@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.14-dev",
+  VERSION = "0.1.15-dev",
 }
 
 local function has_c4()
@@ -2954,6 +2954,7 @@ function CompanionClient.new(options)
     verifier = nil,
     pair_setup = nil,
     pending_pair_setup = false,
+    pending_pair_verify_keys = nil,
     session = nil,
     session_local_sid = nil,
     session_remote_sid = nil,
@@ -3138,6 +3139,15 @@ function CompanionClient:handle_frame(frame)
     Log.debug("Pair-Verify M2 received: finishing Pair-Verify")
     local next_frame, keys = self.verifier:finish(frame)
     self:send_raw(next_frame)
+    self.pending_pair_verify_keys = keys
+    self:set_state("PAIR_VERIFY_M3_SENT")
+    return
+  end
+
+  if self.verifier and self.state == "PAIR_VERIFY_M3_SENT" and frame.frame_type == CompanionFrame.PV_NEXT then
+    Log.debug("Pair-Verify M4 received: enabling encrypted session")
+    local keys = assert(self.pending_pair_verify_keys, "missing Pair-Verify session keys")
+    self.pending_pair_verify_keys = nil
     self:enable_session(keys)
     return
   end

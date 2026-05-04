@@ -126,14 +126,22 @@ local response_frame = Driver.CompanionFrame.encode(Driver.CompanionFrame.PV_NEX
 assert(accepted:send(response_frame))
 
 client:receive(read_exact(transport, #response_frame))
-assert_eq(states[3], "READY", "ready state")
-assert_eq(states[4], "SESSION_STARTING", "session starting state")
+assert_eq(states[3], "PAIR_VERIFY_M3_SENT", "pair verify m3 state")
 
 frame_type, payload = read_frame(accepted)
 assert_eq(frame_type, Driver.CompanionFrame.PV_NEXT, "pair verify next frame type")
 tlv = Driver.PairVerify.decode_pairing_data(payload)
 assert_eq(tlv[6], string.char(0x03), "pair verify next seq")
 assert_eq(tlv[5], encrypted_response, "pair verify next encrypted response")
+
+local ack_payload = Driver.OPACK.encode(Driver.OPACK.dict({
+  { "_pd", Driver.OPACK.bytes(Driver.TLV8.encode_ordered({ { 6, string.char(0x04) } })) },
+}))
+local ack_frame = Driver.CompanionFrame.encode(Driver.CompanionFrame.PV_NEXT, ack_payload)
+assert(accepted:send(ack_frame))
+client:receive(read_exact(transport, #ack_frame))
+assert_eq(states[4], "READY", "ready state")
+assert_eq(states[5], "SESSION_STARTING", "session starting state")
 
 frame_type, payload = read_frame(accepted)
 local session_start = decode_encrypted_message(client.session, frame_type, payload)
@@ -149,7 +157,7 @@ local session_response_payload = Driver.OPACK.encode(Driver.OPACK.dict({
 local session_response_frame = client.session:encode_frame(Driver.CompanionFrame.E_OPACK, session_response_payload)
 assert(accepted:send(session_response_frame))
 client:receive(read_exact(transport, #session_response_frame))
-assert_eq(states[5], "SESSION_ACTIVE", "session active state")
+assert_eq(states[6], "SESSION_ACTIVE", "session active state")
 
 client:launch_app("com.netflix.Netflix")
 frame_type, payload = read_frame(accepted)

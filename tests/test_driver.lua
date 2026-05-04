@@ -795,8 +795,17 @@ function tests.companion_client_pair_verify_enables_encrypted_session()
   }))
   client:receive(Driver.CompanionFrame.encode(Driver.CompanionFrame.PV_NEXT, response_payload))
 
-  assert_eq(states[3], "READY", "ready state")
-  assert_eq(states[4], "SESSION_STARTING", "session starting state")
+  assert_eq(states[3], "PAIR_VERIFY_M3_SENT", "pair verify m3 state")
+  assert_eq(client.session, nil, "session not enabled before pair-verify ack")
+  assert_eq(writes[3], nil, "session start not sent before pair-verify ack")
+
+  local ack_payload = Driver.OPACK.encode(Driver.OPACK.dict({
+    { "_pd", Driver.OPACK.bytes(Driver.TLV8.encode_ordered({ { 6, string.char(0x04) } })) },
+  }))
+  client:receive(Driver.CompanionFrame.encode(Driver.CompanionFrame.PV_NEXT, ack_payload))
+
+  assert_eq(states[4], "READY", "ready state")
+  assert_eq(states[5], "SESSION_STARTING", "session starting state")
   assert(client.session ~= nil, "session enabled")
   assert_eq(Driver.Companion.session, client.session, "global session")
   assert_eq(Driver.Companion.socket, client, "global socket")
@@ -1049,7 +1058,13 @@ function tests.session_start_response_advances_to_session_active()
     })) },
   }))
   client:receive(Driver.CompanionFrame.encode(Driver.CompanionFrame.PV_NEXT, response_payload))
-  assert_eq(states[4], "SESSION_STARTING", "session starting after pair-verify")
+  assert_eq(states[3], "PAIR_VERIFY_M3_SENT", "pair verify m3 after m2")
+
+  local ack_payload = Driver.OPACK.encode(Driver.OPACK.dict({
+    { "_pd", Driver.OPACK.bytes(Driver.TLV8.encode_ordered({ { 6, string.char(0x04) } })) },
+  }))
+  client:receive(Driver.CompanionFrame.encode(Driver.CompanionFrame.PV_NEXT, ack_payload))
+  assert_eq(states[5], "SESSION_STARTING", "session starting after pair-verify ack")
 
   -- Simulate _sessionStart response from Apple TV (_t=3 is Response)
   local remote_sid = 0xABCD1234
@@ -1061,7 +1076,7 @@ function tests.session_start_response_advances_to_session_active()
   local response_frame = client.session:encode_frame(Driver.CompanionFrame.E_OPACK, session_response)
   client:receive(response_frame)
 
-  assert_eq(states[5], "SESSION_ACTIVE", "session active after _sessionStart response")
+  assert_eq(states[6], "SESSION_ACTIVE", "session active after _sessionStart response")
   assert_eq(client.session_remote_sid, remote_sid, "remote sid stored")
 end
 
@@ -1112,6 +1127,11 @@ function tests.session_stop_sent_on_close()
     })) },
   }))
   client:receive(Driver.CompanionFrame.encode(Driver.CompanionFrame.PV_NEXT, response_payload))
+
+  local ack_payload = Driver.OPACK.encode(Driver.OPACK.dict({
+    { "_pd", Driver.OPACK.bytes(Driver.TLV8.encode_ordered({ { 6, string.char(0x04) } })) },
+  }))
+  client:receive(Driver.CompanionFrame.encode(Driver.CompanionFrame.PV_NEXT, ack_payload))
 
   -- Set remote_sid so _sessionStop is triggered on close
   client.session_remote_sid = 0xDEADBEEF
