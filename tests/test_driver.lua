@@ -983,6 +983,100 @@ function tests.queued_command_does_not_reenter_connect_while_connecting()
   assert_eq(#client.pending_commands, 1, "command queued for session active")
 end
 
+function tests.queued_command_reconnects_from_error_state_once()
+  local client = Driver.CompanionClient.new({
+    credentials = Driver.Credentials.parse(table.concat({
+      Driver.Bytes.hex(string.rep("\x01", 32)),
+      Driver.Bytes.hex(string.rep("\x02", 32)),
+      Driver.Bytes.hex("ATV-ID"),
+      Driver.Bytes.hex("CLIENT-ID"),
+    }, ":")),
+    transport = { Write = function() end },
+  })
+  local connect_calls = 0
+  client.state = "ERROR: previous failure"
+  client.connect = function()
+    connect_calls = connect_calls + 1
+    client.connecting = true
+  end
+
+  client:fetch_apps()
+  client:launch_app("com.netflix.Netflix")
+  assert_eq(connect_calls, 1, "queued commands reconnect from error once")
+  assert_eq(#client.pending_commands, 2, "commands queued while reconnecting")
+end
+
+function tests.active_session_command_reuses_connection()
+  local writes = {}
+  local client = Driver.CompanionClient.new({
+    credentials = Driver.Credentials.parse(table.concat({
+      Driver.Bytes.hex(string.rep("\x01", 32)),
+      Driver.Bytes.hex(string.rep("\x02", 32)),
+      Driver.Bytes.hex("ATV-ID"),
+      Driver.Bytes.hex("CLIENT-ID"),
+    }, ":")),
+    crypto = {
+      encrypt = function(_, plaintext) return plaintext .. string.rep("\0", 16) end,
+      decrypt = function(_, ciphertext) return ciphertext:sub(1, #ciphertext - 16) end,
+    },
+    transport = { Write = function(_, data) writes[#writes + 1] = data end },
+  })
+  local connect_calls = 0
+  client.connect = function() connect_calls = connect_calls + 1 end
+  client.session = Driver.CompanionSession.new("out", "in", client.crypto)
+  client.state = "SESSION_ACTIVE"
+
+  client:fetch_apps()
+  assert_eq(connect_calls, 0, "active session command does not reconnect")
+  assert_eq(#client.pending_commands, 0, "active command is not queued")
+  assert_eq(#writes, 1, "active command writes immediately")
+  assert(client.last_tx_ms ~= nil, "last tx timestamp recorded")
+end
+
+function tests.driver_destroy_closes_client_and_cancels_timers()
+  local old_cancel_timer = CancelTimer
+  local old_client = Driver.Companion.client
+  local old_socket = Driver.Companion.socket
+  local old_session = Driver.Companion.session
+  local old_pregen = Driver.OpenSSLCrypto._pregenerated_x25519_keypair
+  local cancelled = {}
+  local closed = false
+
+  CancelTimer = function(name)
+    cancelled[#cancelled + 1] = name
+  end
+  Driver.Companion.client = {
+    close = function()
+      closed = true
+    end,
+  }
+  Driver.Companion.socket = Driver.Companion.client
+  Driver.Companion.session = {}
+  Driver.OpenSSLCrypto._pregenerated_x25519_keypair = {
+    private_key = "cached",
+    public_key = "cached",
+  }
+
+  Driver.C4Driver.destroy()
+
+  assert_eq(closed, true, "destroy closes Companion client")
+  assert_eq(Driver.Companion.client, nil, "destroy clears client")
+  assert_eq(Driver.Companion.socket, nil, "destroy clears socket")
+  assert_eq(Driver.Companion.session, nil, "destroy clears session")
+  assert_contains(cancelled, "AppleTV_crypto_prewarm_base", "base prewarm timer cancelled")
+  assert_contains(cancelled, "AppleTV_crypto_prewarm_controller", "controller prewarm timer cancelled")
+  assert_contains(cancelled, "AppleTV_crypto_prewarm_atv", "atv prewarm timer cancelled")
+  assert_contains(cancelled, "AppleTV_crypto_prewarm_x25519", "x25519 prewarm timer cancelled")
+  assert_contains(cancelled, "AppleTV_reselect_passthrough", "passthrough timer cancelled")
+  assert_eq(Driver.OpenSSLCrypto._pregenerated_x25519_keypair, nil, "destroy clears pregenerated x25519 keypair")
+
+  CancelTimer = old_cancel_timer
+  Driver.Companion.client = old_client
+  Driver.Companion.socket = old_socket
+  Driver.Companion.session = old_session
+  Driver.OpenSSLCrypto._pregenerated_x25519_keypair = old_pregen
+end
+
 function tests.opack_launch_request_roundtrip()
   Driver.Companion.tx = 0
   local request, frame = Driver.Companion.encode_opack_request("_launchApp", {
@@ -1048,6 +1142,50 @@ function tests.mini_app_launch_from_registered_binding()
   assert_table_has(last._c, "_bundleID", "com.netflix.Netflix")
 end
 
+function tests.mini_app_launch_resolves_friendly_name_from_dynamic_app_list()
+  local old_app_list = Driver.Companion.app_list
+  local old_app_rows = Driver.Companion.app_list_rows
+  Driver.Companion.sent_messages = {}
+  Driver.Companion.app_list = {
+    ["com.wbd.stream"] = "HBO Max",
+  }
+  Driver.Companion.app_list_rows = {
+    { name = "HBO Max", identifier = "com.wbd.stream" },
+  }
+  Driver.C4MiniApps.register_binding(3101, {
+    name = "Max",
+    service_id = "Max",
+  })
+
+  ReceivedFromProxy(3101, "SELECT", {})
+
+  local last = Driver.Companion.sent_messages[#Driver.Companion.sent_messages]
+  assert_table_has(last, "_i", "_launchApp")
+  assert_table_has(last._c, "_bundleID", "com.wbd.stream")
+  Driver.Companion.app_list = old_app_list
+  Driver.Companion.app_list_rows = old_app_rows
+end
+
+function tests.mini_app_launch_resolves_predefined_alias()
+  local old_app_list = Driver.Companion.app_list
+  local old_app_rows = Driver.Companion.app_list_rows
+  Driver.Companion.sent_messages = {}
+  Driver.Companion.app_list = {}
+  Driver.Companion.app_list_rows = {}
+  Driver.C4MiniApps.register_binding(3101, {
+    name = "Peacock TV",
+    service_id = "Peacock TV",
+  })
+
+  ReceivedFromProxy(3101, "SELECT", {})
+
+  local last = Driver.Companion.sent_messages[#Driver.Companion.sent_messages]
+  assert_table_has(last, "_i", "_launchApp")
+  assert_table_has(last._c, "_bundleID", "com.peacocktv.peacock")
+  Driver.Companion.app_list = old_app_list
+  Driver.Companion.app_list_rows = old_app_rows
+end
+
 function tests.mini_app_launch_from_switcher_set_input()
   local old_c4 = C4
   C4 = {
@@ -1084,6 +1222,54 @@ function tests.mini_app_launch_from_switcher_set_input()
   assert_table_has(last, "_i", "_launchApp")
   assert_table_has(last._c, "_bundleID", "com.netflix.Netflix")
   C4 = old_c4
+end
+
+function tests.mini_app_switcher_resolves_app_id_that_is_friendly_name()
+  local old_c4 = C4
+  local old_app_list = Driver.Companion.app_list
+  local old_app_rows = Driver.Companion.app_list_rows
+  C4 = {
+    GetDeviceID = function()
+      return 42
+    end,
+    GetBoundConsumerDevices = function(_, device_id, binding_id)
+      assert_eq(device_id, 42, "device id")
+      assert_eq(binding_id, 5002, "switcher binding")
+      return { [9001] = "App Switcher" }
+    end,
+    GetBoundProviderDevice = function(_, device_id, binding_id)
+      if device_id == 9001 and binding_id == 3102 then
+        return 9102
+      end
+      if device_id == 9102 and binding_id == 5001 then
+        return 9202
+      end
+      return nil
+    end,
+    GetDeviceVariables = function(_, device_id)
+      assert_eq(device_id, 9202, "app device id")
+      return {
+        { name = "APP_NAME", value = "HBO Max" },
+        { name = "UM_APPLETV", value = "Max" },
+      }
+    end,
+  }
+  Driver.Companion.app_list = {
+    ["com.wbd.stream"] = "HBO Max",
+  }
+  Driver.Companion.app_list_rows = {
+    { name = "HBO Max", identifier = "com.wbd.stream" },
+  }
+  Driver.Companion.sent_messages = {}
+
+  ReceivedFromProxy(5002, "SET_INPUT", { INPUT = "3102" })
+
+  local last = Driver.Companion.sent_messages[#Driver.Companion.sent_messages]
+  assert_table_has(last, "_i", "_launchApp")
+  assert_table_has(last._c, "_bundleID", "com.wbd.stream")
+  C4 = old_c4
+  Driver.Companion.app_list = old_app_list
+  Driver.Companion.app_list_rows = old_app_rows
 end
 
 function tests.opack_int64_encoding()
@@ -1258,13 +1444,17 @@ function tests.session_stop_sent_on_close()
 	  client.session_local_sid = client.session_local_sid or 0x12345678
 
   local local_sid = client.session_local_sid
+  local cleanup_session = client.session
 	  local writes_before_close = #writes
 	  client:close()
 	  assert(#writes > writes_before_close, "_sessionStop was written before close")
+  assert_eq(client.session, nil, "session cleared after close")
+  assert_eq(next(client.pending_responses), nil, "pending responses cleared after close")
+  assert_eq(#client.pending_commands, 0, "pending commands cleared after close")
 	  local stop_msg, stop_frame
 	  local saw_interest, saw_touch_stop, saw_ti_stop = false, false, false
 	  for i = writes_before_close + 1, #writes do
-	    local decoded = client.session:try_decode(writes[i])
+	    local decoded = cleanup_session:try_decode(writes[i])
 	    local msg = Driver.OPACK.decode(decoded.payload)
 	    if msg._i == "_interest" then saw_interest = true end
 	    if msg._i == "_touchStop" then saw_touch_stop = true end
@@ -1434,6 +1624,7 @@ end
 
 function tests.disconnect_companion_keeps_credentials()
   local old_properties = Properties
+  local old_pregen = Driver.OpenSSLCrypto._pregenerated_x25519_keypair
   Properties = {}
   local closed = false
   local credentials = { type = "HAP" }
@@ -1445,6 +1636,10 @@ function tests.disconnect_companion_keeps_credentials()
       closed = true
     end,
   }
+  Driver.OpenSSLCrypto._pregenerated_x25519_keypair = {
+    private_key = "cached",
+    public_key = "cached",
+  }
 
   Driver.C4Driver.disconnect_companion()
   assert_eq(closed, true, "client close called")
@@ -1452,8 +1647,10 @@ function tests.disconnect_companion_keeps_credentials()
   assert_eq(Driver.Companion.client, nil, "client cleared")
   assert_eq(Driver.Companion.socket, nil, "socket cleared")
   assert_eq(Driver.Companion.session, nil, "session cleared")
+  assert_eq(Driver.OpenSSLCrypto._pregenerated_x25519_keypair, nil, "disconnect clears pregenerated x25519 keypair")
   assert_eq(Properties["Connection State"], "Disconnected", "disconnect state")
   Properties = old_properties
+  Driver.OpenSSLCrypto._pregenerated_x25519_keypair = old_pregen
 end
 
 function tests.bigint_arithmetic()

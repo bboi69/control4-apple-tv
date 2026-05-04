@@ -1112,18 +1112,23 @@ end
 
 local _A24 = _fe_from_number(121665) -- (486662-2)/4 for Curve25519 ladder
 
+local floor = math.floor  -- localize for hot-loop performance
+local _POW2 = {}
+for _i = 0, 30 do _POW2[_i] = 2 ^ _i end
+
 local function _fe_carry(c)
   local carry = 0
-  local n = math.max(#c, _FE_LIMBS)
+  local n = #c
+  if n < _FE_LIMBS then n = _FE_LIMBS end
   for i = 1, n do
     local value = (c[i] or 0) + carry
     c[i] = value % _FE_BASE
-    carry = math.floor(value / _FE_BASE)
+    carry = floor(value / _FE_BASE)
   end
   while carry > 0 do
     n = n + 1
     c[n] = carry % _FE_BASE
-    carry = math.floor(carry / _FE_BASE)
+    carry = floor(carry / _FE_BASE)
   end
   while #c > 1 and c[#c] == 0 do c[#c] = nil end
   return c
@@ -1196,29 +1201,34 @@ local function _fp_mul(a, b)
   local out = {}
   for i = 1, _FE_LIMBS * 2 do out[i] = 0 end
   for i = 1, _FE_LIMBS do
-    local carry = 0
-    for j = 1, _FE_LIMBS do
-      local k = i + j - 1
-      local value = out[k] + (a[i] or 0) * (b[j] or 0) + carry
-      out[k] = value % _FE_BASE
-      carry = math.floor(value / _FE_BASE)
-    end
-    local k = i + _FE_LIMBS
-    while carry > 0 do
-      local value = (out[k] or 0) + carry
-      out[k] = value % _FE_BASE
-      carry = math.floor(value / _FE_BASE)
-      k = k + 1
+    local ai = a[i]
+    if ai ~= 0 then
+      for j = 1, _FE_LIMBS do
+        out[i + j - 1] = out[i + j - 1] + ai * (b[j] or 0)
+      end
     end
   end
   return _fe_reduce(out)
 end
 
-local function _fp_sq(a) return _fp_mul(a, a) end
+local function _fp_sq(a)
+  local out = {}
+  for i = 1, _FE_LIMBS * 2 do out[i] = 0 end
+  for i = 1, _FE_LIMBS do
+    local ai = a[i]
+    if ai ~= 0 then
+      out[2 * i - 1] = out[2 * i - 1] + ai * ai
+      for j = i + 1, _FE_LIMBS do
+        out[i + j - 1] = out[i + j - 1] + 2 * ai * (a[j] or 0)
+      end
+    end
+  end
+  return _fe_reduce(out)
+end
 
 local function _fe_bit(v, bit_index)
-  local limb = v[math.floor(bit_index / _FE_BITS) + 1] or 0
-  return math.floor(limb / (2 ^ (bit_index % _FE_BITS))) % 2
+  local limb = v[floor(bit_index / _FE_BITS) + 1] or 0
+  return floor(limb / _POW2[bit_index % _FE_BITS]) % 2
 end
 
 local function _fp_inv(a)
@@ -1233,16 +1243,17 @@ local function _fp_inv(a)
 end
 
 local function _le32_to_fe(s)
-  local out = {}
-  for limb = 1, _FE_LIMBS do
-    local value = 0
-    for bit = 0, _FE_BITS - 1 do
-      local source_bit = (limb - 1) * _FE_BITS + bit
-      local byte = s:byte(math.floor(source_bit / 8) + 1) or 0
-      local bit_value = math.floor(byte / (2 ^ (source_bit % 8))) % 2
-      if bit_value == 1 then value = value + 2 ^ bit end
+  local b = {s:byte(1, 32)}
+  local out, acc, acc_bits, bi = {}, 0, 0, 1
+  for i = 1, _FE_LIMBS do
+    while acc_bits < _FE_BITS and bi <= 32 do
+      acc = acc + (b[bi] or 0) * _POW2[acc_bits]
+      acc_bits = acc_bits + 8
+      bi = bi + 1
     end
-    out[limb] = value
+    out[i] = acc % _FE_BASE
+    acc = floor(acc / _FE_BASE)
+    acc_bits = acc_bits - _FE_BITS
   end
   return _fe_reduce(out)
 end
@@ -1251,23 +1262,23 @@ local function _fe_to_le32(v)
   local reduced = {}
   for i = 1, #v do reduced[i] = v[i] end
   v = _fe_reduce(reduced)
-  local bytes = {}
-  for i = 1, 32 do bytes[i] = 0 end
-  for limb = 1, _FE_LIMBS do
-    local value = v[limb] or 0
-    for bit = 0, _FE_BITS - 1 do
-      if math.floor(value / (2 ^ bit)) % 2 == 1 then
-        local target_bit = (limb - 1) * _FE_BITS + bit
-        if target_bit < 256 then
-          local byte_index = math.floor(target_bit / 8) + 1
-          bytes[byte_index] = bytes[byte_index] + 2 ^ (target_bit % 8)
-        end
-      end
+  local bytes, acc, acc_bits, bi = {}, 0, 0, 1
+  for i = 1, _FE_LIMBS do
+    acc = acc + (v[i] or 0) * _POW2[acc_bits]
+    acc_bits = acc_bits + _FE_BITS
+    while acc_bits >= 8 and bi <= 32 do
+      bytes[bi] = string.char(acc % 256)
+      acc = floor(acc / 256)
+      acc_bits = acc_bits - 8
+      bi = bi + 1
     end
   end
-  local out = {}
-  for i = 1, 32 do out[i] = string.char(bytes[i]) end
-  return table.concat(out)
+  while bi <= 32 do
+    bytes[bi] = string.char(acc % 256)
+    acc = floor(acc / 256)
+    bi = bi + 1
+  end
+  return table.concat(bytes)
 end
 
 local function _clamp32(k)
@@ -1297,7 +1308,7 @@ function X25519Pure.mul(k_bytes, u_bytes)
   local swap = 0
   local kb = {k_bytes:byte(1, 32)}
   for t = 254, 0, -1 do
-    local k_t = math.floor(kb[math.floor(t / 8) + 1] / (2 ^ (t % 8))) % 2
+    local k_t = floor(kb[floor(t / 8) + 1] / _POW2[t % 8]) % 2
     swap = (swap + k_t) % 2
     if swap == 1 then x2, x3 = x3, x2; z2, z3 = z3, z2 end
     swap = k_t
@@ -1458,40 +1469,43 @@ local function _scalar_reduce(v)
 end
 
 local function _scalar_from_le_bytes_mod(s)
-  local v = {}
-  for i = 1, #s do
-    local byte = s:byte(i)
-    local bit_offset = (i - 1) * 8
-    local limb = math.floor(bit_offset / _FE_BITS) + 1
-    local shift = bit_offset % _FE_BITS
-    v[limb] = (v[limb] or 0) + byte * (2 ^ shift)
-    if shift > _FE_BITS - 8 then
-      v[limb + 1] = (v[limb + 1] or 0) + math.floor((v[limb] or 0) / _FE_BASE)
-      v[limb] = (v[limb] or 0) % _FE_BASE
+  local b = {s:byte(1, #s)}
+  local v, acc, acc_bits, bi = {}, 0, 0, 1
+  local limb = 1
+  while bi <= #b do
+    while acc_bits < _FE_BITS and bi <= #b do
+      acc = acc + (b[bi] or 0) * _POW2[acc_bits]
+      acc_bits = acc_bits + 8
+      bi = bi + 1
     end
+    v[limb] = acc % _FE_BASE
+    acc = floor(acc / _FE_BASE)
+    acc_bits = acc_bits - _FE_BITS
+    limb = limb + 1
   end
+  if acc > 0 then v[limb] = acc end
   return _scalar_reduce(_fe_carry(v))
 end
 
 local function _scalar_to_le32(v)
   v = _scalar_reduce(v)
-  local bytes = {}
-  for i = 1, 32 do bytes[i] = 0 end
-  for limb = 1, #v do
-    local value = v[limb] or 0
-    for bit = 0, _FE_BITS - 1 do
-      if math.floor(value / (2 ^ bit)) % 2 == 1 then
-        local target_bit = (limb - 1) * _FE_BITS + bit
-        if target_bit < 256 then
-          local byte_index = math.floor(target_bit / 8) + 1
-          bytes[byte_index] = bytes[byte_index] + 2 ^ (target_bit % 8)
-        end
-      end
+  local bytes, acc, acc_bits, bi = {}, 0, 0, 1
+  for i = 1, #v do
+    acc = acc + (v[i] or 0) * _POW2[acc_bits]
+    acc_bits = acc_bits + _FE_BITS
+    while acc_bits >= 8 and bi <= 32 do
+      bytes[bi] = string.char(acc % 256)
+      acc = floor(acc / 256)
+      acc_bits = acc_bits - 8
+      bi = bi + 1
     end
   end
-  local out = {}
-  for i = 1, 32 do out[i] = string.char(bytes[i]) end
-  return table.concat(out)
+  while bi <= 32 do
+    bytes[bi] = string.char(acc % 256)
+    acc = floor(acc / 256)
+    bi = bi + 1
+  end
+  return table.concat(bytes)
 end
 
 local function _scalar_add(a, b)
@@ -1531,7 +1545,8 @@ local function _ed_point_add(P, Q)
   local A = _fp_mul(_fp_sub(P.Y, P.X), _fp_sub(Q.Y, Q.X))
   local B = _fp_mul(_fp_add(P.Y, P.X), _fp_add(Q.Y, Q.X))
   local C = _fp_mul(_fp_mul(P.T, Q.T), _ED_2D)
-  local D = _fp_add(_fp_mul(P.Z, Q.Z), _fp_mul(P.Z, Q.Z))
+  local ZZ = _fp_mul(P.Z, Q.Z)
+  local D = _fp_add(ZZ, ZZ)
   local E = _fp_sub(B, A)
   local F = _fp_sub(D, C)
   local G = _fp_add(D, C)
@@ -2170,7 +2185,27 @@ function OpenSSLCrypto._export_raw_public_key(key)
   return der:sub(13)
 end
 
+OpenSSLCrypto._pregenerated_x25519_keypair = nil
+
+function OpenSSLCrypto._pregen_x25519()
+  local scalar = OpenSSLCrypto.random_bytes(32)
+  OpenSSLCrypto._pregenerated_x25519_keypair = {
+    private_key = scalar,
+    public_key  = X25519Pure.mul(scalar, X25519Pure.BASE_POINT),
+  }
+end
+
 function OpenSSLCrypto.generate_x25519_keypair()
+  local cached = OpenSSLCrypto._pregenerated_x25519_keypair
+  if cached then
+    OpenSSLCrypto._pregenerated_x25519_keypair = nil
+    -- Kick off background generation of the next keypair (best-effort, no-op if no C4)
+    if has_c4() and type(SetTimer) == "function" then
+      SetTimer("AppleTV_crypto_prewarm_x25519", 100, OpenSSLCrypto._pregen_x25519)
+    end
+    return cached
+  end
+  -- Fallback: generate synchronously
   local scalar = OpenSSLCrypto.random_bytes(32)
   return {
     private_key = scalar,
@@ -3204,6 +3239,51 @@ function Companion.resolve_app_selection(selection)
   return fuzzy_match
 end
 
+function Companion.normalize_app_name(name)
+  name = tostring(name or ""):lower()
+  return (name:gsub("[^%w]", ""))
+end
+
+function Companion.looks_like_launch_identifier(value)
+  value = tostring(value or "")
+  if value == "" then return false end
+  if value:match("^[%a][%w+.-]*:") then return true end
+  return value:find(".", 1, true) ~= nil
+end
+
+function Companion.find_app_by_name(name)
+  local normalized = Companion.normalize_app_name(name)
+  if normalized == "" then return nil end
+
+  local exact_match
+  for _, app in ipairs(Companion.app_list_rows or {}) do
+    if Companion.normalize_app_name(app.name) == normalized then
+      if exact_match and exact_match ~= app.identifier then
+        return nil, "multiple apps match name " .. tostring(name)
+      end
+      exact_match = app.identifier
+    end
+  end
+  if exact_match then return exact_match end
+
+  local fuzzy_match
+  if #normalized >= 4 then
+    for _, app in ipairs(Companion.app_list_rows or {}) do
+      local app_name = Companion.normalize_app_name(app.name)
+      local app_id = Companion.normalize_app_name(app.identifier)
+      if (app_name ~= "" and (app_name:find(normalized, 1, true) or normalized:find(app_name, 1, true))) or
+         (app_id ~= "" and app_id:find(normalized, 1, true))
+      then
+        if fuzzy_match and fuzzy_match ~= app.identifier then
+          return nil, "multiple apps fuzzily match " .. tostring(name)
+        end
+        fuzzy_match = app.identifier
+      end
+    end
+  end
+  return fuzzy_match
+end
+
 function Companion.render_current_app(app)
   if type(app) ~= "table" then
     return ""
@@ -3357,6 +3437,9 @@ function CompanionClient.new(options)
     startup_index = 0,
     startup_in_progress = false,
     post_session_started = false,
+    last_rx_ms = nil,
+    last_tx_ms = nil,
+    session_active_since_ms = nil,
     injected_transport = options.transport ~= nil,
     connecting = false,
     connected = false,
@@ -3367,6 +3450,43 @@ function CompanionClient.new(options)
     on_paired = options.on_paired,
     on_pair_setup_m2 = options.on_pair_setup_m2,
   }, { __index = CompanionClient })
+end
+
+function CompanionClient:now_ms()
+  return math.floor(os.clock() * 1000 + 0.5)
+end
+
+function CompanionClient:mark_tx()
+  self.last_tx_ms = self:now_ms()
+end
+
+function CompanionClient:mark_rx()
+  self.last_rx_ms = self:now_ms()
+end
+
+function CompanionClient:clear_runtime_state(options)
+  options = options or {}
+  self.connecting = false
+  self.connected = false
+  self.pending_pair_verify_keys = nil
+  self.session = nil
+  self.session_local_sid = nil
+  self.session_remote_sid = nil
+  self.session_start_xid = nil
+  self.startup_steps = nil
+  self.startup_index = 0
+  self.startup_in_progress = false
+  self.post_session_started = false
+  self.session_active_since_ms = nil
+  self.buffer = ""
+  self.pending_responses = {}
+  if options.clear_pending_commands then
+    self.pending_commands = {}
+  end
+  if Companion.client == self then
+    Companion.session = nil
+    Companion.socket = nil
+  end
 end
 
 function CompanionClient:set_state(state)
@@ -3392,6 +3512,7 @@ function CompanionClient:send_raw(frame)
   else
     Log.debug("Companion send raw bytes: len=" .. tostring(#frame))
   end
+  self:mark_tx()
   if self.transport.Write then
     return self.transport:Write(frame)
   end
@@ -3408,7 +3529,8 @@ function CompanionClient:send(frame)
   return self:send_raw(frame)
 end
 
-function CompanionClient:close()
+function CompanionClient:close(options)
+  options = options or {}
   if self.session then
     pcall(function()
       self:send_opack("_interest", {
@@ -3439,12 +3561,9 @@ function CompanionClient:close()
     self.transport:close()
   end
   self.transport = nil
-  self.connecting = false
-  self.connected = false
-  self.startup_steps = nil
-  self.startup_index = 0
-  self.startup_in_progress = false
-  self.post_session_started = false
+  self:clear_runtime_state({
+    clear_pending_commands = options.clear_pending_commands ~= false,
+  })
   self:set_state("DISCONNECTED")
 end
 
@@ -3487,6 +3606,7 @@ function CompanionClient:connect(host, port)
     end)
     :OnRead(function(tcp_client, data)
       Log.debug("Companion TCP read: bytes=" .. tostring(#(data or "")))
+      self:mark_rx()
       local ok, err = pcall(function() self:receive(data) end)
       if not ok then
         Log.error("Companion receive failed: " .. tostring(err))
@@ -3497,25 +3617,15 @@ function CompanionClient:connect(host, port)
     :OnDisconnect(function(_, err_code, err_msg)
       Log.debug("Companion TCP disconnected: code=" .. tostring(err_code) ..
         " message=" .. tostring(err_msg))
-      self.connecting = false
-      self.connected = false
       self.transport = nil
-      self.startup_steps = nil
-      self.startup_index = 0
-      self.startup_in_progress = false
-      self.post_session_started = false
+      self:clear_runtime_state({ clear_pending_commands = false })
       self:set_state((err_code and err_code ~= 0) and ("DISCONNECTED: " .. tostring(err_msg)) or "DISCONNECTED")
     end)
     :OnError(function(_, err_code, err_msg)
       Log.error("Companion TCP error: code=" .. tostring(err_code) ..
         " message=" .. tostring(err_msg))
-      self.connecting = false
-      self.connected = false
       self.transport = nil
-      self.startup_steps = nil
-      self.startup_index = 0
-      self.startup_in_progress = false
-      self.post_session_started = false
+      self:clear_runtime_state({ clear_pending_commands = false })
       self:set_state("ERROR: " .. tostring(err_code) .. " " .. tostring(err_msg))
     end)
     :Connect(self.host, self.port)
@@ -3528,6 +3638,8 @@ function CompanionClient:on_connected(transport)
   self.transport = transport
   self.connecting = false
   self.connected = true
+  self.last_rx_ms = nil
+  self.last_tx_ms = nil
   self:set_state("CONNECTED")
   Log.debug("Companion TCP ready: credentials_present=" .. tostring(self.credentials ~= nil))
   if self.credentials then
@@ -3637,6 +3749,7 @@ function CompanionClient:start_session()
     self.session_remote_sid = message._c._sid
     self.session_start_xid = nil
     self:set_state("SESSION_ACTIVE")
+    self.session_active_since_ms = self:now_ms()
     Log.debug("Companion session active, remote_sid=" .. tostring(self.session_remote_sid))
     self:send_next_startup_step()
   end)
@@ -3660,6 +3773,7 @@ function CompanionClient:subscribe_initial_events()
 end
 
 function CompanionClient:receive(data)
+  self:mark_rx()
   self.buffer = self.buffer .. (data or "")
   Log.debug("Companion receive buffered: buffer_len=" .. tostring(#self.buffer) ..
     " encrypted_session=" .. tostring(self.session ~= nil))
@@ -3836,6 +3950,11 @@ function CompanionClient:is_ready_for_commands()
   return self.state == "SESSION_ACTIVE" and self.session ~= nil
 end
 
+function CompanionClient:needs_reconnect()
+  local state = tostring(self.state or "")
+  return state == "DISCONNECTED" or state:match("^DISCONNECTED") or state:match("^ERROR")
+end
+
 function CompanionClient:send_or_queue_opack(identifier, content, message_type)
   local request = Companion.build_request(identifier, content, message_type)
   Companion.sent_messages[#Companion.sent_messages + 1] = request
@@ -3849,7 +3968,7 @@ function CompanionClient:send_or_queue_opack(identifier, content, message_type)
     message_type = message_type,
     request = request,
   }
-  if (self.state == "DISCONNECTED" or self.state:match("^DISCONNECTED")) and not self.connecting then
+  if self:needs_reconnect() and not self.connecting then
     self:connect()
   end
   return request, nil
@@ -3889,7 +4008,26 @@ local C4MiniApps = {
   MINIAPP_BINDING_START = 3101,
   MINIAPP_BINDING_END = 3125,
   MINIAPP_TYPE = "UM_APPLETV",
+  aliases = {
+    ["abC iView"] = "au.net.abc.ABCiView",
+    ["amazon prime video"] = "com.amazon.aiv.AIVApp",
+    ["apple tv"] = "com.apple.TVWatchList",
+    ["apple tv+"] = "com.apple.TVWatchList",
+    ["directv"] = "com.att.tv",
+    ["disney plus"] = "com.disney.disneyplus",
+    ["disney+"] = "com.disney.disneyplus",
+    ["hbo max"] = "com.wbd.stream",
+    ["hulu"] = "com.hulu.plus",
+    ["max"] = "com.wbd.stream",
+    ["pandora"] = "com.pandora",
+    ["peacock"] = "com.peacocktv.peacock",
+    ["peacock tv"] = "com.peacocktv.peacock",
+    ["prime video"] = "com.amazon.aiv.AIVApp",
+    ["tenplay"] = "com.networkten.epg",
+    ["youtube"] = "com.google.ios.youtube",
+  },
   bindings = {},
+  pending_retry = nil,
   room_ids = {},
   room_sources = {},
 }
@@ -3908,14 +4046,134 @@ end
 function C4MiniApps.resolve(binding_id, params)
   local bound = C4MiniApps.bindings[binding_id]
   if bound then
-    return bound.service_id, bound
+    return bound
   end
 
   if params then
-    return params.SERVICE_ID or params.service_id or params.APP_ID or params.app_id
+    local service_id = params.SERVICE_ID or params.service_id or params.APP_ID or params.app_id
+    local name = params.APP_NAME or params.app_name or params.NAME or params.name
+    if service_id or name then
+      return {
+        service_id = service_id,
+        name = name,
+      }
+    end
   end
 
   return nil
+end
+
+function C4MiniApps.alias_for(name)
+  local normalized = Companion.normalize_app_name(name)
+  if normalized == "" then return nil end
+  for alias, bundle_id in pairs(C4MiniApps.aliases or {}) do
+    if Companion.normalize_app_name(alias) == normalized then
+      return bundle_id, alias
+    end
+  end
+  if #normalized >= 4 then
+    local fuzzy_match, fuzzy_alias
+    for alias, bundle_id in pairs(C4MiniApps.aliases or {}) do
+      local alias_norm = Companion.normalize_app_name(alias)
+      if alias_norm:find(normalized, 1, true) or normalized:find(alias_norm, 1, true) then
+        if fuzzy_match and fuzzy_match ~= bundle_id then
+          return nil, nil, "multiple aliases match " .. tostring(name)
+        end
+        fuzzy_match = bundle_id
+        fuzzy_alias = alias
+      end
+    end
+    return fuzzy_match, fuzzy_alias
+  end
+  return nil
+end
+
+function C4MiniApps.resolve_launch_id(service)
+  service = service or {}
+  local service_id = service.service_id
+  local name = service.name
+
+  if Companion.looks_like_launch_identifier(service_id) then
+    Log.debug("mini app provided launch id " .. tostring(service_id))
+    return service_id
+  end
+  if Companion.looks_like_launch_identifier(name) then
+    Log.debug("mini app provided launch id in name " .. tostring(name))
+    return name
+  end
+
+  if service_id and service_id ~= "" and (not name or name == "") then
+    name = service_id
+    Log.debug("mini app service id appears to be app name: " .. tostring(service_id))
+  end
+
+  local dynamic_id, err = Companion.find_app_by_name(name)
+  if dynamic_id then
+    Log.debug("mini app resolved from app list: " .. tostring(name) .. " -> " .. tostring(dynamic_id))
+    return dynamic_id
+  end
+  if err then
+    Log.error("mini app app-list match failed: " .. tostring(err))
+  end
+
+  local alias_id, alias_name, alias_err = C4MiniApps.alias_for(name)
+  if alias_id then
+    Log.debug("mini app resolved from alias: " .. tostring(name) ..
+      " -> " .. tostring(alias_name) .. " -> " .. tostring(alias_id))
+    return alias_id
+  end
+  if alias_err then
+    Log.error("mini app alias match failed: " .. tostring(alias_err))
+  end
+
+  return nil
+end
+
+function C4MiniApps.queue_retry(service, app_proxy_id)
+  if not service or service._retried then
+    return false
+  end
+  C4MiniApps.pending_retry = {
+    service = {
+      service_id = service.service_id,
+      name = service.name,
+      _retried = true,
+    },
+    app_proxy_id = app_proxy_id,
+  }
+  Log.debug("mini app unresolved; refreshing app list before retry: " ..
+    tostring(service.name or service.service_id or "unknown"))
+  if C4Driver and C4Driver.refresh_app_list then
+    C4Driver.refresh_app_list()
+    return true
+  end
+  return false
+end
+
+function C4MiniApps.launch_service(service, app_proxy_id)
+  local launch_id = C4MiniApps.resolve_launch_id(service)
+  if launch_id then
+    Log.debug("launch mini app " .. launch_id)
+    local request, frame = C4Driver.launch_app(launch_id)
+    C4MiniApps.reselect_passthrough_if_needed(app_proxy_id)
+    return request, frame
+  end
+  if C4MiniApps.queue_retry(service, app_proxy_id) then
+    return nil
+  end
+  Log.error("mini app selected without a resolvable Apple TV app id: " ..
+    tostring(service and (service.name or service.service_id) or "unknown"))
+  return nil
+end
+
+function C4MiniApps.retry_pending_launch()
+  local pending = C4MiniApps.pending_retry
+  if not pending then
+    return
+  end
+  C4MiniApps.pending_retry = nil
+  Log.debug("retrying pending mini app launch after app list refresh")
+  C4MiniApps.launch_service(pending.service, pending.app_proxy_id)
 end
 
 function C4MiniApps.get_relevant_universal_app_id(device_id, source)
@@ -4047,12 +4305,8 @@ function C4MiniApps.handle_proxy_command(binding_id, command, params)
     local input = tonumber(params.INPUT)
     if input and C4MiniApps.is_binding(input) then
       local service = C4MiniApps.resolve_bound_minidriver(input) or C4MiniApps.bindings[input]
-      local service_id = service and service.service_id
-      if service_id then
-        Log.debug("launch mini app " .. service_id)
-        local request, frame = C4Driver.launch_app(service_id)
-        C4MiniApps.reselect_passthrough_if_needed(service.app_proxy_id)
-        return request, frame
+      if service then
+        return C4MiniApps.launch_service(service, service.app_proxy_id)
       end
       Log.error("mini app selected without a " .. C4MiniApps.MINIAPP_TYPE .. " service id on input " .. tostring(input))
       return nil
@@ -4060,10 +4314,9 @@ function C4MiniApps.handle_proxy_command(binding_id, command, params)
   end
 
   if C4MiniApps.is_binding(binding_id) then
-    local service_id = C4MiniApps.resolve(binding_id, params)
-    if service_id then
-      Log.debug("launch mini app " .. service_id)
-      return C4Driver.launch_app(service_id)
+    local service = C4MiniApps.resolve(binding_id, params)
+    if service then
+      return C4MiniApps.launch_service(service)
     end
     Log.error("mini app selected without a service id on binding " .. tostring(binding_id))
     return nil
@@ -4183,6 +4436,7 @@ function C4Driver.handle_companion_message(message)
     Driver.state.app_list = Companion.app_list
     Storage.save(Driver.state)
     C4Driver.publish_app_list()
+    C4MiniApps.retry_pending_launch()
   end
   if changed.current_app then
     C4Driver.publish_current_app()
@@ -4255,6 +4509,8 @@ function C4Driver.load_persisted_credentials()
 end
 
 function C4Driver.reset_pairing()
+  C4Driver.cancel_timer("AppleTV_crypto_prewarm_x25519")
+  OpenSSLCrypto._pregenerated_x25519_keypair = nil
   if Companion.client and Companion.client.close then
     Companion.client:close()
   end
@@ -4281,6 +4537,8 @@ function C4Driver.reset_pairing()
 end
 
 function C4Driver.disconnect_companion()
+  C4Driver.cancel_timer("AppleTV_crypto_prewarm_x25519")
+  OpenSSLCrypto._pregenerated_x25519_keypair = nil
   if Companion.client and Companion.client.close then
     Companion.client:close()
   end
@@ -4292,7 +4550,7 @@ end
 
 function C4Driver.ensure_companion_client()
   if Companion.client then
-    if Companion.client.state == "DISCONNECTED" or tostring(Companion.client.state):match("^DISCONNECTED") then
+    if Companion.client.needs_reconnect and Companion.client:needs_reconnect() then
       Companion.client:connect()
     end
     return Companion.client
@@ -4308,7 +4566,7 @@ function C4Driver.connect_companion()
     Log.error("pair this driver before connecting")
     error("pair this driver before connecting")
   end
-  if Companion.client and Companion.client.state ~= "DISCONNECTED" and not tostring(Companion.client.state):match("^DISCONNECTED") then
+  if Companion.client and not (Companion.client.needs_reconnect and Companion.client:needs_reconnect()) then
     Log.debug("Companion connect requested while client exists: state=" .. tostring(Companion.client.state))
     return Companion.client
   end
@@ -4404,6 +4662,12 @@ function C4Driver.prewarm_crypto_stage(stage)
       OpenSSLCrypto._ed25519_public_key_cache_entry(credentials.ltpk)
       Log.debug("crypto prewarm Apple TV public key fixed table ms=" .. tostring(elapsed_ms(start_time)))
     end
+
+    if stage == nil or stage == "x25519" then
+      local start_time = os.clock()
+      OpenSSLCrypto._pregen_x25519()
+      Log.debug("crypto prewarm X25519 ephemeral keypair ms=" .. tostring(elapsed_ms(start_time)))
+    end
   end)
   if not ok then
     Log.error("crypto prewarm " .. tostring(stage or "all") .. " failed: " .. tostring(err))
@@ -4433,7 +4697,26 @@ function C4Driver.schedule_crypto_prewarm()
   SetTimer("AppleTV_crypto_prewarm_atv", 6000, function()
     C4Driver.prewarm_crypto_stage("atv")
   end)
-  Log.debug("crypto prewarm scheduled: base=2s controller=4s atv=6s")
+  SetTimer("AppleTV_crypto_prewarm_x25519", 8000, function()
+    C4Driver.prewarm_crypto_stage("x25519")
+  end)
+  Log.debug("crypto prewarm scheduled: base=2s controller=4s atv=6s x25519=8s")
+end
+
+function C4Driver.cancel_timer(name)
+  if type(CancelTimer) == "function" then
+    pcall(CancelTimer, name)
+  elseif has_c4() and C4.KillTimer then
+    pcall(function() C4:KillTimer(name) end)
+  end
+end
+
+function C4Driver.cancel_driver_timers()
+  C4Driver.cancel_timer("AppleTV_crypto_prewarm_base")
+  C4Driver.cancel_timer("AppleTV_crypto_prewarm_controller")
+  C4Driver.cancel_timer("AppleTV_crypto_prewarm_atv")
+  C4Driver.cancel_timer("AppleTV_crypto_prewarm_x25519")
+  C4Driver.cancel_timer("AppleTV_reselect_passthrough")
 end
 
 -- EC: Composer action and command dispatch (DCP normalises spaces→underscores and handles LUA_ACTION)
@@ -4494,6 +4777,14 @@ function C4Driver.late_init()
 end
 
 function C4Driver.destroy()
+  C4Driver.cancel_driver_timers()
+  OpenSSLCrypto._pregenerated_x25519_keypair = nil
+  if Companion.client and Companion.client.close then
+    Companion.client:close()
+  end
+  Companion.client = nil
+  Companion.socket = nil
+  Companion.session = nil
   Log.debug("driver destroyed")
 end
 
