@@ -927,6 +927,39 @@ function tests.execute_command_routes_driver_commands()
   Properties = old_properties
 end
 
+function tests.refresh_app_list_uses_existing_client()
+  local old_properties = Properties
+  Properties = {}
+  local writes = {}
+  local client = Driver.CompanionClient.new({
+    credentials = Driver.Credentials.parse(table.concat({
+      Driver.Bytes.hex(string.rep("\x01", 32)),
+      Driver.Bytes.hex(string.rep("\x02", 32)),
+      Driver.Bytes.hex("ATV-ID"),
+      Driver.Bytes.hex("CLIENT-ID"),
+    }, ":")),
+    crypto = {
+      encrypt = function(_, plaintext) return plaintext .. string.rep("\0", 16) end,
+      decrypt = function(_, ciphertext) return ciphertext:sub(1, #ciphertext - 16) end,
+    },
+    transport = { Write = function(_, data) writes[#writes + 1] = data end },
+  })
+  client.session = Driver.CompanionSession.new("out", "in", client.crypto)
+  client.state = "SESSION_ACTIVE"
+  Driver.Companion.client = client
+  Driver.Companion.credentials = client.credentials
+
+  Driver.C4Driver.refresh_app_list()
+  assert_eq(#writes, 1, "refresh app list writes to active client")
+  local decoded = client.session:try_decode(writes[1])
+  local message = Driver.OPACK.decode(decoded.payload)
+  assert_eq(message._i, "FetchLaunchableApplicationsEvent", "refresh app list command")
+
+  Driver.Companion.client = nil
+  Driver.Companion.credentials = nil
+  Properties = old_properties
+end
+
 function tests.opack_launch_request_roundtrip()
   Driver.Companion.tx = 0
   local request, frame = Driver.Companion.encode_opack_request("_launchApp", {

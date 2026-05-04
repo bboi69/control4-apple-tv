@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.21-dev",
+  VERSION = "0.1.22-dev",
 }
 
 local function has_c4()
@@ -3836,6 +3836,13 @@ function C4Driver.launch_app(bundle_id_or_url)
   return request, frame
 end
 
+function C4Driver.refresh_app_list()
+  if Companion.credentials or (Driver.state and Driver.state.companion_credentials) then
+    C4Driver.ensure_companion_client()
+  end
+  return Companion.fetch_apps()
+end
+
 function C4Driver.import_credentials(detail_string)
   assert(type(detail_string) == "string" and detail_string ~= "", "Companion credentials are required")
   local credentials = Credentials.parse(detail_string)
@@ -3995,7 +4002,7 @@ EC.LAUNCH_APP = function(params)
   return C4Driver.launch_app(params.BUNDLE_ID_OR_URL or params.bundle_id_or_url)
 end
 EC.REFRESH_APP_LIST = function()
-  return Companion.fetch_apps()
+  return C4Driver.refresh_app_list()
 end
 EC.RESET_PAIRING = function()
   return C4Driver.reset_pairing()
