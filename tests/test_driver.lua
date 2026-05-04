@@ -816,9 +816,15 @@ function tests.companion_client_pair_verify_enables_encrypted_session()
   assert_eq(tlv[6], string.char(0x03), "pair verify next seq")
   assert_eq(tlv[5], encrypted_response, "pair verify next encrypted")
 
-  -- writes[3] is the encrypted _sessionStart frame
-  assert(writes[3] ~= nil, "_sessionStart was written")
-  local decoded_start_frame = client.session:try_decode(writes[3])
+  local decoded_system_info = client.session:try_decode(writes[3])
+  local system_info_msg = Driver.OPACK.decode(decoded_system_info.payload)
+  assert_table_has(system_info_msg, "_i", "_systemInfo")
+
+  local decoded_touch_start = client.session:try_decode(writes[4])
+  local touch_start_msg = Driver.OPACK.decode(decoded_touch_start.payload)
+  assert_table_has(touch_start_msg, "_i", "_touchStart")
+
+  local decoded_start_frame = client.session:try_decode(writes[5])
   local start_msg = Driver.OPACK.decode(decoded_start_frame.payload)
   assert_table_has(start_msg, "_i", "_sessionStart")
   assert_table_has(start_msg._c, "_srvT", "com.apple.tvremoteservices")
@@ -1078,6 +1084,15 @@ function tests.session_start_response_advances_to_session_active()
 
   assert_eq(states[6], "SESSION_ACTIVE", "session active after _sessionStart response")
   assert_eq(client.session_remote_sid, remote_sid, "remote sid stored")
+
+  local ti_start_frame = client.session:try_decode(writes[#writes - 1])
+  local ti_start = Driver.OPACK.decode(ti_start_frame.payload)
+  assert_table_has(ti_start, "_i", "_tiStart")
+
+  local interest_frame = client.session:try_decode(writes[#writes])
+  local interest = Driver.OPACK.decode(interest_frame.payload)
+  assert_table_has(interest, "_i", "_interest")
+  assert_eq(interest._t, 1, "interest is event message")
 end
 
 function tests.session_stop_sent_on_close()

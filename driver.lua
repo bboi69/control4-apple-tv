@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.16-dev",
+  VERSION = "0.1.17-dev",
 }
 
 local function has_c4()
@@ -2959,6 +2959,7 @@ function CompanionClient.new(options)
     session_local_sid = nil,
     session_remote_sid = nil,
     session_start_xid = nil,
+    post_session_started = false,
     state = "DISCONNECTED",
     received_messages = {},
     on_state = options.on_state,
@@ -3095,6 +3096,35 @@ function CompanionClient:enable_session(keys)
   Companion.session = self.session
   Companion.socket = self
   self:set_state("READY")
+  self:start_companion_services()
+end
+
+function CompanionClient:send_system_info()
+  return self:send_opack("_systemInfo", {
+    _bf = 0,
+    _cf = 512,
+    _clFl = 128,
+    _i = "Control4",
+    _idsID = self.credentials and self.credentials.client_id or "",
+    _pubID = "Control4",
+    _sf = 256,
+    _sv = Driver.VERSION,
+    model = "Control4",
+    name = "Control4",
+  }, 2)
+end
+
+function CompanionClient:start_touch()
+  return self:send_opack("_touchStart", {
+    _height = 1000,
+    _tFl = 0,
+    _width = 1000,
+  }, 2)
+end
+
+function CompanionClient:start_companion_services()
+  self:send_system_info()
+  self:start_touch()
   self:start_session()
 end
 
@@ -3112,6 +3142,15 @@ function CompanionClient:start_session()
   }, 2)
   self.session_start_xid = request._x
   self:set_state("SESSION_STARTING")
+end
+
+function CompanionClient:after_session_active()
+  if self.post_session_started then return end
+  self.post_session_started = true
+  self:send_opack("_tiStart", {}, 2)
+  self:send_opack("_interest", {
+    _regEvents = OPACK.array({ "_iMC" }),
+  }, 1)
 end
 
 function CompanionClient:receive(data)
@@ -3219,6 +3258,7 @@ function CompanionClient:handle_frame(frame)
       self.session_start_xid = nil
       self:set_state("SESSION_ACTIVE")
       Log.debug("Companion session active, remote_sid=" .. tostring(self.session_remote_sid))
+      self:after_session_active()
     end
 
     if self.on_message then

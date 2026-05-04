@@ -144,6 +144,14 @@ assert_eq(states[4], "READY", "ready state")
 assert_eq(states[5], "SESSION_STARTING", "session starting state")
 
 frame_type, payload = read_frame(accepted)
+local system_info = decode_encrypted_message(client.session, frame_type, payload)
+assert_eq(system_info._i, "_systemInfo", "system info identifier")
+
+frame_type, payload = read_frame(accepted)
+local touch_start = decode_encrypted_message(client.session, frame_type, payload)
+assert_eq(touch_start._i, "_touchStart", "touch start identifier")
+
+frame_type, payload = read_frame(accepted)
 local session_start = decode_encrypted_message(client.session, frame_type, payload)
 assert_eq(session_start._i, "_sessionStart", "session start identifier")
 assert_eq(session_start._c._srvT, "com.apple.tvremoteservices", "session start service")
@@ -158,6 +166,14 @@ local session_response_frame = client.session:encode_frame(Driver.CompanionFrame
 assert(accepted:send(session_response_frame))
 client:receive(read_exact(transport, #session_response_frame))
 assert_eq(states[6], "SESSION_ACTIVE", "session active state")
+
+frame_type, payload = read_frame(accepted)
+local ti_start = decode_encrypted_message(client.session, frame_type, payload)
+assert_eq(ti_start._i, "_tiStart", "text input start identifier")
+
+frame_type, payload = read_frame(accepted)
+local interest = decode_encrypted_message(client.session, frame_type, payload)
+assert_eq(interest._i, "_interest", "interest identifier")
 
 client:launch_app("com.netflix.Netflix")
 frame_type, payload = read_frame(accepted)
