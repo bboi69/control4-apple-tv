@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.9-dev",
+  VERSION = "0.1.10-dev",
 }
 
 local function has_c4()
@@ -2167,11 +2167,22 @@ end
 function OpenSSLCrypto.pair_verify_response(credentials, private_key, public_key, server_public_key, encrypted_data)
   local shared_secret = OpenSSLCrypto._derive_x25519(private_key, server_public_key)
   local session_key = OpenSSLCrypto.hkdf_sha512("Pair-Verify-Encrypt-Salt", "Pair-Verify-Encrypt-Info", shared_secret)
+  local nonce = OpenSSLCrypto._hap_nonce("PV-Msg02")
+  local function fp(value)
+    local ok, digest = pcall(_sha512_bytes, value)
+    return ok and Bytes.hex(digest:sub(1, 8)) or "unavailable"
+  end
   Log.debug("Pair-Verify M2 decrypt: server_public_len=" .. tostring(#server_public_key) ..
     " encrypted_len=" .. tostring(#encrypted_data))
+  Log.debug("Pair-Verify M2 diagnostics: client_pub_sha=" .. fp(public_key) ..
+    " server_pub_sha=" .. fp(server_public_key) ..
+    " shared_sha=" .. fp(shared_secret) ..
+    " session_sha=" .. fp(session_key) ..
+    " nonce=" .. Bytes.hex(nonce) ..
+    " tag=" .. Bytes.hex(encrypted_data:sub(#encrypted_data - 15)))
   local decrypted = OpenSSLCrypto._chacha20_poly1305_decrypt(
     session_key,
-    OpenSSLCrypto._hap_nonce("PV-Msg02"),
+    nonce,
     encrypted_data
   )
   Log.debug("Pair-Verify M2 decrypt: decrypted_len=" .. tostring(#(decrypted or "")))
