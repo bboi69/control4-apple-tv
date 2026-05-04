@@ -3969,6 +3969,68 @@ function AirPlayHTTP.try_parse_response(buffer)
   }, buffer:sub(response_end + 1)
 end
 
+function AirPlayHTTP.format_response(status, reason, headers, body, protocol)
+  status = status or 200
+  reason = reason or "OK"
+  protocol = protocol or "HTTP/1.1"
+  headers = headers or {}
+  body = body or ""
+
+  local lines = { protocol .. " " .. tostring(status) .. " " .. tostring(reason) }
+  local has_content_length = false
+  for key, value in pairs(headers) do
+    if string.lower(tostring(key)) == "content-length" then
+      has_content_length = true
+    end
+    lines[#lines + 1] = tostring(key) .. ": " .. tostring(value)
+  end
+  if not has_content_length then
+    lines[#lines + 1] = "Content-Length: " .. tostring(#body)
+  end
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = ""
+  return table.concat(lines, "\r\n") .. body
+end
+
+function AirPlayHTTP.try_parse_request(buffer)
+  local header_end = buffer:find("\r\n\r\n", 1, true)
+  if not header_end then
+    return nil, buffer
+  end
+
+  local header_block = buffer:sub(1, header_end - 1)
+  local body_start = header_end + 4
+  local first_line, rest = header_block:match("^([^\r\n]+)\r\n?(.*)$")
+  if not first_line then
+    error("malformed AirPlay HTTP request")
+  end
+  local method, path, protocol = first_line:match("^(%S+)%s+(%S+)%s+(%S+)$")
+  if not method then
+    error("malformed AirPlay HTTP request line: " .. tostring(first_line))
+  end
+  local headers = {}
+  for line in tostring(rest):gmatch("([^\r\n]+)") do
+    local key, value = line:match("^([^:]+):%s*(.*)$")
+    if key then
+      headers[string.lower(key)] = value
+      headers[key] = value
+    end
+  end
+  local content_length = tonumber(headers["content-length"] or headers["Content-Length"] or "0") or 0
+  local request_end = body_start + content_length - 1
+  if #buffer < request_end then
+    return nil, buffer
+  end
+  return {
+    method = method,
+    path = path,
+    protocol = protocol,
+    headers = headers,
+    body = buffer:sub(body_start, request_end),
+    raw_headers = header_block,
+  }, buffer:sub(request_end + 1)
+end
+
 function Companion.next_x()
   Companion.tx = Companion.tx + 1
   return Companion.tx
@@ -5421,6 +5483,106 @@ function C4MiniApps.handle_proxy_command(binding_id, command, params)
 end
 
 local AirPlayControlClient = {}
+local AirPlayEventChannelClient = {}
+
+function AirPlayEventChannelClient.new(options)
+  options = options or {}
+  return setmetatable({
+    host = options.host,
+    port = options.port,
+    session = HAPSession.new(options.output_key, options.input_key, options.crypto or Crypto),
+    transport = options.transport,
+    buffer = "",
+    on_connected = options.on_connected,
+    on_error = options.on_error,
+  }, { __index = AirPlayEventChannelClient })
+end
+
+function AirPlayEventChannelClient:connect()
+  assert(type(self.host) == "string" and self.host ~= "", "AirPlay event host is required")
+  assert(type(self.port) == "number", "AirPlay event port is required")
+
+  if self.transport then
+    if self.on_connected then self.on_connected(self) end
+    return self
+  end
+
+  assert(has_c4() and C4.CreateTCPClient, "Control4 TCP client is not available")
+  Log.debug("AirPlay event channel TCP connect requested: host=" .. tostring(self.host) ..
+    " port=" .. tostring(self.port))
+  local client
+  client = C4:CreateTCPClient()
+    :OnConnect(function(tcp_client)
+      Log.debug("AirPlay event channel TCP connected")
+      self.transport = tcp_client
+      if self.on_connected then self.on_connected(self) end
+      tcp_client:ReadUpTo(4096)
+    end)
+    :OnRead(function(tcp_client, data)
+      Log.debug("AirPlay event channel TCP read: bytes=" .. tostring(#(data or "")))
+      local ok, err = pcall(function() self:receive(data or "") end)
+      if not ok then
+        Log.error("AirPlay event channel receive failed: " .. tostring(err))
+        if self.on_error then self.on_error(err) end
+      end
+      tcp_client:ReadUpTo(4096)
+    end)
+    :OnDisconnect(function(_, err_code, err_msg)
+      Log.debug("AirPlay event channel TCP disconnected: code=" .. tostring(err_code) ..
+        " message=" .. tostring(err_msg))
+      self.transport = nil
+    end)
+    :OnError(function(_, err_code, err_msg)
+      Log.error("AirPlay event channel TCP error: code=" .. tostring(err_code) ..
+        " message=" .. tostring(err_msg))
+      self.transport = nil
+      if self.on_error then self.on_error(err_msg or err_code) end
+    end)
+    :Connect(self.host, self.port)
+  self.transport = client
+  return self
+end
+
+function AirPlayEventChannelClient:send_response(cseq, server)
+  if not self.transport then return nil end
+  local headers = {
+    ["Content-Length"] = "0",
+    ["Audio-Latency"] = "0",
+  }
+  if cseq then headers["CSeq"] = tostring(cseq) end
+  if server then headers["Server"] = tostring(server) end
+  local response = AirPlayHTTP.format_response(200, "OK", headers, "", "RTSP/1.0")
+  Log.debug("AirPlay event channel send response: cseq=" .. tostring(cseq))
+  return self.transport:Write(self.session:encrypt(response))
+end
+
+function AirPlayEventChannelClient:receive(data)
+  local plaintext = self.session:decrypt(data)
+  if plaintext == "" then return end
+  self.buffer = self.buffer .. plaintext
+
+  while true do
+    local request, rest = AirPlayHTTP.try_parse_request(self.buffer)
+    if not request then
+      self.buffer = rest
+      return
+    end
+    self.buffer = rest
+    Log.debug("AirPlay event channel request: method=" .. tostring(request.method) ..
+      " path=" .. tostring(request.path) ..
+      " cseq=" .. tostring(request.headers.CSeq or request.headers.cseq))
+    self:send_response(request.headers.CSeq or request.headers.cseq, request.headers.Server or request.headers.server)
+  end
+end
+
+function AirPlayEventChannelClient:close()
+  if self.transport and self.transport.Close then
+    self.transport:Close()
+  elseif self.transport and self.transport.close then
+    self.transport:close()
+  end
+  self.transport = nil
+end
 
 function AirPlayControlClient.new(options)
   options = options or {}
@@ -5443,6 +5605,7 @@ function AirPlayControlClient.new(options)
     event_port = nil,
     data_port = nil,
     data_seed = nil,
+    event_channel = nil,
     on_info = options.on_info,
     on_tunnel_setup = options.on_tunnel_setup,
     on_error = options.on_error,
@@ -5558,6 +5721,32 @@ function AirPlayControlClient:build_data_setup_plist()
   })
 end
 
+function AirPlayControlClient:derive_channel_key(salt, info)
+  assert(self.verifier and self.verifier.shared_secret, "AirPlay Pair-Verify shared secret is not available")
+  return crypto_method(self.crypto, "hkdf_sha512")(salt, info, self.verifier.shared_secret)
+end
+
+function AirPlayControlClient:open_event_channel()
+  assert(self.event_port, "AirPlay event port is required")
+  local output_key = self:derive_channel_key("Events-Salt", "Events-Read-Encryption-Key")
+  local input_key = self:derive_channel_key("Events-Salt", "Events-Write-Encryption-Key")
+  self.event_channel = AirPlayEventChannelClient.new({
+    host = self.host,
+    port = self.event_port,
+    output_key = output_key,
+    input_key = input_key,
+    crypto = self.crypto,
+    on_connected = function()
+      self:set_state("RTSP_RECORD")
+      self:send_rtsp("RECORD", "")
+    end,
+    on_error = function(err)
+      if self.on_error then self.on_error(err) end
+    end,
+  })
+  return self.event_channel:connect()
+end
+
 function AirPlayControlClient:connect(host, port)
   self.host = host or self.host
   self.port = port or self.port or 7000
@@ -5605,6 +5794,19 @@ function AirPlayControlClient:connect(host, port)
     :Connect(self.host, self.port)
   self.transport = client
   return self
+end
+
+function AirPlayControlClient:close()
+  if self.event_channel and self.event_channel.close then
+    self.event_channel:close()
+  end
+  self.event_channel = nil
+  if self.transport and self.transport.Close then
+    self.transport:Close()
+  elseif self.transport and self.transport.close then
+    self.transport:close()
+  end
+  self.transport = nil
 end
 
 function AirPlayControlClient:on_connected(transport)
@@ -5697,8 +5899,8 @@ function AirPlayControlClient:handle_encrypted_response(response)
     local body = BPlist.decode(response.body)
     self.event_port = body.eventPort or body.event_port
     Log.debug("AirPlay RTSP event channel discovered: eventPort=" .. tostring(self.event_port))
-    self:set_state("RTSP_RECORD")
-    self:send_rtsp("RECORD", "")
+    self:set_state("EVENT_CHANNEL_CONNECTING")
+    self:open_event_channel()
     return
   end
 
@@ -6456,6 +6658,10 @@ function C4Driver.disconnect_companion()
   if Companion.client and Companion.client.close then
     Companion.client:close()
   end
+  if AirPlay.control_client and AirPlay.control_client.close then
+    AirPlay.control_client:close()
+  end
+  AirPlay.control_client = nil
   Companion.client = nil
   Companion.socket = nil
   Companion.session = nil

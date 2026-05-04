@@ -1259,6 +1259,7 @@ function tests.bplist_roundtrips_nested_setup_payloads()
 end
 
 function tests.airplay_control_client_runs_rtsp_tunnel_setup_probe()
+  local old_c4 = C4
   local credentials = Driver.Credentials.parse(table.concat({
     Driver.Bytes.hex(bytes_range(0, 31)),
     Driver.Bytes.hex(bytes_range(32, 63)),
@@ -1284,6 +1285,8 @@ function tests.airplay_control_client_runs_rtsp_tunnel_setup_probe()
     hkdf_sha512 = function(_, info, _)
       if info == "Control-Write-Encryption-Key" then return "write-key" end
       if info == "Control-Read-Encryption-Key" then return "read-key" end
+      if info == "Events-Read-Encryption-Key" then return "event-write-key" end
+      if info == "Events-Write-Encryption-Key" then return "event-read-key" end
       error("unexpected hkdf info")
     end,
     random_bytes = function(n)
@@ -1298,10 +1301,32 @@ function tests.airplay_control_client_runs_rtsp_tunnel_setup_probe()
     end,
   }
   local writes = {}
+  local event_writes = {}
   local transport = {
     Write = function(_, data)
       writes[#writes + 1] = data
       return true
+    end,
+  }
+  C4 = {
+    CreateTCPClient = function()
+      local callbacks = {}
+      local tcp = {
+        OnConnect = function(self, cb) callbacks.connect = cb; return self end,
+        OnRead = function(self, cb) callbacks.read = cb; return self end,
+        OnDisconnect = function(self, cb) callbacks.disconnect = cb; return self end,
+        OnError = function(self, cb) callbacks.error = cb; return self end,
+        Connect = function(self)
+          callbacks.connect(self)
+          return self
+        end,
+        ReadUpTo = function() return true end,
+        Write = function(_, data)
+          event_writes[#event_writes + 1] = data
+          return true
+        end,
+      }
+      return tcp
     end,
   }
   local tunnel_result
@@ -1342,6 +1367,8 @@ function tests.airplay_control_client_runs_rtsp_tunnel_setup_probe()
 
   client:receive(hap_frame(http_response(Driver.BPlist.encode({ eventPort = 49152 }), "RTSP/1.0")))
   assert_eq(client.state, "RTSP_RECORD", "record state")
+  assert(client.event_channel ~= nil, "event channel created")
+  assert_eq(#event_writes, 0, "event channel does not send on connect")
   client:receive(hap_frame(http_response("", "RTSP/1.0")))
   assert_eq(client.state, "RTSP_DATA_SETUP", "data setup state")
   client:receive(hap_frame(http_response(Driver.BPlist.encode({
@@ -1354,6 +1381,7 @@ function tests.airplay_control_client_runs_rtsp_tunnel_setup_probe()
   assert(tunnel_result ~= nil, "tunnel callback")
   assert_eq(tunnel_result.event_port, 49152, "event port")
   assert_eq(tunnel_result.data_port, 49153, "data port")
+  C4 = old_c4
 end
 
 function tests.airplay_pairing_flow_saves_credentials()
