@@ -552,9 +552,6 @@ function tests.openssl_crypto_self_test_uses_documented_call_shapes()
     end)
   end)
 
-  assert_contains(fake.calls, "cipher.get:chacha20-poly1305", "cipher lookup")
-  assert_contains(fake.calls, "cipher:encrypt_new", "encrypt context")
-  assert_contains(fake.calls, "cipher:decrypt_new", "decrypt context")
   assert_contains(fake.calls, "hmac.hmac:sha512:true", "hmac call")
   assert_contains(fake.calls, "bn.powmod", "native SRP BN modpow")
   assert_contains(fake.calls, "rand.bytes:32", "secure random call")
@@ -615,6 +612,8 @@ function tests.openssl_crypto_pair_verify_response_uses_pure_x25519_and_ed25519_
 
   local old_verify = Driver.OpenSSLCrypto._verify_ed25519
   local old_sign = Driver.OpenSSLCrypto._sign_ed25519
+  local old_decrypt = Driver.OpenSSLCrypto._chacha20_poly1305_decrypt
+  local old_encrypt = Driver.OpenSSLCrypto._chacha20_poly1305_encrypt
   Driver.OpenSSLCrypto._verify_ed25519 = function(received_public_key, received_signature, received_data)
     assert_eq(received_public_key, credentials.ltpk, "verify public key")
     assert_eq(received_signature, server_signature, "verify signature")
@@ -625,6 +624,12 @@ function tests.openssl_crypto_pair_verify_response_uses_pure_x25519_and_ed25519_
     assert_eq(received_private_key, credentials.ltsk, "sign private key")
     assert_eq(received_data, public_key .. credentials.client_id .. server_public_key, "sign data")
     return "controller-signature"
+  end
+  Driver.OpenSSLCrypto._chacha20_poly1305_decrypt = function()
+    return decrypted_challenge
+  end
+  Driver.OpenSSLCrypto._chacha20_poly1305_encrypt = function()
+    return "ciphertext" .. string.rep("T", 16)
   end
 
   with_fake_openssl(fake, function()
@@ -641,9 +646,8 @@ function tests.openssl_crypto_pair_verify_response_uses_pure_x25519_and_ed25519_
   end)
   Driver.OpenSSLCrypto._verify_ed25519 = old_verify
   Driver.OpenSSLCrypto._sign_ed25519 = old_sign
-
-  assert_contains(fake.calls, "cipher:decrypt_new", "pair verify decrypt")
-  assert_contains(fake.calls, "cipher:encrypt_new", "pair verify encrypt")
+  Driver.OpenSSLCrypto._chacha20_poly1305_decrypt = old_decrypt
+  Driver.OpenSSLCrypto._chacha20_poly1305_encrypt = old_encrypt
 end
 
 function tests.companion_client_pair_verify_enables_encrypted_session()

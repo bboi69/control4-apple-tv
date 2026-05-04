@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.6-dev",
+  VERSION = "0.1.7-dev",
 }
 
 local function has_c4()
@@ -777,6 +777,197 @@ function BigInt.mont_modpow(base, exp, N, R2, k, n_prime)
   for i = 1, #result_hat do padded[i] = result_hat[i] end
   for i = #result_hat + 1, 2 * k do padded[i] = 0 end
   return mont_redc(padded, N, k, n_prime)
+end
+
+local Bit32 = {}
+do
+  local ok, native = pcall(load([[
+    return {
+      band = function(a, b) return (a & b) & 0xffffffff end,
+      bor  = function(a, b) return (a | b) & 0xffffffff end,
+      bxor = function(a, b) return (a ~ b) & 0xffffffff end,
+      lshift = function(a, n) return (a << n) & 0xffffffff end,
+      rshift = function(a, n) return (a >> n) & 0xffffffff end,
+    }
+  ]]))
+  if ok and native then
+    Bit32 = native
+  elseif bit32 then
+    Bit32.band = bit32.band
+    Bit32.bor = bit32.bor
+    Bit32.bxor = bit32.bxor
+    Bit32.lshift = bit32.lshift
+    Bit32.rshift = bit32.rshift
+  else
+    local function bitop(a, b, op)
+      local result, bit = 0, 1
+      a = a % 0x100000000
+      b = b % 0x100000000
+      for _ = 0, 31 do
+        local aa, bb = a % 2, b % 2
+        if op(aa, bb) then result = result + bit end
+        a = math.floor(a / 2)
+        b = math.floor(b / 2)
+        bit = bit * 2
+      end
+      return result
+    end
+    Bit32.band = function(a, b) return bitop(a, b, function(x, y) return x == 1 and y == 1 end) end
+    Bit32.bor = function(a, b) return bitop(a, b, function(x, y) return x == 1 or y == 1 end) end
+    Bit32.bxor = function(a, b) return bitop(a, b, function(x, y) return x ~= y end) end
+    Bit32.lshift = function(a, n) return (a * (2 ^ n)) % 0x100000000 end
+    Bit32.rshift = function(a, n) return math.floor((a % 0x100000000) / (2 ^ n)) end
+  end
+end
+
+function Bit32.add(a, b)
+  return (a + b) % 0x100000000
+end
+
+function Bit32.rotl(a, n)
+  return Bit32.bor(Bit32.lshift(a, n), Bit32.rshift(a, 32 - n))
+end
+
+local ChaCha20Poly1305Pure = {}
+local _CHACHA_CONST = { 0x61707865, 0x3320646e, 0x79622d32, 0x6b206574 }
+local _POLY1305_P = BigInt.from_bytes_be(Bytes.from_hex("03fffffffffffffffffffffffffffffffb"))
+local _POLY1305_2_128 = BigInt.from_bytes_be(Bytes.from_hex("0100000000000000000000000000000000"))
+
+local function _read_u32_le(s, offset)
+  local b1, b2, b3, b4 = s:byte(offset, offset + 3)
+  return b1 + b2 * 0x100 + b3 * 0x10000 + b4 * 0x1000000
+end
+
+local function _write_u32_le(v)
+  v = v % 0x100000000
+  return string.char(
+    v % 0x100,
+    math.floor(v / 0x100) % 0x100,
+    math.floor(v / 0x10000) % 0x100,
+    math.floor(v / 0x1000000) % 0x100
+  )
+end
+
+local function _reverse_bytes(s)
+  local out = {}
+  for i = #s, 1, -1 do out[#out + 1] = s:sub(i, i) end
+  return table.concat(out)
+end
+
+local function _bigint_from_le(s)
+  return BigInt.from_bytes_be(_reverse_bytes(s))
+end
+
+local function _bigint_to_le(v, len)
+  return _reverse_bytes(BigInt.to_bytes_be(v, len))
+end
+
+local function _quarter_round(x, a, b, c, d)
+  x[a] = Bit32.add(x[a], x[b]); x[d] = Bit32.rotl(Bit32.bxor(x[d], x[a]), 16)
+  x[c] = Bit32.add(x[c], x[d]); x[b] = Bit32.rotl(Bit32.bxor(x[b], x[c]), 12)
+  x[a] = Bit32.add(x[a], x[b]); x[d] = Bit32.rotl(Bit32.bxor(x[d], x[a]), 8)
+  x[c] = Bit32.add(x[c], x[d]); x[b] = Bit32.rotl(Bit32.bxor(x[b], x[c]), 7)
+end
+
+function ChaCha20Poly1305Pure.block(key, counter, nonce)
+  assert(#key == 32 and #nonce == 12, "ChaCha20 key/nonce length invalid")
+  local state = {
+    _CHACHA_CONST[1], _CHACHA_CONST[2], _CHACHA_CONST[3], _CHACHA_CONST[4],
+    _read_u32_le(key, 1), _read_u32_le(key, 5), _read_u32_le(key, 9), _read_u32_le(key, 13),
+    _read_u32_le(key, 17), _read_u32_le(key, 21), _read_u32_le(key, 25), _read_u32_le(key, 29),
+    counter % 0x100000000, _read_u32_le(nonce, 1), _read_u32_le(nonce, 5), _read_u32_le(nonce, 9),
+  }
+  local x = {}
+  for i = 1, 16 do x[i] = state[i] end
+  for _ = 1, 10 do
+    _quarter_round(x, 1, 5, 9, 13)
+    _quarter_round(x, 2, 6, 10, 14)
+    _quarter_round(x, 3, 7, 11, 15)
+    _quarter_round(x, 4, 8, 12, 16)
+    _quarter_round(x, 1, 6, 11, 16)
+    _quarter_round(x, 2, 7, 12, 13)
+    _quarter_round(x, 3, 8, 9, 14)
+    _quarter_round(x, 4, 5, 10, 15)
+  end
+  local out = {}
+  for i = 1, 16 do out[i] = _write_u32_le(Bit32.add(x[i], state[i])) end
+  return table.concat(out)
+end
+
+function ChaCha20Poly1305Pure.chacha20_xor(key, nonce, initial_counter, data)
+  local out, pos, counter = {}, 1, initial_counter
+  while pos <= #data do
+    local block = ChaCha20Poly1305Pure.block(key, counter, nonce)
+    local n = math.min(64, #data - pos + 1)
+    local chunk = {}
+    for i = 1, n do
+      chunk[i] = string.char(Bit32.bxor(data:byte(pos + i - 1), block:byte(i)))
+    end
+    out[#out + 1] = table.concat(chunk)
+    pos = pos + n
+    counter = (counter + 1) % 0x100000000
+  end
+  return table.concat(out)
+end
+
+local function _poly1305_clamp(r)
+  local b = { r:byte(1, 16) }
+  b[4] = Bit32.band(b[4], 15)
+  b[8] = Bit32.band(b[8], 15)
+  b[12] = Bit32.band(b[12], 15)
+  b[16] = Bit32.band(b[16], 15)
+  b[5] = Bit32.band(b[5], 252)
+  b[9] = Bit32.band(b[9], 252)
+  b[13] = Bit32.band(b[13], 252)
+  local out = {}
+  for i = 1, 16 do out[i] = string.char(b[i]) end
+  return table.concat(out)
+end
+
+local function _pad16(s)
+  local rem = #s % 16
+  if rem == 0 then return "" end
+  return string.rep("\0", 16 - rem)
+end
+
+function ChaCha20Poly1305Pure.poly1305_mac(msg, one_time_key)
+  local r = _bigint_from_le(_poly1305_clamp(one_time_key:sub(1, 16)))
+  local s = _bigint_from_le(one_time_key:sub(17, 32))
+  local acc = BigInt.from_number(0)
+  local pos = 1
+  while pos <= #msg do
+    local block = msg:sub(pos, pos + 15)
+    local n = _bigint_from_le(block .. "\1")
+    acc = BigInt.mod(BigInt.mul(BigInt.add(acc, n), r), _POLY1305_P)
+    pos = pos + 16
+  end
+  return _bigint_to_le(BigInt.mod(BigInt.add(acc, s), _POLY1305_2_128), 16)
+end
+
+function ChaCha20Poly1305Pure.encrypt(key, nonce, plaintext, aad)
+  aad = aad or ""
+  local otk = ChaCha20Poly1305Pure.block(key, 0, nonce):sub(1, 32)
+  local ciphertext = ChaCha20Poly1305Pure.chacha20_xor(key, nonce, 1, plaintext)
+  local mac_data = aad .. _pad16(aad) .. ciphertext .. _pad16(ciphertext) ..
+    Bytes.uint_le(#aad, 8) .. Bytes.uint_le(#ciphertext, 8)
+  return ciphertext .. ChaCha20Poly1305Pure.poly1305_mac(mac_data, otk)
+end
+
+function ChaCha20Poly1305Pure.auth_tag(key, nonce, ciphertext, aad)
+  aad = aad or ""
+  local otk = ChaCha20Poly1305Pure.block(key, 0, nonce):sub(1, 32)
+  local mac_data = aad .. _pad16(aad) .. ciphertext .. _pad16(ciphertext) ..
+    Bytes.uint_le(#aad, 8) .. Bytes.uint_le(#ciphertext, 8)
+  return ChaCha20Poly1305Pure.poly1305_mac(mac_data, otk)
+end
+
+function ChaCha20Poly1305Pure.decrypt(key, nonce, ciphertext_and_tag, aad)
+  assert(#ciphertext_and_tag >= 16, "ChaCha20-Poly1305 ciphertext is missing auth tag")
+  local ciphertext = ciphertext_and_tag:sub(1, #ciphertext_and_tag - 16)
+  local tag = ciphertext_and_tag:sub(#ciphertext_and_tag - 15)
+  local expected = ChaCha20Poly1305Pure.auth_tag(key, nonce, ciphertext, aad or "")
+  assert(tag == expected, "ChaCha20-Poly1305 authentication failed")
+  return ChaCha20Poly1305Pure.chacha20_xor(key, nonce, 1, ciphertext)
 end
 
 -- SRP-6a with HAP parameters: RFC 3526 3072-bit prime, g=5, SHA-512.
@@ -1871,15 +2062,13 @@ end
 function OpenSSLCrypto._chacha20_poly1305_encrypt(key, nonce, plaintext, aad)
   assert(#key == 32, "ChaCha20-Poly1305 key must be 32 bytes")
   assert(#nonce == 12, "ChaCha20-Poly1305 nonce must be 12 bytes")
-  return OpenSSLCrypto._chacha20_poly1305_encrypt_variant(
-    OpenSSLCrypto._select_chacha_variant(), key, nonce, plaintext, aad)
+  return ChaCha20Poly1305Pure.encrypt(key, nonce, plaintext, aad or "")
 end
 
 function OpenSSLCrypto._chacha20_poly1305_decrypt(key, nonce, ciphertext_and_tag, aad)
   assert(#key == 32, "ChaCha20-Poly1305 key must be 32 bytes")
   assert(#nonce == 12, "ChaCha20-Poly1305 nonce must be 12 bytes")
-  return OpenSSLCrypto._chacha20_poly1305_decrypt_variant(
-    OpenSSLCrypto._select_chacha_variant(), key, nonce, ciphertext_and_tag, aad)
+  return ChaCha20Poly1305Pure.decrypt(key, nonce, ciphertext_and_tag, aad or "")
 end
 
 function OpenSSLCrypto.encrypt(output_key, plaintext, aad, nonce)
