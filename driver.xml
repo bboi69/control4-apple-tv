@@ -505,6 +505,18 @@
                 <readonly>true</readonly>
             </property>
             <property>
+                <name>Companion State</name>
+                <default>Disconnected</default>
+                <type>STRING</type>
+                <readonly>true</readonly>
+            </property>
+            <property>
+                <name>AirPlay Monitor State</name>
+                <default>Stopped</default>
+                <type>STRING</type>
+                <readonly>true</readonly>
+            </property>
+            <property>
                 <name>Current App</name>
                 <default />
                 <type>STRING</type>

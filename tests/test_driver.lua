@@ -1605,6 +1605,7 @@ function tests.driver_destroy_closes_client_and_cancels_timers()
   assert_contains(cancelled, "AppleTV_reselect_passthrough", "passthrough timer cancelled")
   assert_contains(cancelled, "AppleTV_airplay_monitor_start", "AirPlay monitor start timer cancelled")
   assert_contains(cancelled, "AppleTV_airplay_monitor_retry", "AirPlay monitor retry timer cancelled")
+  assert_contains(cancelled, "AppleTV_airplay_monitor_watchdog", "AirPlay monitor watchdog timer cancelled")
   assert_eq(Driver.OpenSSLCrypto._pregenerated_x25519_keypair, nil, "destroy clears pregenerated x25519 keypair")
 
   CancelTimer = old_cancel_timer
@@ -2392,8 +2393,88 @@ function tests.disconnect_companion_keeps_credentials()
   assert_eq(Driver.Companion.session, nil, "session cleared")
   assert_eq(Driver.OpenSSLCrypto._pregenerated_x25519_keypair, nil, "disconnect clears pregenerated x25519 keypair")
   assert_eq(Properties["Connection State"], "Disconnected", "disconnect state")
+  assert_eq(Properties["Companion State"], "Disconnected", "disconnect companion state")
+  assert_eq(Properties["AirPlay Monitor State"], "STOPPED", "disconnect stops AirPlay monitor")
   Properties = old_properties
   Driver.OpenSSLCrypto._pregenerated_x25519_keypair = old_pregen
+end
+
+function tests.connection_state_also_publishes_companion_state()
+  local old_properties = Properties
+  Properties = {}
+  Driver.C4Driver.set_connection_state("SESSION_ACTIVE")
+  assert_eq(Properties["Connection State"], "SESSION_ACTIVE", "connection state")
+  assert_eq(Properties["Companion State"], "SESSION_ACTIVE", "companion state")
+  Properties = old_properties
+end
+
+function tests.airplay_monitor_watchdog_sends_heartbeat()
+  local old_properties = Properties
+  local old_client = Driver.AirPlay.control_client
+  local old_enabled = Driver.AirPlay.monitor_enabled
+  local old_last = Driver.AirPlay.monitor_last_activity_ms
+  local old_now = Driver.C4Driver.now_ms
+  local sent = false
+
+  Properties = {}
+  Driver.AirPlay.monitor_enabled = true
+  Driver.AirPlay.monitor_last_activity_ms = 1000
+  Driver.C4Driver.now_ms = function() return 2000 end
+  Driver.AirPlay.control_client = {
+    data_channel = {
+      transport = {},
+      send_heartbeat = function()
+        sent = true
+      end,
+    },
+  }
+
+  Driver.C4Driver.check_airplay_monitor_watchdog()
+  assert_eq(sent, true, "watchdog heartbeat sent")
+  assert_eq(Driver.AirPlay.control_client ~= nil, true, "active monitor remains connected")
+
+  Properties = old_properties
+  Driver.AirPlay.control_client = old_client
+  Driver.AirPlay.monitor_enabled = old_enabled
+  Driver.AirPlay.monitor_last_activity_ms = old_last
+  Driver.C4Driver.now_ms = old_now
+end
+
+function tests.airplay_monitor_watchdog_restarts_stale_channel()
+  local old_properties = Properties
+  local old_client = Driver.AirPlay.control_client
+  local old_enabled = Driver.AirPlay.monitor_enabled
+  local old_last = Driver.AirPlay.monitor_last_activity_ms
+  local old_stale = Driver.AirPlay.monitor_stale_ms
+  local old_now = Driver.C4Driver.now_ms
+  local closed = false
+
+  Properties = {}
+  Driver.AirPlay.monitor_enabled = true
+  Driver.AirPlay.monitor_last_activity_ms = 1000
+  Driver.AirPlay.monitor_stale_ms = 500
+  Driver.C4Driver.now_ms = function() return 2000 end
+  Driver.AirPlay.control_client = {
+    data_channel = {
+      transport = {},
+    },
+    close = function()
+      closed = true
+    end,
+  }
+
+  Driver.C4Driver.check_airplay_monitor_watchdog()
+  assert_eq(closed, true, "stale monitor closes old client")
+  assert_eq(Driver.AirPlay.control_client, nil, "stale monitor clears old client")
+  assert_eq(Properties["AirPlay Monitor State"], "STALE", "stale monitor state")
+  assert_eq(Properties["Connection State"], nil, "metadata failure does not alter control state")
+
+  Properties = old_properties
+  Driver.AirPlay.control_client = old_client
+  Driver.AirPlay.monitor_enabled = old_enabled
+  Driver.AirPlay.monitor_last_activity_ms = old_last
+  Driver.AirPlay.monitor_stale_ms = old_stale
+  Driver.C4Driver.now_ms = old_now
 end
 
 function tests.bigint_arithmetic()

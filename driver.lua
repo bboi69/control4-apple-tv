@@ -3673,7 +3673,11 @@ local AirPlay = {
   pairing_active = false,
   control_client = nil,
   monitor_enabled = false,
+  monitor_state = "Stopped",
   monitor_retry_ms = 15000,
+  monitor_heartbeat_ms = 30000,
+  monitor_stale_ms = 90000,
+  monitor_last_activity_ms = nil,
 }
 
 local BPlist = {}
@@ -5998,6 +6002,7 @@ function AirPlayDataChannelClient.new(options)
     client_id = options.client_id,
     startup_stage = "idle",
     on_connected = options.on_connected,
+    on_activity = options.on_activity,
     on_error = options.on_error,
   }, { __index = AirPlayDataChannelClient })
 end
@@ -6025,6 +6030,7 @@ function AirPlayDataChannelClient:connect()
     end)
     :OnRead(function(tcp_client, data)
       Log.debug("AirPlay data channel TCP read: bytes=" .. tostring(#(data or "")))
+      if self.on_activity then self.on_activity("read") end
       local ok, err = pcall(function() self:receive(data or "") end)
       if not ok then
         Log.error("AirPlay data channel receive failed: " .. tostring(err))
@@ -6036,6 +6042,7 @@ function AirPlayDataChannelClient:connect()
       Log.debug("AirPlay data channel TCP disconnected: code=" .. tostring(err_code) ..
         " message=" .. tostring(err_msg))
       self.transport = nil
+      if not self.closed and self.on_error then self.on_error(err_msg or err_code or "disconnect") end
     end)
     :OnError(function(_, err_code, err_msg)
       Log.error("AirPlay data channel TCP error: code=" .. tostring(err_code) ..
@@ -6069,6 +6076,7 @@ function AirPlayDataChannelClient:encode_message(message_type, command, seqno, p
 end
 
 function AirPlayDataChannelClient:send_payload(plist_payload)
+  assert(self.transport, "AirPlay data channel is not connected")
   local frame = self:encode_message("sync", "comm", self.send_seqno, BPlist.encode(plist_payload))
   Log.debug("AirPlay data channel send frame: seqno=" .. tostring(self.send_seqno) ..
     " payload_len=" .. tostring(#frame - DATA_HEADER_LENGTH))
@@ -6103,7 +6111,13 @@ function AirPlayDataChannelClient:send_post_device_info_bootstrap()
   self:send_protobuf(PB.get_keyboard_session(self.crypto, keyboard_id))
 end
 
+function AirPlayDataChannelClient:send_heartbeat()
+  Log.debug("AirPlay data channel heartbeat: sending MRP connection state")
+  return self:send_protobuf(PB.set_connection_state(self.crypto))
+end
+
 function AirPlayDataChannelClient:send_reply(seqno)
+  assert(self.transport, "AirPlay data channel is not connected")
   local frame = self:encode_message("rply", "\0\0\0\0", seqno, "")
   local seqno_log = type(seqno) == "string" and Bytes.hex(seqno) or tostring(seqno)
   Log.debug("AirPlay data channel send reply: seqno=" .. seqno_log)
@@ -6163,6 +6177,7 @@ function AirPlayDataChannelClient:handle_payload(message_type, seqno, payload)
 end
 
 function AirPlayDataChannelClient:close()
+  self.closed = true
   if self.transport and self.transport.Close then
     self.transport:Close()
   elseif self.transport and self.transport.close then
@@ -6296,6 +6311,7 @@ function AirPlayControlClient.new(options)
     data_channel = nil,
     on_info = options.on_info,
     on_tunnel_setup = options.on_tunnel_setup,
+    on_activity = options.on_activity,
     on_error = options.on_error,
     on_disconnect = options.on_disconnect,
     on_state = options.on_state,
@@ -6457,6 +6473,9 @@ function AirPlayControlClient:open_data_channel()
           seed = self.data_seed,
         })
       end
+    end,
+    on_activity = function(reason)
+      if self.on_activity then self.on_activity(reason) end
     end,
     on_error = function(err)
       if self.on_error then self.on_error(err) end
@@ -6699,9 +6718,29 @@ function C4Driver.update_property_list(name, items)
   end
 end
 
+function C4Driver.now_ms()
+  if has_c4() and C4.GetTime then
+    local ok, value = pcall(function() return C4:GetTime() end)
+    if ok and type(value) == "number" then
+      return value
+    end
+  end
+  return (os.time() or 0) * 1000
+end
+
 function C4Driver.set_connection_state(value)
+  C4Driver.set_companion_state(value)
+end
+
+function C4Driver.set_companion_state(value)
   Companion.state = value
   C4Driver.update_property("Connection State", value)
+  C4Driver.update_property("Companion State", value)
+end
+
+function C4Driver.set_airplay_monitor_state(value)
+  AirPlay.monitor_state = value
+  C4Driver.update_property("AirPlay Monitor State", value)
 end
 
 function C4Driver.publish_current_app()
@@ -6802,6 +6841,7 @@ end
 
 function C4Driver.schedule_airplay_monitor_retry(reason)
   if not AirPlay.monitor_enabled then return end
+  C4Driver.cancel_timer("AppleTV_airplay_monitor_watchdog")
   if not (has_c4() and type(SetTimer) == "function") then return end
   C4Driver.cancel_timer("AppleTV_airplay_monitor_retry")
   Log.debug("AirPlay monitor retry scheduled: " .. tostring(reason or "unknown") ..
@@ -6814,6 +6854,58 @@ function C4Driver.schedule_airplay_monitor_retry(reason)
   if not ok then
     Log.debug("AirPlay monitor retry timer unavailable: " .. tostring(err))
   end
+end
+
+function C4Driver.mark_airplay_monitor_activity(reason)
+  AirPlay.monitor_last_activity_ms = C4Driver.now_ms()
+  if AirPlay.monitor_state ~= "ACTIVE" then
+    C4Driver.set_airplay_monitor_state("ACTIVE")
+  end
+  if reason and reason ~= "" and reason ~= "read" then
+    Log.debug("AirPlay monitor activity: " .. tostring(reason))
+  end
+end
+
+function C4Driver.schedule_airplay_monitor_watchdog()
+  if not AirPlay.monitor_enabled then return end
+  if not (has_c4() and type(SetTimer) == "function") then return end
+  C4Driver.cancel_timer("AppleTV_airplay_monitor_watchdog")
+  local ok, err = pcall(SetTimer, "AppleTV_airplay_monitor_watchdog", AirPlay.monitor_heartbeat_ms, function()
+    C4Driver.check_airplay_monitor_watchdog()
+  end)
+  if not ok then
+    Log.debug("AirPlay monitor watchdog timer unavailable: " .. tostring(err))
+  end
+end
+
+function C4Driver.check_airplay_monitor_watchdog()
+  if not AirPlay.monitor_enabled then return end
+  local client = AirPlay.control_client
+  local data_channel = client and client.data_channel
+  if not data_channel or not data_channel.transport then
+    C4Driver.set_airplay_monitor_state("STALE")
+    C4Driver.close_airplay_control_client("AirPlay monitor watchdog missing data channel")
+    C4Driver.schedule_airplay_monitor_retry("watchdog missing data channel")
+    return
+  end
+
+  local last_activity = AirPlay.monitor_last_activity_ms or 0
+  local age = C4Driver.now_ms() - last_activity
+  if last_activity > 0 and age > AirPlay.monitor_stale_ms then
+    C4Driver.set_airplay_monitor_state("STALE")
+    C4Driver.close_airplay_control_client("AirPlay monitor watchdog stale")
+    C4Driver.schedule_airplay_monitor_retry("watchdog stale")
+    return
+  end
+
+  local ok, err = pcall(function() data_channel:send_heartbeat() end)
+  if not ok then
+    C4Driver.set_airplay_monitor_state("FAILED")
+    C4Driver.close_airplay_control_client("AirPlay monitor heartbeat failed")
+    C4Driver.schedule_airplay_monitor_retry(err or "heartbeat failed")
+    return
+  end
+  C4Driver.schedule_airplay_monitor_watchdog()
 end
 
 function C4Driver.start_airplay_monitor(reason)
@@ -6832,10 +6924,13 @@ function C4Driver.start_airplay_monitor(reason)
 
   AirPlay.monitor_enabled = true
   C4Driver.cancel_timer("AppleTV_airplay_monitor_retry")
+  C4Driver.cancel_timer("AppleTV_airplay_monitor_watchdog")
 
   local function start_monitor(port)
     C4Driver.close_airplay_control_client("starting AirPlay monitor")
     AirPlay.port = port or AirPlay.port or 7000
+    AirPlay.monitor_last_activity_ms = C4Driver.now_ms()
+    C4Driver.set_airplay_monitor_state("CONNECTING")
     AirPlay.control_client = AirPlayControlClient.new({
       host = host,
       port = AirPlay.port,
@@ -6845,16 +6940,23 @@ function C4Driver.start_airplay_monitor(reason)
       on_tunnel_setup = function(result)
         if result and result.data_port then
           Log.debug("AirPlay monitor active: dataPort=" .. tostring(result.data_port))
+          C4Driver.mark_airplay_monitor_activity("tunnel ready")
+          C4Driver.schedule_airplay_monitor_watchdog()
         else
           Log.debug("AirPlay monitor setup incomplete")
+          C4Driver.set_airplay_monitor_state("SETUP_INCOMPLETE")
+          C4Driver.schedule_airplay_monitor_retry("setup incomplete")
         end
       end,
+      on_activity = function(activity_reason)
+        C4Driver.mark_airplay_monitor_activity(activity_reason)
+      end,
       on_disconnect = function(err)
-        C4Driver.update_property("Connection State", "AirPlay Monitor Disconnected")
+        C4Driver.set_airplay_monitor_state("DISCONNECTED")
         C4Driver.schedule_airplay_monitor_retry(err or "disconnect")
       end,
       on_error = function(err)
-        C4Driver.update_property("Connection State", "AirPlay Monitor Failed")
+        C4Driver.set_airplay_monitor_state("FAILED")
         C4Driver.schedule_airplay_monitor_retry(err or "error")
       end,
     })
@@ -6867,6 +6969,7 @@ function C4Driver.start_airplay_monitor(reason)
   end
 
   Log.debug("AirPlay monitor waiting for AirPlay port discovery")
+  C4Driver.set_airplay_monitor_state("DISCOVERING")
   return MDNS.discover_airplay_info(host, function(info)
     if info and info.port then
       AirPlay.port = info.port
@@ -6874,7 +6977,7 @@ function C4Driver.start_airplay_monitor(reason)
       start_monitor(info.port)
     else
       Log.debug("AirPlay monitor skipped: AirPlay service not discovered")
-      C4Driver.update_property("Connection State", "AirPlay Not Found")
+      C4Driver.set_airplay_monitor_state("NOT_FOUND")
       C4Driver.schedule_airplay_monitor_retry("AirPlay service not discovered")
     end
   end)
@@ -6883,7 +6986,9 @@ end
 function C4Driver.stop_airplay_monitor(reason)
   AirPlay.monitor_enabled = false
   C4Driver.cancel_timer("AppleTV_airplay_monitor_retry")
+  C4Driver.cancel_timer("AppleTV_airplay_monitor_watchdog")
   C4Driver.close_airplay_control_client(reason or "stopping AirPlay monitor")
+  C4Driver.set_airplay_monitor_state("STOPPED")
 end
 
 function C4Driver.schedule_airplay_monitor_start()
@@ -6896,6 +7001,7 @@ function C4Driver.schedule_airplay_monitor_start()
   end
   if type(SetTimer) == "function" then
     C4Driver.cancel_timer("AppleTV_airplay_monitor_start")
+    C4Driver.set_airplay_monitor_state("SCHEDULED")
     local ok, err = pcall(SetTimer, "AppleTV_airplay_monitor_start", 2000, function()
       C4Driver.start_airplay_monitor("auto-start")
     end)
@@ -7451,6 +7557,7 @@ function C4Driver.cancel_driver_timers()
   C4Driver.cancel_timer("AppleTV_mdns_timeout")
   C4Driver.cancel_timer("AppleTV_airplay_monitor_start")
   C4Driver.cancel_timer("AppleTV_airplay_monitor_retry")
+  C4Driver.cancel_timer("AppleTV_airplay_monitor_watchdog")
   MDNS.close()
 end
 
