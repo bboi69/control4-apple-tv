@@ -6127,11 +6127,6 @@ function AirPlayDataChannelClient:receive(data)
     local seqno_bytes = frame:sub(21, 28)
     local seqno = Bytes.read_uint_be(frame, 21, 8)
     local payload = frame:sub(DATA_HEADER_LENGTH + 1)
-    Log.debug("AirPlay data channel frame: type=" .. tostring(message_type) ..
-      " command=" .. tostring(command) ..
-      " seqno=" .. tostring(seqno) ..
-      " payload_len=" .. tostring(#payload) ..
-      " head=" .. Bytes.hex(payload:sub(1, 24)))
     self:handle_payload(message_type, seqno_bytes, payload)
   end
 end
@@ -6156,14 +6151,10 @@ function AirPlayDataChannelClient:handle_payload(message_type, seqno, payload)
             self:send_post_device_info_bootstrap()
           end
         end
-        Log.debug("AirPlay data channel protobuf bytes: len=" .. tostring(#data.data) ..
-          " head=" .. Bytes.hex(data.data:sub(1, 32)) ..
-          " desc=" .. description)
-      else
-        Log.debug("AirPlay data channel plist payload: " .. BPlist.describe(decoded))
+        if description ~= "" and not description:match("^UPDATE_OUTPUT_DEVICE_MESSAGE") then
+          Log.debug("AirPlay MRP: " .. description)
+        end
       end
-    else
-      Log.debug("AirPlay data channel non-plist payload: " .. tostring(decoded))
     end
   end
   if message_type == "sync" then
@@ -6267,14 +6258,6 @@ function AirPlayEventChannelClient:receive(data)
       " path=" .. tostring(request.path) ..
       " cseq=" .. tostring(request.headers.CSeq or request.headers.cseq) ..
       " body_len=" .. tostring(#(request.body or "")))
-    if request.body and request.body ~= "" then
-      local ok, decoded = pcall(BPlist.decode, request.body)
-      if ok then
-        Log.debug("AirPlay event channel plist payload: " .. BPlist.describe(decoded))
-      else
-        Log.debug("AirPlay event channel body head=" .. Bytes.hex(request.body:sub(1, 64)))
-      end
-    end
     self:send_response(request.headers.CSeq or request.headers.cseq, request.headers.Server or request.headers.server)
   end
 end
@@ -6800,121 +6783,6 @@ function C4Driver.refresh_app_list()
   return Companion.fetch_apps()
 end
 
-function C4Driver.probe_metadata_service()
-  local host = Properties and Properties["Apple TV Address"]
-  if not host or host == "" then
-    Log.error("Apple TV Address is required")
-    return nil, "Apple TV Address is required"
-  end
-  Log.debug("MRP metadata service probe requested")
-  return MDNS.discover_mrp_port(host, function(port)
-    if port then
-      Log.debug("MRP metadata service available: host=" .. tostring(host) ..
-        " port=" .. tostring(port))
-      C4Driver.update_property("Connection State", "MRP Metadata Port " .. tostring(port))
-    else
-      Log.debug("MRP metadata service not discovered; metadata may require tunneled media remote")
-      C4Driver.update_property("Connection State", "MRP Metadata Not Found")
-    end
-  end)
-end
-
-function C4Driver.render_airplay_txt(txt)
-  if type(txt) ~= "table" then return "" end
-  local keys = {
-    "deviceid", "features", "fex", "flags", "model", "osvers", "protovers",
-    "srcvers", "vv", "pi", "psi", "pk", "acl", "gcgl", "igl",
-  }
-  local parts = {}
-  for _, key in ipairs(keys) do
-    local value = txt[key]
-    if value ~= nil then
-      parts[#parts + 1] = key .. "=" .. tostring(value)
-    end
-  end
-  return table.concat(parts, " ")
-end
-
-function C4Driver.probe_airplay_service()
-  local host = Properties and Properties["Apple TV Address"]
-  if not host or host == "" then
-    Log.error("Apple TV Address is required")
-    return nil, "Apple TV Address is required"
-  end
-  Log.debug("AirPlay service probe requested")
-  return MDNS.discover_airplay_info(host, function(info)
-    if info and info.port then
-      local txt = info.txt or {}
-      AirPlay.port = info.port
-      AirPlay.txt = txt
-      Log.debug("AirPlay service available: host=" .. tostring(host) ..
-        " port=" .. tostring(info.port) ..
-        " txt={" .. C4Driver.render_airplay_txt(txt) .. "}")
-      C4Driver.update_property("Connection State", "AirPlay Port " .. tostring(info.port))
-    else
-      Log.debug("AirPlay service not discovered")
-      C4Driver.update_property("Connection State", "AirPlay Not Found")
-    end
-  end)
-end
-
-function C4Driver.probe_airplay_info()
-  local host = Properties and Properties["Apple TV Address"]
-  if not host or host == "" then
-    Log.error("Apple TV Address is required")
-    return nil, "Apple TV Address is required"
-  end
-
-  local function request_info(port)
-    port = port or AirPlay.port or 7000
-    local url = "http://" .. tostring(host) .. ":" .. tostring(port) .. "/info"
-    if not (has_c4() and C4.urlGet) then
-      Log.error("AirPlay /info probe requires Control4 HTTP client")
-      return nil, "Control4 HTTP client unavailable"
-    end
-
-    Log.debug("AirPlay /info probe requested: " .. url)
-    local headers = {
-      ["User-Agent"] = "AirPlay/550.10",
-      ["Connection"] = "keep-alive",
-    }
-    return C4:urlGet(url, headers, false, function(_, body, response_code, response_headers, error_text)
-      if error_text ~= nil then
-        Log.error("AirPlay /info probe failed: " .. tostring(error_text))
-        C4Driver.update_property("Connection State", "AirPlay Info Failed")
-        return
-      end
-
-      body = body or ""
-      local content_type = ""
-      if type(response_headers) == "table" then
-        content_type = response_headers["Content-Type"] or response_headers["content-type"] or ""
-      end
-      Log.debug("AirPlay /info response: code=" .. tostring(response_code) ..
-        " content_type=" .. tostring(content_type) ..
-        " body_len=" .. tostring(#body) ..
-        " body_head=" .. Bytes.hex(body:sub(1, 32)))
-      C4Driver.update_property("Connection State", "AirPlay Info " .. tostring(response_code))
-    end)
-  end
-
-  if AirPlay.port then
-    return request_info(AirPlay.port)
-  end
-
-  Log.debug("AirPlay /info probe waiting for AirPlay port discovery")
-  return MDNS.discover_airplay_info(host, function(info)
-    if info and info.port then
-      AirPlay.port = info.port
-      AirPlay.txt = info.txt or {}
-      request_info(info.port)
-    else
-      Log.debug("AirPlay /info probe skipped: AirPlay service not discovered")
-      C4Driver.update_property("Connection State", "AirPlay Not Found")
-    end
-  end)
-end
-
 function C4Driver.airplay_post(path, body, callback)
   local host = Properties and Properties["Apple TV Address"]
   local port = AirPlay.port or 7000
@@ -6930,102 +6798,6 @@ function C4Driver.airplay_post(path, body, callback)
     ["Content-Type"] = "application/octet-stream",
   }
   return C4:urlPost(url, body or "", headers, false, callback)
-end
-
-function C4Driver.probe_airplay_pair_verify()
-  C4Driver.ensure_crypto_provider()
-  local host = Properties and Properties["Apple TV Address"]
-  if not host or host == "" then
-    Log.error("Apple TV Address is required")
-    return nil, "Apple TV Address is required"
-  end
-
-  local credentials = AirPlay.credentials or (Driver.state and Driver.state.airplay_credentials and Credentials.parse(Driver.state.airplay_credentials))
-  if not credentials or credentials.type ~= "HAP" then
-    Log.error("AirPlay HAP credentials are required for Pair-Verify probe")
-    C4Driver.update_property("Connection State", "AirPlay Credentials Required")
-    return nil, "AirPlay HAP credentials are required"
-  end
-
-  local function start_pair_verify(port)
-    AirPlay.port = port or AirPlay.port or 7000
-    local verifier = PairVerify.new(credentials, Crypto)
-    AirPlay.verifier = verifier
-    AirPlay.control_keys = nil
-    local body = verifier:start_hap()
-    Log.debug("AirPlay Pair-Verify M1 requested: port=" .. tostring(AirPlay.port) ..
-      " payload_len=" .. tostring(#body))
-    return C4Driver.airplay_post("/pair-verify", body, function(_, response_body, response_code, response_headers, error_text)
-      if error_text ~= nil then
-        Log.error("AirPlay Pair-Verify M2 failed: " .. tostring(error_text))
-        C4Driver.update_property("Connection State", "AirPlay Pair-Verify Failed")
-        return
-      end
-
-      response_body = response_body or ""
-      local content_type = ""
-      if type(response_headers) == "table" then
-        content_type = response_headers["Content-Type"] or response_headers["content-type"] or ""
-      end
-      Log.debug("AirPlay Pair-Verify M2 response: code=" .. tostring(response_code) ..
-        " content_type=" .. tostring(content_type) ..
-        " body_len=" .. tostring(#response_body) ..
-        " body_head=" .. Bytes.hex(response_body:sub(1, 32)))
-
-      local code = tonumber(response_code) or 0
-      if code < 200 or code >= 300 then
-        C4Driver.update_property("Connection State", "AirPlay Pair-Verify " .. tostring(response_code))
-        return
-      end
-
-      local ok, next_body_or_err, keys = pcall(function()
-        local next_body, control_keys = verifier:finish_hap(response_body)
-        return next_body, control_keys
-      end)
-      if not ok then
-        Log.error("AirPlay Pair-Verify M2 processing failed: " .. tostring(next_body_or_err))
-        C4Driver.update_property("Connection State", "AirPlay Pair-Verify Failed")
-        return
-      end
-
-      local next_body = next_body_or_err
-      AirPlay.control_keys = keys
-      Log.debug("AirPlay Pair-Verify M3 requested: payload_len=" .. tostring(#next_body))
-      C4Driver.airplay_post("/pair-verify", next_body, function(_, final_body, final_code, _, final_error)
-        if final_error ~= nil then
-          Log.error("AirPlay Pair-Verify M4 failed: " .. tostring(final_error))
-          C4Driver.update_property("Connection State", "AirPlay Pair-Verify Failed")
-          return
-        end
-        final_body = final_body or ""
-        Log.debug("AirPlay Pair-Verify M4 response: code=" .. tostring(final_code) ..
-          " body_len=" .. tostring(#final_body) ..
-          " body_head=" .. Bytes.hex(final_body:sub(1, 32)))
-        local final_code_num = tonumber(final_code) or 0
-        if final_code_num >= 200 and final_code_num < 300 then
-          C4Driver.update_property("Connection State", "AirPlay Pair-Verify Ready")
-        else
-          C4Driver.update_property("Connection State", "AirPlay Pair-Verify " .. tostring(final_code))
-        end
-      end)
-    end)
-  end
-
-  if AirPlay.port then
-    return start_pair_verify(AirPlay.port)
-  end
-
-  Log.debug("AirPlay Pair-Verify waiting for AirPlay port discovery")
-  return MDNS.discover_airplay_info(host, function(info)
-    if info and info.port then
-      AirPlay.port = info.port
-      AirPlay.txt = info.txt or {}
-      start_pair_verify(info.port)
-    else
-      Log.debug("AirPlay Pair-Verify skipped: AirPlay service not discovered")
-      C4Driver.update_property("Connection State", "AirPlay Not Found")
-    end
-  end)
 end
 
 function C4Driver.schedule_airplay_monitor_retry(reason)
@@ -7073,9 +6845,8 @@ function C4Driver.start_airplay_monitor(reason)
       on_tunnel_setup = function(result)
         if result and result.data_port then
           Log.debug("AirPlay monitor active: dataPort=" .. tostring(result.data_port))
-          C4Driver.update_property("Connection State", "AirPlay Monitor Active")
         else
-          C4Driver.update_property("Connection State", "AirPlay Monitor Incomplete")
+          Log.debug("AirPlay monitor setup incomplete")
         end
       end,
       on_disconnect = function(err)
@@ -7113,7 +6884,6 @@ function C4Driver.stop_airplay_monitor(reason)
   AirPlay.monitor_enabled = false
   C4Driver.cancel_timer("AppleTV_airplay_monitor_retry")
   C4Driver.close_airplay_control_client(reason or "stopping AirPlay monitor")
-  C4Driver.update_property("Connection State", "AirPlay Monitor Stopped")
 end
 
 function C4Driver.schedule_airplay_monitor_start()
@@ -7137,116 +6907,6 @@ function C4Driver.schedule_airplay_monitor_start()
   else
     C4Driver.start_airplay_monitor("auto-start")
   end
-end
-
-function C4Driver.probe_airplay_control_info()
-  C4Driver.ensure_crypto_provider()
-  local host = Properties and Properties["Apple TV Address"]
-  if not host or host == "" then
-    Log.error("Apple TV Address is required")
-    return nil, "Apple TV Address is required"
-  end
-
-  local credentials = AirPlay.credentials or (Driver.state and Driver.state.airplay_credentials and Credentials.parse(Driver.state.airplay_credentials))
-  if not credentials or credentials.type ~= "HAP" then
-    Log.error("AirPlay HAP credentials are required for encrypted info probe")
-    C4Driver.update_property("Connection State", "AirPlay Credentials Required")
-    return nil, "AirPlay HAP credentials are required"
-  end
-
-  local function start_probe(port)
-    C4Driver.close_airplay_control_client("restarting AirPlay encrypted /info probe")
-    AirPlay.port = port or AirPlay.port or 7000
-    AirPlay.control_client = AirPlayControlClient.new({
-      host = host,
-      port = AirPlay.port,
-      credentials = credentials,
-      crypto = Crypto,
-      on_info = function(response)
-        local status = tonumber(response.status) or 0
-        if status >= 200 and status < 300 then
-          C4Driver.update_property("Connection State", "AirPlay Encrypted Info " .. tostring(response.status))
-        else
-          C4Driver.update_property("Connection State", "AirPlay Encrypted Info Failed")
-        end
-      end,
-      on_error = function()
-        C4Driver.update_property("Connection State", "AirPlay Control Failed")
-      end,
-    })
-    return AirPlay.control_client:connect(host, AirPlay.port)
-  end
-
-  if AirPlay.port then
-    return start_probe(AirPlay.port)
-  end
-
-  Log.debug("AirPlay encrypted /info probe waiting for AirPlay port discovery")
-  return MDNS.discover_airplay_info(host, function(info)
-    if info and info.port then
-      AirPlay.port = info.port
-      AirPlay.txt = info.txt or {}
-      start_probe(info.port)
-    else
-      Log.debug("AirPlay encrypted /info probe skipped: AirPlay service not discovered")
-      C4Driver.update_property("Connection State", "AirPlay Not Found")
-    end
-  end)
-end
-
-function C4Driver.probe_airplay_tunnel_setup()
-  C4Driver.ensure_crypto_provider()
-  local host = Properties and Properties["Apple TV Address"]
-  if not host or host == "" then
-    Log.error("Apple TV Address is required")
-    return nil, "Apple TV Address is required"
-  end
-
-  local credentials = AirPlay.credentials or (Driver.state and Driver.state.airplay_credentials and Credentials.parse(Driver.state.airplay_credentials))
-  if not credentials or credentials.type ~= "HAP" then
-    Log.error("AirPlay HAP credentials are required for tunnel setup probe")
-    C4Driver.update_property("Connection State", "AirPlay Credentials Required")
-    return nil, "AirPlay HAP credentials are required"
-  end
-
-  local function start_probe(port)
-    C4Driver.close_airplay_control_client("restarting AirPlay tunnel setup probe")
-    AirPlay.port = port or AirPlay.port or 7000
-    AirPlay.control_client = AirPlayControlClient.new({
-      host = host,
-      port = AirPlay.port,
-      credentials = credentials,
-      crypto = Crypto,
-      probe = "tunnel_setup",
-      on_tunnel_setup = function(result)
-        if result and result.data_port then
-          C4Driver.update_property("Connection State", "AirPlay Tunnel Ready " .. tostring(result.data_port))
-        else
-          C4Driver.update_property("Connection State", "AirPlay Tunnel Setup Incomplete")
-        end
-      end,
-      on_error = function()
-        C4Driver.update_property("Connection State", "AirPlay Tunnel Failed")
-      end,
-    })
-    return AirPlay.control_client:connect(host, AirPlay.port)
-  end
-
-  if AirPlay.port then
-    return start_probe(AirPlay.port)
-  end
-
-  Log.debug("AirPlay tunnel setup probe waiting for AirPlay port discovery")
-  return MDNS.discover_airplay_info(host, function(info)
-    if info and info.port then
-      AirPlay.port = info.port
-      AirPlay.txt = info.txt or {}
-      start_probe(info.port)
-    else
-      Log.debug("AirPlay tunnel setup probe skipped: AirPlay service not discovered")
-      C4Driver.update_property("Connection State", "AirPlay Not Found")
-    end
-  end)
 end
 
 function C4Driver.pair_airplay()
@@ -7818,24 +7478,6 @@ EC.CHECK_CRYPTO_PROVIDER = function()
 end
 EC.PREWARM_CRYPTO = function()
   return C4Driver.prewarm_crypto()
-end
-EC.PROBE_METADATA_SERVICE = function()
-  return C4Driver.probe_metadata_service()
-end
-EC.PROBE_AIRPLAY_SERVICE = function()
-  return C4Driver.probe_airplay_service()
-end
-EC.PROBE_AIRPLAY_INFO = function()
-  return C4Driver.probe_airplay_info()
-end
-EC.PROBE_AIRPLAY_PAIR_VERIFY = function()
-  return C4Driver.probe_airplay_pair_verify()
-end
-EC.PROBE_AIRPLAY_CONTROL_INFO = function()
-  return C4Driver.probe_airplay_control_info()
-end
-EC.PROBE_AIRPLAY_TUNNEL_SETUP = function()
-  return C4Driver.probe_airplay_tunnel_setup()
 end
 EC.START_AIRPLAY_MONITOR = function()
   return C4Driver.start_airplay_monitor("manual")

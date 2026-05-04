@@ -721,30 +721,6 @@
                 <command>PREWARM_CRYPTO</command>
             </action>
             <action>
-                <name>Probe Metadata Service</name>
-                <command>PROBE_METADATA_SERVICE</command>
-            </action>
-            <action>
-                <name>Probe AirPlay Service</name>
-                <command>PROBE_AIRPLAY_SERVICE</command>
-            </action>
-            <action>
-                <name>Probe AirPlay Info</name>
-                <command>PROBE_AIRPLAY_INFO</command>
-            </action>
-            <action>
-                <name>Probe AirPlay Pair Verify</name>
-                <command>PROBE_AIRPLAY_PAIR_VERIFY</command>
-            </action>
-            <action>
-                <name>Probe AirPlay Control Info</name>
-                <command>PROBE_AIRPLAY_CONTROL_INFO</command>
-            </action>
-            <action>
-                <name>Probe AirPlay Tunnel Setup</name>
-                <command>PROBE_AIRPLAY_TUNNEL_SETUP</command>
-            </action>
-            <action>
                 <name>Start AirPlay Monitor</name>
                 <command>START_AIRPLAY_MONITOR</command>
             </action>
