@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.2-dev",
+  VERSION = "0.1.4-dev",
 }
 
 local function has_c4()
@@ -1640,6 +1640,7 @@ local OpenSSLCrypto = {
 
 OpenSSLCrypto.EVP_CTRL_AEAD_GET_TAG = 0x10
 OpenSSLCrypto.EVP_CTRL_AEAD_SET_TAG = 0x11
+OpenSSLCrypto.EVP_CTRL_AEAD_SET_IVLEN = 0x09
 
 function OpenSSLCrypto.load_openssl()
   if OpenSSLCrypto.openssl then
@@ -1750,12 +1751,18 @@ function OpenSSLCrypto._cipher_ctx(encrypting, key, nonce)
   local cipher = OpenSSLCrypto._cipher()
   local algorithm, algorithm_err = cipher.get("chacha20-poly1305")
   algorithm = openssl_assert(algorithm, algorithm_err, "get ChaCha20-Poly1305 cipher")
+  local ctx, err
   if encrypting then
-    local ctx, err = algorithm:encrypt_new(key, nonce, false)
-    return openssl_assert(ctx, err, "create ChaCha20-Poly1305 encrypt context")
+    ctx, err = algorithm:encrypt_new()
+    ctx = openssl_assert(ctx, err, "create ChaCha20-Poly1305 encrypt context")
+  else
+    ctx, err = algorithm:decrypt_new()
+    ctx = openssl_assert(ctx, err, "create ChaCha20-Poly1305 decrypt context")
   end
-  local ctx, err = algorithm:decrypt_new(key, nonce, false)
-  return openssl_assert(ctx, err, "create ChaCha20-Poly1305 decrypt context")
+  assert(ctx.init, "lua-openssl cipher context init is required for ChaCha20-Poly1305 AEAD")
+  ctx:ctrl(OpenSSLCrypto.EVP_CTRL_AEAD_SET_IVLEN, #nonce)
+  openssl_assert(ctx:init(key, nonce, false), nil, "initialize ChaCha20-Poly1305 context")
+  return ctx
 end
 
 function OpenSSLCrypto._chacha20_poly1305_encrypt(key, nonce, plaintext, aad)
@@ -1950,8 +1957,25 @@ function OpenSSLCrypto.self_test(progress)
 
   progress("crypto self-test: HMAC-SHA512 started")
   local hmac = OpenSSLCrypto.hmac_sha512("key", "data")
-  assert(type(hmac) == "string" and #hmac == 64, "HMAC-SHA512 failed")
+  local expected_hmac = Bytes.from_hex(
+    "3c5953a18f7303ec653ba170ae334fafa08e3846f2efe317b87efce82376253c" ..
+    "b52a8c31ddcde5a3a2eee183c2b34cb91f85e64ddbc325f7692b199473579c58"
+  )
+  assert(hmac == expected_hmac, "HMAC-SHA512 vector failed")
   progress("crypto self-test: HMAC-SHA512 passed")
+
+  progress("crypto self-test: HKDF-SHA512 started")
+  local hkdf = OpenSSLCrypto.hkdf_sha512(
+    "Pair-Verify-Encrypt-Salt",
+    "Pair-Verify-Encrypt-Info",
+    Bytes.from_hex("000102030405060708090a0b0c0d0e0f" ..
+      "101112131415161718191a1b1c1d1e1f")
+  )
+  local expected_hkdf = Bytes.from_hex(
+    "faf9f3558a8ed1e45219bd94fb6d27e5b43a1bc861157fc2a0d291d8e3df410a"
+  )
+  assert(hkdf == expected_hkdf, "HKDF-SHA512 vector failed")
+  progress("crypto self-test: HKDF-SHA512 passed")
 
   progress("crypto self-test: native SRP BN modpow started")
   local srp_native = OpenSSLCrypto.srp_modpow(
@@ -1963,11 +1987,22 @@ function OpenSSLCrypto.self_test(progress)
   progress("crypto self-test: native SRP BN modpow passed")
 
   progress("crypto self-test: ChaCha20-Poly1305 started")
-  local key = string.rep("\0", 32)
-  local nonce = string.rep("\0", 12)
-  local ciphertext = OpenSSLCrypto._chacha20_poly1305_encrypt(key, nonce, "plaintext", "aad")
-  local plaintext = OpenSSLCrypto._chacha20_poly1305_decrypt(key, nonce, ciphertext, "aad")
+  local key = Bytes.from_hex(
+    "000102030405060708090a0b0c0d0e0f" ..
+    "101112131415161718191a1b1c1d1e1f"
+  )
+  local nonce = Bytes.from_hex("000102030405060708090a0b")
+  local plaintext = "plaintext"
+  local aad = "aad"
+  local expected_ciphertext = Bytes.from_hex("f99769694763c038c388540d8367db9102148f2c2034e779d0")
+  local ciphertext = OpenSSLCrypto._chacha20_poly1305_encrypt(key, nonce, plaintext, aad)
+  assert(ciphertext == expected_ciphertext, "ChaCha20-Poly1305 encrypt vector failed")
+  plaintext = OpenSSLCrypto._chacha20_poly1305_decrypt(key, nonce, ciphertext, aad)
   assert(plaintext == "plaintext", "ChaCha20-Poly1305 roundtrip failed")
+  local bad_tag = ciphertext:sub(1, #ciphertext - 1) ..
+    string.char((ciphertext:byte(#ciphertext) + 1) % 256)
+  local bad_ok = pcall(OpenSSLCrypto._chacha20_poly1305_decrypt, key, nonce, bad_tag, aad)
+  assert(not bad_ok, "ChaCha20-Poly1305 bad tag was accepted")
   progress("crypto self-test: ChaCha20-Poly1305 passed")
 
   progress("crypto self-test: secure random started")

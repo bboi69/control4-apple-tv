@@ -157,7 +157,15 @@ local function make_fake_openssl(options)
   end
 
   local function make_cipher_ctx(mode)
+    local vector_plaintext = false
     return {
+      init = function(_, key, nonce, pad)
+        record("cipher." .. mode .. ".init")
+        assert_eq(#key, 32, mode .. " key length")
+        assert_eq(#nonce, 12, mode .. " nonce length")
+        assert_eq(pad, false, mode .. " padding")
+        return true
+      end,
       update = function(_, data, aad)
         if aad then
           record("cipher." .. mode .. ".aad:" .. data)
@@ -165,7 +173,14 @@ local function make_fake_openssl(options)
         end
         record("cipher." .. mode .. ".update:" .. data)
         if mode == "encrypt" then
+          if data == "plaintext" then
+            vector_plaintext = true
+            return Driver.Bytes.from_hex("f99769694763c038c3")
+          end
           return options.encrypt_ciphertext or "ciphertext"
+        end
+        if data == Driver.Bytes.from_hex("f99769694763c038c3") then
+          return "plaintext"
         end
         return options.decrypt_plaintext or "plaintext"
       end,
@@ -175,13 +190,28 @@ local function make_fake_openssl(options)
       end,
       ctrl = function(_, control, value)
         record("cipher." .. mode .. ".ctrl:" .. tostring(control))
+        if control == Driver.OpenSSLCrypto.EVP_CTRL_AEAD_SET_IVLEN then
+          assert_eq(value, 12, "iv length")
+          return true
+        end
         if mode == "encrypt" then
           assert_eq(control, Driver.OpenSSLCrypto.EVP_CTRL_AEAD_GET_TAG, "get tag ctrl")
           assert_eq(value, 16, "tag length")
+          if mode == "encrypt" and options.encrypt_tag then
+            return options.encrypt_tag
+          end
+          if vector_plaintext then
+            return Driver.Bytes.from_hex("88540d8367db9102148f2c2034e779d0")
+          end
           return string.rep("T", 16)
         end
         assert_eq(control, Driver.OpenSSLCrypto.EVP_CTRL_AEAD_SET_TAG, "set tag ctrl")
-        assert_eq(value, string.rep("T", 16), "decrypt tag")
+        if value == Driver.Bytes.from_hex("88540d8367db9102148f2c2034e779d0") then
+          return true
+        end
+        if value ~= string.rep("T", 16) then
+          return false
+        end
         return true
       end,
     }
@@ -243,22 +273,22 @@ local function make_fake_openssl(options)
       end,
     },
     cipher = {
-      get = function(algorithm)
+          get = function(algorithm)
         record("cipher.get:" .. tostring(algorithm))
         assert_eq(algorithm, "chacha20-poly1305", "cipher algorithm")
         return {
           encrypt_new = function(_, key, nonce, pad)
             record("cipher:encrypt_new")
-            assert_eq(#key, 32, "encrypt key length")
-            assert_eq(#nonce, 12, "encrypt nonce length")
-            assert_eq(pad, false, "encrypt padding")
+            assert_eq(key, nil, "encrypt key deferred until init")
+            assert_eq(nonce, nil, "encrypt nonce deferred until init")
+            assert_eq(pad, nil, "encrypt padding deferred until init")
             return make_cipher_ctx("encrypt")
           end,
           decrypt_new = function(_, key, nonce, pad)
             record("cipher:decrypt_new")
-            assert_eq(#key, 32, "decrypt key length")
-            assert_eq(#nonce, 12, "decrypt nonce length")
-            assert_eq(pad, false, "decrypt padding")
+            assert_eq(key, nil, "decrypt key deferred until init")
+            assert_eq(nonce, nil, "decrypt nonce deferred until init")
+            assert_eq(pad, nil, "decrypt padding deferred until init")
             return make_cipher_ctx("decrypt")
           end,
         }
@@ -271,6 +301,29 @@ local function make_fake_openssl(options)
         assert_eq(raw, true, "hmac raw flag")
         assert(type(message) == "string", "hmac message")
         assert(type(key) == "string", "hmac key")
+        if key == "key" and message == "data" then
+          return Driver.Bytes.from_hex(
+            "3c5953a18f7303ec653ba170ae334fafa08e3846f2efe317b87efce82376253c" ..
+            "b52a8c31ddcde5a3a2eee183c2b34cb91f85e64ddbc325f7692b199473579c58"
+          )
+        end
+        if key == "Pair-Verify-Encrypt-Salt" and
+            message == Driver.Bytes.from_hex("000102030405060708090a0b0c0d0e0f" ..
+              "101112131415161718191a1b1c1d1e1f") then
+          return Driver.Bytes.from_hex(
+            "490d7d582bd5f56ac0b28825d324232159c13826cfcd091ed2cf20972cba9517" ..
+            "a761d0b079e06dbb1ab1ad9c1687e9becdf7eebe45e00091c8616fc4b87921fd"
+          )
+        end
+        if key == Driver.Bytes.from_hex(
+            "490d7d582bd5f56ac0b28825d324232159c13826cfcd091ed2cf20972cba9517" ..
+            "a761d0b079e06dbb1ab1ad9c1687e9becdf7eebe45e00091c8616fc4b87921fd"
+          ) and message == "Pair-Verify-Encrypt-Info\1" then
+          return Driver.Bytes.from_hex(
+            "faf9f3558a8ed1e45219bd94fb6d27e5b43a1bc861157fc2a0d291d8e3df410a" ..
+            "50891da5d6730734836ff9391b671ae4faf1635c2005250f6fb03a7659af9abd"
+          )
+        end
         return string.rep("H", 64)
       end,
     },
