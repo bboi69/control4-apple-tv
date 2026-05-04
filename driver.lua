@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.12-dev",
+  VERSION = "0.1.13-dev",
 }
 
 local function has_c4()
@@ -2083,20 +2083,21 @@ function OpenSSLCrypto.decrypt(input_key, ciphertext, aad, nonce)
 end
 
 function OpenSSLCrypto.hmac_sha512(key, data)
-  if has_c4() and C4.HMAC then
-    local result, err = C4:HMAC("SHA512", key, data, {
-      return_encoding = "NONE",
-      key_encoding = "NONE",
-      data_encoding = "NONE",
-    })
-    assert(not err, err)
-    return result
+  assert(type(key) == "string" and type(data) == "string", "HMAC-SHA512 requires string inputs")
+  local block_size = 128
+  if #key > block_size then
+    key = _sha512_bytes(key)
   end
-
-  local openssl = OpenSSLCrypto.load_openssl()
-  assert(openssl.hmac and openssl.hmac.hmac, "lua-openssl hmac.hmac is required")
-  local digest, err = openssl.hmac.hmac("sha512", data, key, true)
-  return openssl_assert(digest, err, "HMAC-SHA512")
+  if #key < block_size then
+    key = key .. string.rep("\0", block_size - #key)
+  end
+  local ipad, opad = {}, {}
+  for i = 1, block_size do
+    local b = key:byte(i)
+    ipad[i] = string.char(Bit32.bxor(b, 0x36))
+    opad[i] = string.char(Bit32.bxor(b, 0x5c))
+  end
+  return _sha512_bytes(table.concat(opad) .. _sha512_bytes(table.concat(ipad) .. data))
 end
 
 function OpenSSLCrypto.hkdf_sha512(salt, info, ikm)
@@ -2180,10 +2181,6 @@ function OpenSSLCrypto.pair_verify_response(credentials, private_key, public_key
     " session_sha=" .. fp(session_key) ..
     " nonce=" .. Bytes.hex(nonce) ..
     " tag=" .. Bytes.hex(encrypted_data:sub(#encrypted_data - 15)))
-  Log.debug("Pair-Verify M2 repro: client_private=" .. Bytes.hex(private_key) ..
-    " client_public=" .. Bytes.hex(public_key) ..
-    " server_public=" .. Bytes.hex(server_public_key) ..
-    " encrypted=" .. Bytes.hex(encrypted_data))
   local decrypted = OpenSSLCrypto._chacha20_poly1305_decrypt(
     session_key,
     nonce,

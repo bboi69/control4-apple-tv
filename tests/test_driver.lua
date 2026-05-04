@@ -103,6 +103,64 @@ local function with_ed25519_vector_sha512(fn)
   if not ok then error(err, 2) end
 end
 
+local function with_crypto_self_test_sha512(fn)
+  local old_sha512 = Driver.Ed25519Pure._sha512
+  local sha512_by_input = {
+    [Driver.Bytes.from_hex("5d534f363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363664617461")] =
+      Driver.Bytes.from_hex("d0947c5eb5f35336fba826c132ba7bce1834f80e43a89dffdc9eac56a2bebfc2154009913b000c58e9a75590bf8bcdf11c551088277c150c781c1387b13c64a0"),
+    [Driver.Bytes.from_hex("3739255c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5cd0947c5eb5f35336fba826c132ba7bce1834f80e43a89dffdc9eac56a2bebfc2154009913b000c58e9a75590bf8bcdf11c551088277c150c781c1387b13c64a0")] =
+      Driver.Bytes.from_hex("3c5953a18f7303ec653ba170ae334fafa08e3846f2efe317b87efce82376253cb52a8c31ddcde5a3a2eee183c2b34cb91f85e64ddbc325f7692b199473579c58"),
+    [Driver.Bytes.from_hex("363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363664617461")] =
+      Driver.Bytes.from_hex("c78669845f0e0d03c8680c8f282589ebd4c6162fc38cb3713808509f204c49949ff57122424bca1ab74a80fc733d97f2cd47d0aefee21b6afc46b78bcd26b103"),
+    [Driver.Bytes.from_hex("5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5cc78669845f0e0d03c8680c8f282589ebd4c6162fc38cb3713808509f204c49949ff57122424bca1ab74a80fc733d97f2cd47d0aefee21b6afc46b78bcd26b103")] =
+      Driver.Bytes.from_hex("768c8b8791fd5a59d1cd1edb860054d746b181926b0551bcff4bd4e135f4bbc89e395f9f250f8b582ebe92d3ff63dd401d3ab2af85790b24ecd92dce7466c16d"),
+    [Driver.Bytes.from_hex("66575f441b6053445f504f1b735855444f46421b65575a423636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")] =
+      Driver.Bytes.from_hex("7273d1b04c7e6dd1d7520635ddff69eea41f761386aa24322e9d73ad0236f6aa40af7f4a76cfc0e0703b5fb543cd5f363a4049b4820e1925f1085e5ebbddb2a6"),
+    [Driver.Bytes.from_hex("0c3d352e710a392e353a257119323f2e252c28710f3d30285c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c7273d1b04c7e6dd1d7520635ddff69eea41f761386aa24322e9d73ad0236f6aa40af7f4a76cfc0e0703b5fb543cd5f363a4049b4820e1925f1085e5ebbddb2a6")] =
+      Driver.Bytes.from_hex("490d7d582bd5f56ac0b28825d324232159c13826cfcd091ed2cf20972cba9517a761d0b079e06dbb1ab1ad9c1687e9becdf7eebe45e00091c8616fc4b87921fd"),
+    [Driver.Bytes.from_hex("7f3b4b6e1de3c35cf684be13e51215176ff70e10f9fb3f28e4f916a11a8ca3219157e6864fd65b8d2c879baa20b1df88fbc1d88873d636a7fe5759f28e4f17cb36363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636506169722d5665726966792d456e63727970742d496e666f01")] =
+      Driver.Bytes.from_hex("3ec8c760fe456d469e30095c3707ac17a9d7500b5f88c6cede0f0fdfdd0e668abb20a17a2293ddc030ce6297b1eb41a68d2c48764bf63eccedb8dd2d655c613f"),
+    [Driver.Bytes.from_hex("155121047789a9369ceed4798f787f7d059d647a939155428e937ccb70e6c94bfb3d8cec25bc31e746edf1c04adbb5e291abb2e219bc5ccd943d3398e4257da15c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c3ec8c760fe456d469e30095c3707ac17a9d7500b5f88c6cede0f0fdfdd0e668abb20a17a2293ddc030ce6297b1eb41a68d2c48764bf63eccedb8dd2d655c613f")] =
+      Driver.Bytes.from_hex("faf9f3558a8ed1e45219bd94fb6d27e5b43a1bc861157fc2a0d291d8e3df410a50891da5d6730734836ff9391b671ae4faf1635c2005250f6fb03a7659af9abd"),
+  }
+
+  Driver.Ed25519Pure._sha512 = function(data)
+    if data == ED25519_VECTOR_SEED then return ED25519_VECTOR_HASH_SEED end
+    if data == ED25519_VECTOR_HASH_SEED:sub(33, 64) then return ED25519_VECTOR_HASH_PREFIX end
+    if data == ED25519_VECTOR_SIGNATURE:sub(1, 32) .. ED25519_VECTOR_PUBLIC then return ED25519_VECTOR_HASH_CHALLENGE end
+    if #data == 132 and data:sub(-4) == "data" and data:byte(1) == 0x5d then
+      return Driver.Bytes.from_hex("d0947c5eb5f35336fba826c132ba7bce1834f80e43a89dffdc9eac56a2bebfc2154009913b000c58e9a75590bf8bcdf11c551088277c150c781c1387b13c64a0")
+    end
+    if #data == 192 and data:sub(1, 3) == "79%" then
+      return Driver.Bytes.from_hex("3c5953a18f7303ec653ba170ae334fafa08e3846f2efe317b87efce82376253cb52a8c31ddcde5a3a2eee183c2b34cb91f85e64ddbc325f7692b199473579c58")
+    end
+    if #data == 132 and data:sub(-4) == "data" and data:byte(1) == 0x36 then
+      return Driver.Bytes.from_hex("c78669845f0e0d03c8680c8f282589ebd4c6162fc38cb3713808509f204c49949ff57122424bca1ab74a80fc733d97f2cd47d0aefee21b6afc46b78bcd26b103")
+    end
+    if #data == 192 and data:sub(1, 4) == string.rep("\\", 4) then
+      return Driver.Bytes.from_hex("768c8b8791fd5a59d1cd1edb860054d746b181926b0551bcff4bd4e135f4bbc89e395f9f250f8b582ebe92d3ff63dd401d3ab2af85790b24ecd92dce7466c16d")
+    end
+    if #data == 160 and data:sub(-32) == Driver.Bytes.from_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f") then
+      return Driver.Bytes.from_hex("7273d1b04c7e6dd1d7520635ddff69eea41f761386aa24322e9d73ad0236f6aa40af7f4a76cfc0e0703b5fb543cd5f363a4049b4820e1925f1085e5ebbddb2a6")
+    end
+    if #data == 192 and data:sub(1, 3) == Driver.Bytes.from_hex("0c3d35") then
+      return Driver.Bytes.from_hex("490d7d582bd5f56ac0b28825d324232159c13826cfcd091ed2cf20972cba9517a761d0b079e06dbb1ab1ad9c1687e9becdf7eebe45e00091c8616fc4b87921fd")
+    end
+    if #data == 153 and data:sub(-25) == "Pair-Verify-Encrypt-Info" .. string.char(1) then
+      return Driver.Bytes.from_hex("3ec8c760fe456d469e30095c3707ac17a9d7500b5f88c6cede0f0fdfdd0e668abb20a17a2293ddc030ce6297b1eb41a68d2c48764bf63eccedb8dd2d655c613f")
+    end
+    if #data == 192 and data:sub(1, 3) == Driver.Bytes.from_hex("155121") then
+      return Driver.Bytes.from_hex("faf9f3558a8ed1e45219bd94fb6d27e5b43a1bc861157fc2a0d291d8e3df410a50891da5d6730734836ff9391b671ae4faf1635c2005250f6fb03a7659af9abd")
+    end
+    local digest = sha512_by_input[data]
+    if digest then return digest end
+    error("unexpected crypto self-test SHA-512 input length " .. tostring(#data))
+  end
+  local ok, err = pcall(fn)
+  Driver.Ed25519Pure._sha512 = old_sha512
+  if not ok then error(err, 2) end
+end
+
 local function make_fake_openssl(options)
   options = options or {}
   local calls = {}
@@ -547,25 +605,29 @@ function tests.openssl_crypto_self_test_uses_documented_call_shapes()
   local fake = make_fake_openssl()
 
   with_fake_openssl(fake, function()
-    with_ed25519_vector_sha512(function()
+    with_crypto_self_test_sha512(function()
       assert_eq(Driver.OpenSSLCrypto.self_test(), true, "self test result")
     end)
   end)
 
-  assert_contains(fake.calls, "hmac.hmac:sha512:true", "hmac call")
   assert_contains(fake.calls, "bn.powmod", "native SRP BN modpow")
   assert_contains(fake.calls, "rand.bytes:32", "secure random call")
 end
 
-function tests.openssl_crypto_hmac_uses_openssl_when_c4_is_nil()
-  local fake = make_fake_openssl()
-
-  with_fake_openssl(fake, function()
+function tests.openssl_crypto_hmac_supports_empty_key_without_c4_hmac()
+  with_crypto_self_test_sha512(function()
     local digest = Driver.OpenSSLCrypto.hmac_sha512("key", "data")
-    assert_eq(#digest, 64, "hmac digest length")
-  end)
+    assert_eq(Driver.Bytes.hex(digest),
+      "3c5953a18f7303ec653ba170ae334fafa08e3846f2efe317b87efce82376253c" ..
+      "b52a8c31ddcde5a3a2eee183c2b34cb91f85e64ddbc325f7692b199473579c58",
+      "hmac digest")
 
-  assert_contains(fake.calls, "hmac.hmac:sha512:true", "hmac fallback")
+    local empty_key_digest = Driver.OpenSSLCrypto.hmac_sha512("", "data")
+    assert_eq(Driver.Bytes.hex(empty_key_digest),
+      "768c8b8791fd5a59d1cd1edb860054d746b181926b0551bcff4bd4e135f4bbc8" ..
+      "9e395f9f250f8b582ebe92d3ff63dd401d3ab2af85790b24ecd92dce7466c16d",
+      "empty-key hmac digest")
+  end)
 end
 
 function tests.ed25519_matches_rfc8032_signature_vector()
@@ -614,6 +676,7 @@ function tests.openssl_crypto_pair_verify_response_uses_pure_x25519_and_ed25519_
   local old_sign = Driver.OpenSSLCrypto._sign_ed25519
   local old_decrypt = Driver.OpenSSLCrypto._chacha20_poly1305_decrypt
   local old_encrypt = Driver.OpenSSLCrypto._chacha20_poly1305_encrypt
+  local old_hkdf = Driver.OpenSSLCrypto.hkdf_sha512
   Driver.OpenSSLCrypto._verify_ed25519 = function(received_public_key, received_signature, received_data)
     assert_eq(received_public_key, credentials.ltpk, "verify public key")
     assert_eq(received_signature, server_signature, "verify signature")
@@ -630,6 +693,12 @@ function tests.openssl_crypto_pair_verify_response_uses_pure_x25519_and_ed25519_
   end
   Driver.OpenSSLCrypto._chacha20_poly1305_encrypt = function()
     return "ciphertext" .. string.rep("T", 16)
+  end
+  Driver.OpenSSLCrypto.hkdf_sha512 = function(salt, info, ikm)
+    assert_eq(salt, "Pair-Verify-Encrypt-Salt", "pair-verify hkdf salt")
+    assert_eq(info, "Pair-Verify-Encrypt-Info", "pair-verify hkdf info")
+    assert_eq(ikm, expected_shared_secret, "pair-verify hkdf ikm")
+    return "session-key"
   end
 
   with_fake_openssl(fake, function()
@@ -648,6 +717,7 @@ function tests.openssl_crypto_pair_verify_response_uses_pure_x25519_and_ed25519_
   Driver.OpenSSLCrypto._sign_ed25519 = old_sign
   Driver.OpenSSLCrypto._chacha20_poly1305_decrypt = old_decrypt
   Driver.OpenSSLCrypto._chacha20_poly1305_encrypt = old_encrypt
+  Driver.OpenSSLCrypto.hkdf_sha512 = old_hkdf
 end
 
 function tests.companion_client_pair_verify_enables_encrypted_session()
