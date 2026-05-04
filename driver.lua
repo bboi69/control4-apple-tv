@@ -1383,10 +1383,6 @@ end
 
 function SRP.compute_A(a_bytes)
   SRP.init()
-  local modpow = SRP._modpow
-  if modpow then
-    return modpow(BigInt.to_minimal_bytes_be(SRP.g), a_bytes, 384)
-  end
   local a = BigInt.from_bytes_be(a_bytes)
   local A = BigInt.mont_modpow(SRP.g, a, SRP.N, SRP._R2, SRP.N_LIMBS, SRP._n_prime)
   return BigInt.to_bytes_be(A, 384)
@@ -1402,16 +1398,7 @@ function SRP.compute_session_key(B_bytes, a_bytes, x, u)
   local a = BigInt.from_bytes_be(a_bytes)
   local k_big = BigInt.from_bytes_be(SRP._k_bytes)
   Log.debug("Pair-Setup M3 progress: SRP g^x started")
-  local gx
-  if SRP._modpow then
-    gx = BigInt.from_bytes_be(SRP._modpow(
-      BigInt.to_minimal_bytes_be(SRP.g),
-      BigInt.to_minimal_bytes_be(x),
-      384
-    ))
-  else
-    gx = BigInt.mont_modpow(SRP.g, x, SRP.N, SRP._R2, SRP.N_LIMBS, SRP._n_prime)
-  end
+  local gx = BigInt.mont_modpow(SRP.g, x, SRP.N, SRP._R2, SRP.N_LIMBS, SRP._n_prime)
   Log.debug("Pair-Setup M3 progress: SRP g^x computed")
   local kgx = BigInt.mod(BigInt.mul(k_big, gx), SRP.N)
   local Bkgx
@@ -1924,12 +1911,14 @@ function OpenSSLCrypto.self_test(progress)
   progress("crypto self-test: HMAC-SHA512 passed")
 
   progress("crypto self-test: native SRP DH modpow started")
+  local native_test_base = BigInt.sub(SRP.N, BigInt.from_number(2))
+  local native_test_expected = BigInt.to_bytes_be(BigInt.sub(SRP.N, BigInt.from_number(8)), 384)
   local srp_native = OpenSSLCrypto.srp_modpow(
-    BigInt.to_minimal_bytes_be(SRP.g),
+    BigInt.to_bytes_be(native_test_base, 384),
     string.char(3),
     384
   )
-  assert(BigInt.from_bytes_be(srp_native)[1] == 125, "native SRP DH modpow failed")
+  assert(srp_native == native_test_expected, "native SRP DH modpow failed")
   progress("crypto self-test: native SRP DH modpow passed")
 
   progress("crypto self-test: ChaCha20-Poly1305 started")

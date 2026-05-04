@@ -235,7 +235,10 @@ local function make_fake_openssl(options)
         assert(private_key.kind:match("private"), "derive expected private key")
         assert(peer_key.kind:match("public"), "derive expected public key")
         if private_key.kind == "dh-private" then
-          return string.char(125)
+          return Driver.BigInt.to_bytes_be(
+            Driver.BigInt.sub(Driver.SRP.N, Driver.BigInt.from_number(8)),
+            384
+          )
         end
         return string.rep("S", 32)
       end,
