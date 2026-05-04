@@ -817,6 +817,8 @@ function tests.companion_client_pair_verify_enables_encrypted_session()
 	  local decoded_system_info = client.session:try_decode(writes[3])
 	  local system_info_msg = Driver.OPACK.decode(decoded_system_info.payload)
 	  assert_table_has(system_info_msg, "_i", "_systemInfo")
+	  client:start_companion_services()
+	  assert_eq(writes[4], nil, "startup sequence does not re-enter while system info is pending")
 
 	  client:receive(client.session:encode_frame(Driver.CompanionFrame.E_OPACK, Driver.OPACK.encode(Driver.OPACK.dict({
 	    { "_t", 3 },

@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.31-dev",
+  VERSION = "0.1.32-dev",
 }
 
 local function has_c4()
@@ -3272,6 +3272,7 @@ function CompanionClient.new(options)
     pending_commands = {},
     startup_steps = nil,
     startup_index = 0,
+    startup_in_progress = false,
     post_session_started = false,
     injected_transport = options.transport ~= nil,
     connecting = false,
@@ -3357,6 +3358,10 @@ function CompanionClient:close()
   self.transport = nil
   self.connecting = false
   self.connected = false
+  self.startup_steps = nil
+  self.startup_index = 0
+  self.startup_in_progress = false
+  self.post_session_started = false
   self:set_state("DISCONNECTED")
 end
 
@@ -3412,6 +3417,10 @@ function CompanionClient:connect(host, port)
       self.connecting = false
       self.connected = false
       self.transport = nil
+      self.startup_steps = nil
+      self.startup_index = 0
+      self.startup_in_progress = false
+      self.post_session_started = false
       self:set_state((err_code and err_code ~= 0) and ("DISCONNECTED: " .. tostring(err_msg)) or "DISCONNECTED")
     end)
     :OnError(function(_, err_code, err_msg)
@@ -3420,6 +3429,10 @@ function CompanionClient:connect(host, port)
       self.connecting = false
       self.connected = false
       self.transport = nil
+      self.startup_steps = nil
+      self.startup_index = 0
+      self.startup_in_progress = false
+      self.post_session_started = false
       self:set_state("ERROR: " .. tostring(err_code) .. " " .. tostring(err_msg))
     end)
     :Connect(self.host, self.port)
@@ -3487,6 +3500,17 @@ function CompanionClient:start_touch()
 end
 
 function CompanionClient:start_companion_services()
+  if self.startup_in_progress or self.startup_steps then
+    Log.debug("Companion startup already in progress")
+    return
+  end
+  if self.state == "SESSION_ACTIVE" then
+    Log.debug("Companion startup skipped: session already active")
+    self:flush_pending_commands()
+    return
+  end
+  self.startup_in_progress = true
+  self.post_session_started = false
   self.startup_steps = {
     function() self:send_system_info() end,
     function() self:start_touch() end,
@@ -3508,6 +3532,7 @@ function CompanionClient:send_next_startup_step()
   end
   self.startup_steps = nil
   self.startup_index = 0
+  self.startup_in_progress = false
   self:flush_pending_commands()
 end
 
@@ -3587,6 +3612,7 @@ function CompanionClient:handle_frame(frame)
     Log.debug("Pair-Verify M4 received: enabling encrypted session")
     local keys = assert(self.pending_pair_verify_keys, "missing Pair-Verify session keys")
     self.pending_pair_verify_keys = nil
+    self.verifier = nil
     self:enable_session(keys)
     return
   end
