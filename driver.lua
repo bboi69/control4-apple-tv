@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.26-dev",
+  VERSION = "0.1.27-dev",
 }
 
 local function has_c4()
@@ -1908,7 +1908,6 @@ local OpenSSLCrypto = {
   out_counter = 0,
   in_counter = 0,
   self_tested = false,
-  ed25519_native_mode = false,
 }
 
 OpenSSLCrypto.EVP_CTRL_AEAD_GET_TAG = 0x10
@@ -1979,100 +1978,6 @@ function OpenSSLCrypto._read_private_key(algorithm, private_key)
   return openssl_assert(key, err, "read " .. algorithm .. " private key")
 end
 
-function OpenSSLCrypto._native_ed25519_sign_with_mode(mode, private_key_bytes, data)
-  local key = OpenSSLCrypto._read_private_key("ed25519", private_key_bytes)
-  if mode == "data" then
-    return key:sign(data)
-  elseif mode == "data_nil_digest" then
-    return key:sign(data, nil)
-  elseif mode == "data_empty_digest" then
-    return key:sign(data, "")
-  elseif mode == "data_null_digest" then
-    return key:sign(data, "null")
-  elseif mode == "data_NULL_digest" then
-    return key:sign(data, "NULL")
-  elseif mode == "data_none_digest" then
-    return key:sign(data, "none")
-  elseif mode == "data_NONE_digest" then
-    return key:sign(data, "NONE")
-  elseif mode == "digest_nil_data" then
-    return key:sign(nil, data)
-  elseif mode == "digest_empty_data" then
-    return key:sign("", data)
-  elseif mode == "digest_null_data" then
-    return key:sign("null", data)
-  elseif mode == "digest_NULL_data" then
-    return key:sign("NULL", data)
-  end
-  error("unsupported native Ed25519 sign mode " .. tostring(mode))
-end
-
-function OpenSSLCrypto._native_ed25519_verify_with_mode(mode, public_key_bytes, signature, data)
-  local key = OpenSSLCrypto._read_public_key("ed25519", public_key_bytes)
-  if mode == "data" then
-    return key:verify(data, signature)
-  elseif mode == "data_nil_digest" then
-    return key:verify(data, signature, nil)
-  elseif mode == "data_empty_digest" then
-    return key:verify(data, signature, "")
-  elseif mode == "data_null_digest" then
-    return key:verify(data, signature, "null")
-  elseif mode == "data_NULL_digest" then
-    return key:verify(data, signature, "NULL")
-  elseif mode == "data_none_digest" then
-    return key:verify(data, signature, "none")
-  elseif mode == "data_NONE_digest" then
-    return key:verify(data, signature, "NONE")
-  elseif mode == "digest_nil_data" then
-    return key:verify(nil, data, signature)
-  elseif mode == "digest_empty_data" then
-    return key:verify("", data, signature)
-  elseif mode == "digest_null_data" then
-    return key:verify("null", data, signature)
-  elseif mode == "digest_NULL_data" then
-    return key:verify("NULL", data, signature)
-  end
-  error("unsupported native Ed25519 verify mode " .. tostring(mode))
-end
-
-function OpenSSLCrypto._select_native_ed25519_mode(seed, public_key, message, expected_signature)
-  if OpenSSLCrypto.ed25519_native_mode ~= false then
-    return OpenSSLCrypto.ed25519_native_mode
-  end
-  local modes = {
-    "data",
-    "data_nil_digest",
-    "data_empty_digest",
-    "data_null_digest",
-    "data_NULL_digest",
-    "data_none_digest",
-    "data_NONE_digest",
-    "digest_nil_data",
-    "digest_empty_data",
-    "digest_null_data",
-    "digest_NULL_data",
-  }
-  local diagnostics = {}
-  for _, mode in ipairs(modes) do
-    local sign_ok, signature_or_err = pcall(OpenSSLCrypto._native_ed25519_sign_with_mode, mode, seed, message)
-    if sign_ok and signature_or_err == expected_signature then
-      local verify_ok, verify_result = pcall(OpenSSLCrypto._native_ed25519_verify_with_mode, mode, public_key, signature_or_err, message)
-      if verify_ok and verify_result then
-        OpenSSLCrypto.ed25519_native_mode = mode
-        Log.debug("crypto self-test: Ed25519 using native lua-openssl mode " .. mode)
-        return mode
-      end
-      diagnostics[#diagnostics + 1] = mode .. "_verify=" .. tostring(verify_result)
-    else
-      diagnostics[#diagnostics + 1] = mode .. "=" .. tostring(signature_or_err)
-    end
-  end
-  OpenSSLCrypto.ed25519_native_mode = nil
-  Log.debug("crypto self-test: native Ed25519 unavailable, using pure Lua: " ..
-    table.concat(diagnostics, "; "))
-  return nil
-end
-
 function OpenSSLCrypto._export_raw_public_key(key)
   local public_key, public_key_err = key:get_public()
   public_key = openssl_assert(public_key, public_key_err, "get public key")
@@ -2101,25 +2006,11 @@ function OpenSSLCrypto._derive_x25519(private_key, server_public_key)
 end
 
 function OpenSSLCrypto._sign_ed25519(private_key_bytes, data, public_key)
-  if OpenSSLCrypto.ed25519_native_mode then
-    local ok, signature = pcall(OpenSSLCrypto._native_ed25519_sign_with_mode,
-      OpenSSLCrypto.ed25519_native_mode, private_key_bytes, data)
-    if ok then return signature end
-    Log.debug("native Ed25519 sign failed, falling back to pure Lua: " .. tostring(signature))
-    OpenSSLCrypto.ed25519_native_mode = nil
-  end
   public_key = public_key or Ed25519Pure.public_key_from_private(private_key_bytes)
   return Ed25519Pure.sign(private_key_bytes, public_key, data)
 end
 
 function OpenSSLCrypto._verify_ed25519(public_key_bytes, signature, data)
-  if OpenSSLCrypto.ed25519_native_mode then
-    local ok, verified = pcall(OpenSSLCrypto._native_ed25519_verify_with_mode,
-      OpenSSLCrypto.ed25519_native_mode, public_key_bytes, signature, data)
-    if ok then return verified end
-    Log.debug("native Ed25519 verify failed, falling back to pure Lua: " .. tostring(verified))
-    OpenSSLCrypto.ed25519_native_mode = nil
-  end
   return Ed25519Pure.verify(public_key_bytes, signature, data)
 end
 
@@ -2539,7 +2430,6 @@ function OpenSSLCrypto.self_test(progress)
   )
   assert(ed_signature == ed_expected_signature, "Ed25519 RFC 8032 signature vector failed")
   assert(Ed25519Pure.verify(ed_public, ed_signature, ""), "Ed25519 RFC 8032 verify vector failed")
-  OpenSSLCrypto._select_native_ed25519_mode(ed_seed, ed_public, "", ed_expected_signature)
   progress("crypto self-test: Ed25519 passed")
 
   OpenSSLCrypto.self_tested = true
