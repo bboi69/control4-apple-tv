@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.11-dev",
+  VERSION = "0.1.12-dev",
 }
 
 local function has_c4()
@@ -1234,7 +1234,7 @@ function X25519Pure.mul(k_bytes, u_bytes)
 end
 
 -- Base point u=9 in little-endian
-X25519Pure.BASE_POINT = "\x09" .. string.rep("\x00", 31)
+X25519Pure.BASE_POINT = string.char(9) .. string.rep("\0", 31)
 
 -- Pure-Lua Ed25519 (RFC 8032). Used because Control4's lua-openssl binding
 -- exposes Ed25519 keys but routes signing through a digest API that OpenSSL
@@ -2234,10 +2234,19 @@ function OpenSSLCrypto.self_test(progress)
     "de9edb7d7b7dc1b4d35b61c2ece43537" ..
     "3f8343c85b78674dadfc7e146f882b4f"
   )
+  local x_alice_pub = Bytes.from_hex(
+    "8520f0098930a754748b7ddcb43ef75a" ..
+    "0dbf3a0d26381af4eba4a98eaa9b4e6a"
+  )
   local x_expected = Bytes.from_hex(
     "4a5d9d5ba4ce2de1728e3bf480350f25" ..
     "e07e21c947d19e3376f09b3c1e161742"
   )
+  local x_public = X25519Pure.mul(x_alice_priv, X25519Pure.BASE_POINT)
+  if x_public ~= x_alice_pub then
+    error("X25519 RFC 7748 base point vector failed: got " ..
+      Bytes.hex(x_public) .. " expected " .. Bytes.hex(x_alice_pub))
+  end
   local x_shared = OpenSSLCrypto._derive_x25519(x_alice_priv, x_bob_pub)
   if x_shared ~= x_expected then
     error("X25519 RFC 7748 test vector failed: got " ..
