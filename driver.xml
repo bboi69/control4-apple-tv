@@ -741,6 +741,10 @@
                 <command>PROBE_AIRPLAY_CONTROL_INFO</command>
             </action>
             <action>
+                <name>Probe AirPlay Tunnel Setup</name>
+                <command>PROBE_AIRPLAY_TUNNEL_SETUP</command>
+            </action>
+            <action>
                 <name>Pair AirPlay</name>
                 <command>PAIR_AIRPLAY</command>
             </action>

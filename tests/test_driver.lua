@@ -1239,6 +1239,123 @@ function tests.airplay_control_client_pair_verifies_then_gets_encrypted_info()
   assert_eq(received_info.body, "bplist-body", "encrypted info body")
 end
 
+function tests.bplist_roundtrips_nested_setup_payloads()
+  local payload = {
+    isRemoteControlOnly = true,
+    eventPort = 12345,
+    streams = {
+      {
+        dataPort = 54321,
+        wantsDedicatedSocket = true,
+        clientTypeUUID = "1910A70F-DBC0-4242-AF95-115DB30604E1",
+      },
+    },
+  }
+  local decoded = Driver.BPlist.decode(Driver.BPlist.encode(payload))
+  assert_eq(decoded.isRemoteControlOnly, true, "bplist bool")
+  assert_eq(decoded.eventPort, 12345, "bplist int")
+  assert_eq(decoded.streams[1].dataPort, 54321, "bplist nested int")
+  assert_eq(decoded.streams[1].clientTypeUUID, "1910A70F-DBC0-4242-AF95-115DB30604E1", "bplist nested string")
+end
+
+function tests.airplay_control_client_runs_rtsp_tunnel_setup_probe()
+  local credentials = Driver.Credentials.parse(table.concat({
+    Driver.Bytes.hex(bytes_range(0, 31)),
+    Driver.Bytes.hex(bytes_range(32, 63)),
+    Driver.Bytes.hex("ATV-ID"),
+    Driver.Bytes.hex("CLIENT-ID"),
+  }, ":"))
+  local random_values = {
+    string.rep("\1", 4),
+    string.rep("\2", 8),
+    string.rep("\3", 16),
+    string.rep("\4", 16),
+    string.rep("\5", 4),
+    string.rep("\6", 16),
+    string.rep("\7", 16),
+  }
+  local fake_crypto = {
+    generate_x25519_keypair = function()
+      return { private_key = "private-key", public_key = bytes_range(64, 95) }
+    end,
+    pair_verify_response = function(_, _, _, _, _)
+      return "encrypted-response", "shared-secret"
+    end,
+    hkdf_sha512 = function(_, info, _)
+      if info == "Control-Write-Encryption-Key" then return "write-key" end
+      if info == "Control-Read-Encryption-Key" then return "read-key" end
+      error("unexpected hkdf info")
+    end,
+    random_bytes = function(n)
+      local value = table.remove(random_values, 1) or string.rep("\8", n)
+      return value:sub(1, n)
+    end,
+    encrypt = function(_, plaintext)
+      return plaintext .. string.rep("T", 16)
+    end,
+    decrypt = function(_, ciphertext)
+      return ciphertext:sub(1, #ciphertext - 16)
+    end,
+  }
+  local writes = {}
+  local transport = {
+    Write = function(_, data)
+      writes[#writes + 1] = data
+      return true
+    end,
+  }
+  local tunnel_result
+  local client = Driver.AirPlayControlClient.new({
+    host = "192.0.2.55",
+    port = 7000,
+    credentials = credentials,
+    crypto = fake_crypto,
+    transport = transport,
+    probe = "tunnel_setup",
+    on_tunnel_setup = function(result)
+      tunnel_result = result
+    end,
+  })
+
+  local function http_response(body, protocol)
+    return table.concat({
+      (protocol or "HTTP/1.1") .. " 200 OK",
+      "Content-Type: application/x-apple-binary-plist",
+      "Content-Length: " .. tostring(#(body or "")),
+      "",
+      "",
+    }, "\r\n") .. (body or "")
+  end
+
+  local function hap_frame(plaintext)
+    return Driver.Bytes.uint_le(#plaintext, 2) .. plaintext .. string.rep("T", 16)
+  end
+
+  client:connect()
+  client:receive(http_response(Driver.TLV8.encode_ordered({
+    { 3, bytes_range(96, 127) },
+    { 5, "encrypted-challenge" },
+  })))
+  client:receive(http_response(Driver.TLV8.encode_ordered({ { 6, string.char(0x04) } })))
+  assert_eq(client.state, "RTSP_EVENT_SETUP", "event setup state")
+  assert(writes[3]:find("SETUP rtsp://192%.0%.2%.55/"), "encrypted event setup request")
+
+  client:receive(hap_frame(http_response(Driver.BPlist.encode({ eventPort = 49152 }), "RTSP/1.0")))
+  assert_eq(client.state, "RTSP_RECORD", "record state")
+  client:receive(hap_frame(http_response("", "RTSP/1.0")))
+  assert_eq(client.state, "RTSP_DATA_SETUP", "data setup state")
+  client:receive(hap_frame(http_response(Driver.BPlist.encode({
+    streams = {
+      { dataPort = 49153 },
+    },
+  }), "RTSP/1.0")))
+
+  assert_eq(client.state, "RTSP_TUNNEL_READY", "tunnel ready state")
+  assert(tunnel_result ~= nil, "tunnel callback")
+  assert_eq(tunnel_result.event_port, 49152, "event port")
+  assert_eq(tunnel_result.data_port, 49153, "data port")
+end
+
 function tests.airplay_pairing_flow_saves_credentials()
   local old_c4 = C4
   local old_properties = Properties

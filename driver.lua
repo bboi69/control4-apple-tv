@@ -429,6 +429,30 @@ function Bytes.read_u16le(data, offset)
   return b1 + b2 * 0x100
 end
 
+function Bytes.read_uint_be(data, offset, length)
+  offset = offset or 1
+  local value = 0
+  for i = 0, length - 1 do
+    local b = data:byte(offset + i)
+    assert(b, "not enough bytes for uint")
+    value = value * 0x100 + b
+  end
+  return value
+end
+
+function Bytes.uint_be(value, length)
+  assert(value >= 0 and value == math.floor(value), "integer required")
+  local out = {}
+  for i = length - 1, 0, -1 do
+    out[#out + 1] = string.char(math.floor(value / (0x100 ^ i)) % 0x100)
+  end
+  return table.concat(out)
+end
+
+function Bytes.read_i32be(data, offset)
+  return Bytes.read_uint_be(data, offset, 4)
+end
+
 local TLV8 = {}
 
 function TLV8.encode_ordered(entries)
@@ -3649,6 +3673,230 @@ local AirPlay = {
   pairing_active = false,
 }
 
+local BPlist = {}
+
+local function bplist_is_array(value)
+  if type(value) ~= "table" then return false end
+  local count = 0
+  for key in pairs(value) do
+    if type(key) ~= "number" or key < 1 or key ~= math.floor(key) then
+      return false
+    end
+    count = count + 1
+  end
+  return count == #value
+end
+
+function BPlist.integer_object(value)
+  assert(type(value) == "number" and value >= 0 and value == math.floor(value), "bplist integer must be unsigned")
+  if value <= 0xFF then
+    return string.char(0x10) .. Bytes.uint_be(value, 1)
+  elseif value <= 0xFFFF then
+    return string.char(0x11) .. Bytes.uint_be(value, 2)
+  elseif value <= 0xFFFFFFFF then
+    return string.char(0x12) .. Bytes.uint_be(value, 4)
+  end
+  return string.char(0x13) .. Bytes.uint_be(value, 8)
+end
+
+function BPlist.length_marker(prefix, length)
+  if length < 15 then
+    return string.char(prefix + length)
+  end
+  return string.char(prefix + 15) .. BPlist.integer_object(length)
+end
+
+function BPlist.encode(value)
+  local objects = {}
+
+  local function add(obj)
+    objects[#objects + 1] = obj
+    return #objects - 1
+  end
+
+  local function encode_object(obj)
+    local value_type = type(obj)
+    if value_type == "boolean" then
+      return add(string.char(obj and 0x09 or 0x08))
+    end
+    if value_type == "number" then
+      return add(BPlist.integer_object(obj))
+    end
+    if value_type == "string" then
+      return add(BPlist.length_marker(0x50, #obj) .. obj)
+    end
+    if value_type == "table" then
+      if bplist_is_array(obj) then
+        local refs = {}
+        for i = 1, #obj do
+          refs[#refs + 1] = encode_object(obj[i])
+        end
+        local body = {}
+        for _, ref in ipairs(refs) do
+          body[#body + 1] = string.char(ref)
+        end
+        return add(BPlist.length_marker(0xA0, #refs) .. table.concat(body))
+      end
+
+      local keys = {}
+      for key in pairs(obj) do
+        assert(type(key) == "string", "bplist dictionary keys must be strings")
+        keys[#keys + 1] = key
+      end
+      table.sort(keys)
+
+      local key_refs = {}
+      local value_refs = {}
+      for _, key in ipairs(keys) do
+        key_refs[#key_refs + 1] = encode_object(key)
+        value_refs[#value_refs + 1] = encode_object(obj[key])
+      end
+
+      local body = {}
+      for _, ref in ipairs(key_refs) do body[#body + 1] = string.char(ref) end
+      for _, ref in ipairs(value_refs) do body[#body + 1] = string.char(ref) end
+      return add(BPlist.length_marker(0xD0, #keys) .. table.concat(body))
+    end
+    error("unsupported bplist type: " .. tostring(value_type))
+  end
+
+  local top_object = encode_object(value)
+  assert(#objects < 256, "bplist encoder currently supports fewer than 256 objects")
+
+  local object_data = {}
+  local offsets = {}
+  local cursor = #"bplist00"
+  for _, obj in ipairs(objects) do
+    offsets[#offsets + 1] = cursor
+    object_data[#object_data + 1] = obj
+    cursor = cursor + #obj
+  end
+
+  local offset_int_size = cursor <= 0xFFFF and 2 or 4
+  local offset_table = {}
+  for _, offset in ipairs(offsets) do
+    offset_table[#offset_table + 1] = Bytes.uint_be(offset, offset_int_size)
+  end
+  local offset_table_offset = cursor
+  local trailer = string.rep("\0", 6) ..
+    string.char(offset_int_size) ..
+    string.char(1) ..
+    Bytes.uint_be(#objects, 8) ..
+    Bytes.uint_be(top_object, 8) ..
+    Bytes.uint_be(offset_table_offset, 8)
+
+  return "bplist00" .. table.concat(object_data) .. table.concat(offset_table) .. trailer
+end
+
+function BPlist.decode(data)
+  assert(type(data) == "string" and data:sub(1, 8) == "bplist00", "not a binary plist")
+  assert(#data >= 40, "truncated binary plist")
+
+  local trailer = data:sub(#data - 31)
+  local offset_int_size = trailer:byte(7)
+  local object_ref_size = trailer:byte(8)
+  local object_count = Bytes.read_uint_be(trailer, 9, 8)
+  local top_object = Bytes.read_uint_be(trailer, 17, 8)
+  local offset_table_offset = Bytes.read_uint_be(trailer, 25, 8)
+
+  local offsets = {}
+  for i = 0, object_count - 1 do
+    offsets[i] = Bytes.read_uint_be(data, offset_table_offset + 1 + (i * offset_int_size), offset_int_size) + 1
+  end
+
+  local cache = {}
+  local parse_object
+
+  local function read_length(low, index)
+    if low < 15 then
+      return low, index
+    end
+    local marker = data:byte(index)
+    assert(marker, "truncated bplist length")
+    local kind = math.floor(marker / 0x10)
+    local power = marker % 0x10
+    assert(kind == 1, "extended bplist length must be integer")
+    local size = 2 ^ power
+    local value = Bytes.read_uint_be(data, index + 1, size)
+    return value, index + 1 + size
+  end
+
+  local function read_ref(index)
+    return Bytes.read_uint_be(data, index, object_ref_size), index + object_ref_size
+  end
+
+  parse_object = function(ref)
+    if cache[ref] ~= nil then
+      return cache[ref]
+    end
+
+    local index = offsets[ref]
+    assert(index, "invalid bplist object reference")
+    local marker = data:byte(index)
+    assert(marker, "truncated bplist object")
+    local kind = math.floor(marker / 0x10)
+    local low = marker % 0x10
+    index = index + 1
+
+    local value
+    if kind == 0 then
+      if low == 0x8 then value = false
+      elseif low == 0x9 then value = true
+      else value = nil end
+    elseif kind == 1 then
+      value = Bytes.read_uint_be(data, index, 2 ^ low)
+    elseif kind == 5 then
+      local length
+      length, index = read_length(low, index)
+      value = data:sub(index, index + length - 1)
+    elseif kind == 6 then
+      local length
+      length, index = read_length(low, index)
+      local chars = {}
+      for i = 0, length - 1 do
+        local code = Bytes.read_uint_be(data, index + (i * 2), 2)
+        chars[#chars + 1] = code < 128 and string.char(code) or "?"
+      end
+      value = table.concat(chars)
+    elseif kind == 0xA then
+      local length
+      length, index = read_length(low, index)
+      value = {}
+      cache[ref] = value
+      for i = 1, length do
+        local child_ref
+        child_ref, index = read_ref(index)
+        value[i] = parse_object(child_ref)
+      end
+      return value
+    elseif kind == 0xD then
+      local length
+      length, index = read_length(low, index)
+      local key_refs = {}
+      local value_refs = {}
+      for i = 1, length do
+        key_refs[i], index = read_ref(index)
+      end
+      for i = 1, length do
+        value_refs[i], index = read_ref(index)
+      end
+      value = {}
+      cache[ref] = value
+      for i = 1, length do
+        value[tostring(parse_object(key_refs[i]))] = parse_object(value_refs[i])
+      end
+      return value
+    else
+      error("unsupported bplist marker 0x" .. string.format("%02x", marker))
+    end
+
+    cache[ref] = value
+    return value
+  end
+
+  return parse_object(top_object)
+end
+
 local AirPlayHTTP = {}
 
 function AirPlayHTTP.format_request(method, path, host, port, headers, body, protocol)
@@ -5187,7 +5435,16 @@ function AirPlayControlClient.new(options)
     raw_buffer = "",
     http_buffer = "",
     state = "DISCONNECTED",
+    probe = options.probe or "info",
+    rtsp_cseq = 0,
+    rtsp_session_id = nil,
+    rtsp_dacp_id = nil,
+    rtsp_active_remote = nil,
+    event_port = nil,
+    data_port = nil,
+    data_seed = nil,
     on_info = options.on_info,
+    on_tunnel_setup = options.on_tunnel_setup,
     on_error = options.on_error,
     on_state = options.on_state,
   }, { __index = AirPlayControlClient })
@@ -5218,6 +5475,87 @@ function AirPlayControlClient:send_encrypted(method, path, body, headers)
   Log.debug("AirPlay control send encrypted: " .. tostring(method) .. " " .. tostring(path) ..
     " plain_len=" .. tostring(#request))
   return self.transport:Write(self.session:encrypt(request))
+end
+
+function AirPlayControlClient:random_u32()
+  local bytes = crypto_method(self.crypto, "random_bytes")(4)
+  return Bytes.read_uint_be(bytes, 1, 4)
+end
+
+function AirPlayControlClient:random_hex(bytes)
+  return string.upper(Bytes.hex(crypto_method(self.crypto, "random_bytes")(bytes)))
+end
+
+function AirPlayControlClient:uuid()
+  local h = Bytes.hex(crypto_method(self.crypto, "random_bytes")(16))
+  return string.upper(h:sub(1, 8) .. "-" ..
+    h:sub(9, 12) .. "-" ..
+    h:sub(13, 16) .. "-" ..
+    h:sub(17, 20) .. "-" ..
+    h:sub(21, 32))
+end
+
+function AirPlayControlClient:rtsp_uri()
+  if not self.rtsp_session_id then
+    self.rtsp_session_id = self:random_u32()
+  end
+  return "rtsp://" .. tostring(self.host) .. "/" .. tostring(self.rtsp_session_id)
+end
+
+function AirPlayControlClient:send_rtsp(method, body, headers)
+  self.rtsp_cseq = self.rtsp_cseq + 1
+  self.rtsp_dacp_id = self.rtsp_dacp_id or self:random_hex(8)
+  self.rtsp_active_remote = self.rtsp_active_remote or self:random_u32()
+
+  headers = headers or {}
+  headers["CSeq"] = tostring(self.rtsp_cseq)
+  headers["DACP-ID"] = self.rtsp_dacp_id
+  headers["Active-Remote"] = tostring(self.rtsp_active_remote)
+  headers["Client-Instance"] = self.rtsp_dacp_id
+  if body and body ~= "" then
+    headers["Content-Type"] = headers["Content-Type"] or "application/x-apple-binary-plist"
+  end
+
+  local uri = self:rtsp_uri()
+  local request = AirPlayHTTP.format_request(method, uri, self.host, self.port, headers, body or "", "RTSP/1.0")
+  Log.debug("AirPlay RTSP send: method=" .. tostring(method) ..
+    " cseq=" .. tostring(self.rtsp_cseq) ..
+    " body_len=" .. tostring(#(body or "")))
+  return self.transport:Write(self.session:encrypt(request))
+end
+
+function AirPlayControlClient:build_event_setup_plist()
+  local txt = AirPlay.txt or {}
+  return BPlist.encode({
+    isRemoteControlOnly = true,
+    osName = "tvOS",
+    sourceVersion = "550.10",
+    timingProtocol = "None",
+    model = txt.model or "AppleTV",
+    deviceID = txt.deviceid or txt.deviceID or "",
+    osVersion = txt.osvers or "",
+    osBuildVersion = txt.osbuild or "",
+    macAddress = txt.deviceid or "",
+    sessionUUID = self:uuid(),
+    name = "Control4",
+  })
+end
+
+function AirPlayControlClient:build_data_setup_plist()
+  self.data_seed = self:random_u32()
+  return BPlist.encode({
+    streams = {
+      {
+        controlType = 2,
+        channelID = self:uuid(),
+        seed = self.data_seed,
+        clientUUID = self:uuid(),
+        type = 130,
+        wantsDedicatedSocket = true,
+        clientTypeUUID = "1910A70F-DBC0-4242-AF95-115DB30604E1",
+      },
+    },
+  })
 end
 
 function AirPlayControlClient:connect(host, port)
@@ -5334,11 +5672,16 @@ function AirPlayControlClient:handle_plain_response(response)
       " body_head=" .. Bytes.hex(response.body:sub(1, 32)))
     assert(response.status >= 200 and response.status < 300, "AirPlay Pair-Verify M4 HTTP " .. tostring(response.status))
     self.session = HAPSession.new(self.pending_control_keys.output_key, self.pending_control_keys.input_key, self.crypto)
-    self:set_state("ENCRYPTED_INFO")
-    self:send_encrypted("GET", "/info", "", {
-      ["User-Agent"] = "AirPlay/550.10",
-      ["Accept"] = "application/x-apple-binary-plist",
-    })
+    if self.probe == "tunnel_setup" then
+      self:set_state("RTSP_EVENT_SETUP")
+      self:send_rtsp("SETUP", self:build_event_setup_plist())
+    else
+      self:set_state("ENCRYPTED_INFO")
+      self:send_encrypted("GET", "/info", "", {
+        ["User-Agent"] = "AirPlay/550.10",
+        ["Accept"] = "application/x-apple-binary-plist",
+      })
+    end
     return
   end
 
@@ -5346,6 +5689,49 @@ function AirPlayControlClient:handle_plain_response(response)
 end
 
 function AirPlayControlClient:handle_encrypted_response(response)
+  if self.state == "RTSP_EVENT_SETUP" then
+    Log.debug("AirPlay RTSP event SETUP response: code=" .. tostring(response.status) ..
+      " body_len=" .. tostring(#response.body) ..
+      " body_head=" .. Bytes.hex(response.body:sub(1, 32)))
+    assert(response.status >= 200 and response.status < 300, "AirPlay event SETUP HTTP " .. tostring(response.status))
+    local body = BPlist.decode(response.body)
+    self.event_port = body.eventPort or body.event_port
+    Log.debug("AirPlay RTSP event channel discovered: eventPort=" .. tostring(self.event_port))
+    self:set_state("RTSP_RECORD")
+    self:send_rtsp("RECORD", "")
+    return
+  end
+
+  if self.state == "RTSP_RECORD" then
+    Log.debug("AirPlay RTSP RECORD response: code=" .. tostring(response.status) ..
+      " body_len=" .. tostring(#response.body))
+    assert(response.status >= 200 and response.status < 300, "AirPlay RECORD HTTP " .. tostring(response.status))
+    self:set_state("RTSP_DATA_SETUP")
+    self:send_rtsp("SETUP", self:build_data_setup_plist())
+    return
+  end
+
+  if self.state == "RTSP_DATA_SETUP" then
+    Log.debug("AirPlay RTSP data SETUP response: code=" .. tostring(response.status) ..
+      " body_len=" .. tostring(#response.body) ..
+      " body_head=" .. Bytes.hex(response.body:sub(1, 32)))
+    assert(response.status >= 200 and response.status < 300, "AirPlay data SETUP HTTP " .. tostring(response.status))
+    local body = BPlist.decode(response.body)
+    local stream = body.streams and body.streams[1] or {}
+    self.data_port = stream.dataPort or stream.data_port
+    Log.debug("AirPlay RTSP data channel discovered: dataPort=" .. tostring(self.data_port) ..
+      " seed=" .. tostring(self.data_seed))
+    self:set_state("RTSP_TUNNEL_READY")
+    if self.on_tunnel_setup then
+      self.on_tunnel_setup({
+        event_port = self.event_port,
+        data_port = self.data_port,
+        seed = self.data_seed,
+      })
+    end
+    return
+  end
+
   Log.debug("AirPlay encrypted /info response: code=" .. tostring(response.status) ..
     " content_type=" .. tostring(response.headers["content-type"] or response.headers["Content-Type"] or "") ..
     " body_len=" .. tostring(#response.body) ..
@@ -5724,6 +6110,60 @@ function C4Driver.probe_airplay_control_info()
       start_probe(info.port)
     else
       Log.debug("AirPlay encrypted /info probe skipped: AirPlay service not discovered")
+      C4Driver.update_property("Connection State", "AirPlay Not Found")
+    end
+  end)
+end
+
+function C4Driver.probe_airplay_tunnel_setup()
+  C4Driver.ensure_crypto_provider()
+  local host = Properties and Properties["Apple TV Address"]
+  if not host or host == "" then
+    Log.error("Apple TV Address is required")
+    return nil, "Apple TV Address is required"
+  end
+
+  local credentials = AirPlay.credentials or (Driver.state and Driver.state.airplay_credentials and Credentials.parse(Driver.state.airplay_credentials))
+  if not credentials or credentials.type ~= "HAP" then
+    Log.error("AirPlay HAP credentials are required for tunnel setup probe")
+    C4Driver.update_property("Connection State", "AirPlay Credentials Required")
+    return nil, "AirPlay HAP credentials are required"
+  end
+
+  local function start_probe(port)
+    AirPlay.port = port or AirPlay.port or 7000
+    AirPlay.control_client = AirPlayControlClient.new({
+      host = host,
+      port = AirPlay.port,
+      credentials = credentials,
+      crypto = Crypto,
+      probe = "tunnel_setup",
+      on_tunnel_setup = function(result)
+        if result and result.data_port then
+          C4Driver.update_property("Connection State", "AirPlay Tunnel Ready " .. tostring(result.data_port))
+        else
+          C4Driver.update_property("Connection State", "AirPlay Tunnel Setup Incomplete")
+        end
+      end,
+      on_error = function()
+        C4Driver.update_property("Connection State", "AirPlay Tunnel Failed")
+      end,
+    })
+    return AirPlay.control_client:connect(host, AirPlay.port)
+  end
+
+  if AirPlay.port then
+    return start_probe(AirPlay.port)
+  end
+
+  Log.debug("AirPlay tunnel setup probe waiting for AirPlay port discovery")
+  return MDNS.discover_airplay_info(host, function(info)
+    if info and info.port then
+      AirPlay.port = info.port
+      AirPlay.txt = info.txt or {}
+      start_probe(info.port)
+    else
+      Log.debug("AirPlay tunnel setup probe skipped: AirPlay service not discovered")
       C4Driver.update_property("Connection State", "AirPlay Not Found")
     end
   end)
@@ -6297,6 +6737,9 @@ end
 EC.PROBE_AIRPLAY_CONTROL_INFO = function()
   return C4Driver.probe_airplay_control_info()
 end
+EC.PROBE_AIRPLAY_TUNNEL_SETUP = function()
+  return C4Driver.probe_airplay_tunnel_setup()
+end
 EC.PAIR_AIRPLAY = function()
   return C4Driver.pair_airplay()
 end
@@ -6431,6 +6874,7 @@ Driver.Companion = Companion
 Driver.AirPlay = AirPlay
 Driver.AirPlayHTTP = AirPlayHTTP
 Driver.AirPlayControlClient = AirPlayControlClient
+Driver.BPlist = BPlist
 Driver.PairVerify = PairVerify
 Driver.PairSetup = PairSetup
 Driver.Crypto = Crypto
