@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.24-dev",
+  VERSION = "0.1.25-dev",
 }
 
 local function has_c4()
@@ -2005,8 +2005,8 @@ function OpenSSLCrypto._derive_x25519(private_key, server_public_key)
   return X25519Pure.mul(private_key, server_public_key)
 end
 
-function OpenSSLCrypto._sign_ed25519(private_key_bytes, data)
-  local public_key = Ed25519Pure.public_key_from_private(private_key_bytes)
+function OpenSSLCrypto._sign_ed25519(private_key_bytes, data, public_key)
+  public_key = public_key or Ed25519Pure.public_key_from_private(private_key_bytes)
   return Ed25519Pure.sign(private_key_bytes, public_key, data)
 end
 
@@ -2251,7 +2251,12 @@ function OpenSSLCrypto.ed25519_sign(private_key_bytes, message)
   return OpenSSLCrypto._sign_ed25519(private_key_bytes, message)
 end
 
+local function elapsed_ms(start_time)
+  return math.floor(((os.clock() - start_time) * 1000) + 0.5)
+end
+
 function OpenSSLCrypto.pair_verify_response(credentials, private_key, public_key, server_public_key, encrypted_data)
+  local total_start = os.clock()
   local shared_secret = OpenSSLCrypto._derive_x25519(private_key, server_public_key)
   local session_key = OpenSSLCrypto.hkdf_sha512("Pair-Verify-Encrypt-Salt", "Pair-Verify-Encrypt-Info", shared_secret)
   local nonce = OpenSSLCrypto._hap_nonce("PV-Msg02")
@@ -2273,6 +2278,7 @@ function OpenSSLCrypto.pair_verify_response(credentials, private_key, public_key
     encrypted_data
   )
   Log.debug("Pair-Verify M2 decrypt: decrypted_len=" .. tostring(#(decrypted or "")))
+  local step_start = os.clock()
   local ok, decrypted_tlv_or_err = pcall(TLV8.decode, decrypted)
   if not ok then
     Log.error("Pair-Verify decrypted TLV decode failed: len=" .. tostring(#(decrypted or "")) ..
@@ -2282,6 +2288,7 @@ function OpenSSLCrypto.pair_verify_response(credentials, private_key, public_key
     error(decrypted_tlv_or_err, 2)
   end
   local decrypted_tlv = decrypted_tlv_or_err
+  Log.debug("Pair-Verify M2 timing: tlv_decode_ms=" .. tostring(elapsed_ms(step_start)))
 
   local identifier = decrypted_tlv[1]
   local signature = decrypted_tlv[10]
@@ -2289,16 +2296,30 @@ function OpenSSLCrypto.pair_verify_response(credentials, private_key, public_key
   assert(signature, "Apple TV Pair-Verify signature missing")
 
   local device_info = server_public_key .. identifier .. public_key
+  step_start = os.clock()
   assert(OpenSSLCrypto._verify_ed25519(credentials.ltpk, signature, device_info), "Apple TV Pair-Verify signature invalid")
+  Log.debug("Pair-Verify M2 timing: atv_signature_verify_ms=" .. tostring(elapsed_ms(step_start)))
 
   local controller_info = public_key .. credentials.client_id .. server_public_key
-  local controller_signature = OpenSSLCrypto._sign_ed25519(credentials.ltsk, controller_info)
+  step_start = os.clock()
+  if not credentials.controller_ltpk then
+    local public_ok, controller_ltpk = pcall(Ed25519Pure.public_key_from_private, credentials.ltsk)
+    if public_ok then
+      credentials.controller_ltpk = controller_ltpk
+    end
+  end
+  local controller_signature = OpenSSLCrypto._sign_ed25519(credentials.ltsk, controller_info, credentials.controller_ltpk)
+  Log.debug("Pair-Verify M2 timing: controller_signature_ms=" .. tostring(elapsed_ms(step_start)))
   local response_tlv = TLV8.encode_ordered({
     { 1, credentials.client_id },
     { 10, controller_signature },
   })
 
-  return OpenSSLCrypto._chacha20_poly1305_encrypt(session_key, OpenSSLCrypto._hap_nonce("PV-Msg03"), response_tlv), shared_secret
+  step_start = os.clock()
+  local encrypted_response = OpenSSLCrypto._chacha20_poly1305_encrypt(session_key, OpenSSLCrypto._hap_nonce("PV-Msg03"), response_tlv)
+  Log.debug("Pair-Verify M2 timing: response_encrypt_ms=" .. tostring(elapsed_ms(step_start)) ..
+    " total_ms=" .. tostring(elapsed_ms(total_start)))
+  return encrypted_response, shared_secret
 end
 
 function OpenSSLCrypto.install()
