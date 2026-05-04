@@ -5,8 +5,8 @@
     <name>Apple TV</name>
     <model>Apple TV</model>
     <created>05/02/2026 12:00 AM</created>
-    <modified>05/04/2026 12:10 AM</modified>
-    <version>24</version>
+    <modified>05/04/2026 12:18 AM</modified>
+    <version>25</version>
     <small image_source="c4z">icons/device_sm.png</small>
     <large image_source="c4z">icons/device_lg.png</large>
     <control>lua_gen</control>
@@ -522,6 +522,17 @@
                 <readonly>true</readonly>
             </property>
             <property>
+                <name>App Count</name>
+                <default>0</default>
+                <type>STRING</type>
+                <readonly>true</readonly>
+            </property>
+            <property>
+                <name>Selected App</name>
+                <type>DYNAMIC_LIST</type>
+                <readonly>false</readonly>
+            </property>
+            <property>
                 <name>Pairing PIN</name>
                 <default />
                 <type>STRING</type>
@@ -552,6 +563,10 @@
             <action>
                 <name>Refresh App List</name>
                 <command>REFRESH_APP_LIST</command>
+            </action>
+            <action>
+                <name>Launch Selected App</name>
+                <command>LAUNCH_SELECTED_APP</command>
             </action>
             <action>
                 <name>Connect Apple TV</name>

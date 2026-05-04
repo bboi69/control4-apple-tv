@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.22-dev",
+  VERSION = "0.1.23-dev",
 }
 
 local function has_c4()
@@ -2903,6 +2903,53 @@ function Companion.render_app_list(rows)
   return table.concat(lines, "\n")
 end
 
+function Companion.app_display_name(app)
+  if type(app) ~= "table" then return "" end
+  return tostring(app.name or app.identifier or "") .. " | " .. tostring(app.identifier or "")
+end
+
+function Companion.app_selector_items(rows)
+  local items = { "" }
+  for _, app in ipairs(rows or {}) do
+    local item = Companion.app_display_name(app):gsub(",", " ")
+    if item ~= " | " then
+      items[#items + 1] = item
+    end
+  end
+  return items
+end
+
+function Companion.resolve_app_selection(selection)
+  selection = tostring(selection or "")
+  if selection == "" then return nil end
+  if Companion.app_list[selection] then return selection end
+
+  local exact_name_match
+  for _, app in ipairs(Companion.app_list_rows or {}) do
+    if selection == Companion.app_display_name(app) or selection == app.name then
+      if selection == app.name and exact_name_match and exact_name_match ~= app.identifier then
+        return nil, "multiple apps match name " .. selection .. "; select the full app entry"
+      end
+      exact_name_match = app.identifier
+    end
+  end
+  if exact_name_match then return exact_name_match end
+
+  local needle = selection:lower()
+  local fuzzy_match
+  for _, app in ipairs(Companion.app_list_rows or {}) do
+    local name = tostring(app.name or ""):lower()
+    local identifier = tostring(app.identifier or ""):lower()
+    if name:find(needle, 1, true) or identifier:find(needle, 1, true) then
+      if fuzzy_match and fuzzy_match ~= app.identifier then
+        return nil, "multiple apps match " .. selection .. "; select the full app entry"
+      end
+      fuzzy_match = app.identifier
+    end
+  end
+  return fuzzy_match
+end
+
 function Companion.render_current_app(app)
   if type(app) ~= "table" then
     return ""
@@ -3790,6 +3837,12 @@ function C4Driver.update_property(name, value)
   end
 end
 
+function C4Driver.update_property_list(name, items)
+  if has_c4() and C4.UpdatePropertyList then
+    C4:UpdatePropertyList(name, table.concat(items or {}, ","))
+  end
+end
+
 function C4Driver.set_connection_state(value)
   Companion.state = value
   C4Driver.update_property("Connection State", value)
@@ -3804,7 +3857,10 @@ function C4Driver.publish_now_playing()
 end
 
 function C4Driver.publish_app_list()
-  C4Driver.update_property("App List", Companion.render_app_list(Companion.app_list_rows or {}))
+  local rows = Companion.app_list_rows or {}
+  C4Driver.update_property("App List", Companion.render_app_list(rows))
+  C4Driver.update_property("App Count", tostring(#rows))
+  C4Driver.update_property_list("Selected App", Companion.app_selector_items(rows))
 end
 
 function C4Driver.handle_companion_message(message)
@@ -3841,6 +3897,17 @@ function C4Driver.refresh_app_list()
     C4Driver.ensure_companion_client()
   end
   return Companion.fetch_apps()
+end
+
+function C4Driver.launch_selected_app()
+  local selection = Properties and Properties["Selected App"] or ""
+  local app_id, err = Companion.resolve_app_selection(selection)
+  if not app_id then
+    err = err or "select an app after refreshing the app list"
+    Log.error("Launch Selected App failed: " .. tostring(err))
+    error(err)
+  end
+  return C4Driver.launch_app(app_id)
 end
 
 function C4Driver.import_credentials(detail_string)
@@ -3895,6 +3962,9 @@ function C4Driver.reset_pairing()
   Companion.now_playing = {}
   Storage.save(Driver.state)
   C4Driver.update_property("App List", "")
+  C4Driver.update_property("App Count", "0")
+  C4Driver.update_property("Selected App", "")
+  C4Driver.update_property_list("Selected App", { "" })
   C4Driver.update_property("Current App", "")
   C4Driver.update_property("Now Playing", "")
   C4Driver.set_connection_state("Disconnected")
@@ -4003,6 +4073,9 @@ EC.LAUNCH_APP = function(params)
 end
 EC.REFRESH_APP_LIST = function()
   return C4Driver.refresh_app_list()
+end
+EC.LAUNCH_SELECTED_APP = function()
+  return C4Driver.launch_selected_app()
 end
 EC.RESET_PAIRING = function()
   return C4Driver.reset_pairing()

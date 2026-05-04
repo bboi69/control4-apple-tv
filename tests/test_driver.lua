@@ -869,7 +869,7 @@ end
 
 function tests.driver_imports_and_resets_companion_credentials()
   local old_properties = Properties
-  Properties = {}
+  Properties = { ["App List"] = "", ["App Count"] = "0", ["Selected App"] = "", ["Current App"] = "" }
   Driver._test_storage = {}
 
   local credentials = table.concat({
@@ -896,7 +896,7 @@ function tests.crypto_provider_failure_logs_without_last_error_property()
   local old_properties = Properties
   local old_provider = Driver.Crypto.provider
   local old_openssl = Driver.OpenSSLCrypto.openssl
-  Properties = {}
+  Properties = { ["App List"] = "", ["App Count"] = "0", ["Selected App"] = "", ["Current App"] = "" }
   Driver.Crypto.provider = nil
   Driver.OpenSSLCrypto.openssl = {}
 
@@ -913,7 +913,7 @@ end
 
 function tests.execute_command_routes_driver_commands()
   local old_properties = Properties
-  Properties = {}
+  Properties = { ["App List"] = "", ["App Count"] = "0", ["Selected App"] = "", ["Current App"] = "" }
   Driver.Companion.sent_messages = {}
   ExecuteCommand("LAUNCH_APP", { BUNDLE_ID_OR_URL = "com.netflix.Netflix" })
   local launch = Driver.Companion.sent_messages[#Driver.Companion.sent_messages]
@@ -1338,6 +1338,43 @@ function tests.app_list_current_app_and_now_playing_are_published()
   })
   assert_eq(Properties["Now Playing"], "Episode One - A Show - Season 1", "now playing property")
 
+  Properties = old_properties
+end
+
+function tests.app_list_populates_selected_app_dynamic_list_and_launches_selection()
+  local old_properties = Properties
+  local old_c4 = C4
+  local property_lists = {}
+  Properties = {}
+  C4 = {
+    UpdatePropertyList = function(_, name, items)
+      property_lists[name] = items
+    end,
+  }
+  Driver.Companion.sent_messages = {}
+  Driver.Companion.app_list = {}
+  Driver.Companion.app_list_rows = {}
+
+  Driver.C4Driver.handle_companion_message({
+    _i = "FetchLaunchableApplicationsEvent",
+    _t = 3,
+    _c = {
+      ["com.netflix.Netflix"] = "Netflix",
+      ["com.google.ios.youtube"] = "YouTube",
+    },
+  })
+
+  assert_eq(Properties["App Count"], "2", "app count property")
+  assert(property_lists["Selected App"]:match("Netflix | com.netflix.Netflix"), "selected app list contains Netflix")
+  assert(property_lists["Selected App"]:match("YouTube | com.google.ios.youtube"), "selected app list contains YouTube")
+
+  Properties["Selected App"] = "Netflix | com.netflix.Netflix"
+  Driver.C4Driver.launch_selected_app()
+  local launch = Driver.Companion.sent_messages[#Driver.Companion.sent_messages]
+  assert_eq(launch._i, "_launchApp", "selected app launches")
+  assert_eq(launch._c._bundleID, "com.netflix.Netflix", "selected app bundle")
+
+  C4 = old_c4
   Properties = old_properties
 end
 
