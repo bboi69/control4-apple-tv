@@ -3909,6 +3909,42 @@ function BPlist.decode(data)
   return parse_object(top_object)
 end
 
+function BPlist.describe(value, depth)
+  depth = depth or 0
+  if depth > 3 then return "..." end
+  local value_type = type(value)
+  if value_type == "nil" then return "nil" end
+  if value_type == "boolean" or value_type == "number" then return tostring(value) end
+  if value_type == "string" then
+    local printable = value:gsub("[^%g ]", ".")
+    if #printable > 80 then printable = printable:sub(1, 80) .. "..." end
+    return '"' .. printable .. '"'
+  end
+  if value_type == "table" then
+    if value.__bplist_type == "bytes" then
+      return "bytes(" .. tostring(#(value.data or "")) .. ")=" .. Bytes.hex((value.data or ""):sub(1, 24))
+    end
+    local parts = {}
+    if bplist_is_array(value) then
+      for i = 1, math.min(#value, 8) do
+        parts[#parts + 1] = BPlist.describe(value[i], depth + 1)
+      end
+      if #value > 8 then parts[#parts + 1] = "..." end
+      return "[" .. table.concat(parts, ", ") .. "]"
+    end
+    local keys = {}
+    for key in pairs(value) do keys[#keys + 1] = tostring(key) end
+    table.sort(keys)
+    for i = 1, math.min(#keys, 8) do
+      local key = keys[i]
+      parts[#parts + 1] = key .. "=" .. BPlist.describe(value[key], depth + 1)
+    end
+    if #keys > 8 then parts[#parts + 1] = "..." end
+    return "{" .. table.concat(parts, ", ") .. "}"
+  end
+  return tostring(value)
+end
+
 local AirPlayHTTP = {}
 
 function AirPlayHTTP.format_request(method, path, host, port, headers, body, protocol)
@@ -5575,26 +5611,33 @@ function PB.describe(data)
   return table.concat(parts, " ")
 end
 
-function PB.protocol_message(message_type, extension_field, extension_body, crypto)
+function PB.uuid(crypto)
   crypto = crypto or Crypto
   local h = Bytes.hex(crypto_method(crypto, "random_bytes")(16))
-  local uuid = string.upper(h:sub(1, 8) .. "-" ..
+  return string.upper(h:sub(1, 8) .. "-" ..
     h:sub(9, 12) .. "-" ..
     h:sub(13, 16) .. "-" ..
     h:sub(17, 20) .. "-" ..
     h:sub(21, 32))
+end
+
+function PB.protocol_message(message_type, extension_field, extension_body, crypto, identifier)
+  crypto = crypto or Crypto
   local out = {
     PB.field_varint(1, message_type),
     PB.field_varint(4, 0),
-    PB.field_string(85, uuid),
+    PB.field_string(85, PB.uuid(crypto)),
   }
+  if identifier then
+    table.insert(out, 2, PB.field_string(2, identifier))
+  end
   if extension_field and extension_body then
     out[#out + 1] = PB.field_message(extension_field, extension_body)
   end
   return table.concat(out)
 end
 
-function PB.device_info(client_id, crypto)
+function PB.device_info(client_id, crypto, identifier)
   local info = table.concat({
     PB.field_string(1, tostring(client_id or "Control4")),
     PB.field_string(2, "Control4"),
@@ -5614,22 +5657,26 @@ function PB.device_info(client_id, crypto)
     PB.field_varint(21, 1),
     PB.field_varint(22, 1),
   })
-  return PB.protocol_message(15, 20, info, crypto)
+  return PB.protocol_message(15, 20, info, crypto, identifier)
 end
 
 function PB.set_connection_state(crypto)
   return PB.protocol_message(38, 42, PB.field_varint(1, 2), crypto)
 end
 
-function PB.client_updates_config(crypto)
+function PB.client_updates_config(crypto, identifier)
   local config = table.concat({
     PB.field_varint(1, 1),
-    PB.field_varint(2, 1),
+    PB.field_varint(2, 0),
     PB.field_varint(3, 1),
     PB.field_varint(4, 1),
     PB.field_varint(5, 1),
   })
-  return PB.protocol_message(16, 21, config, crypto)
+  return PB.protocol_message(16, 21, config, crypto, identifier)
+end
+
+function PB.get_keyboard_session(crypto, identifier)
+  return PB.protocol_message(24, nil, nil, crypto, identifier)
 end
 
 local DATA_HEADER_LENGTH = 32
@@ -5730,12 +5777,17 @@ function AirPlayDataChannelClient:send_protobuf(message)
 end
 
 function AirPlayDataChannelClient:send_bootstrap()
+  local device_info_id = PB.uuid(self.crypto)
+  local updates_id = PB.uuid(self.crypto)
+  local keyboard_id = PB.uuid(self.crypto)
   Log.debug("AirPlay data channel bootstrap: sending MRP device info")
-  self:send_protobuf(PB.device_info(self.client_id, self.crypto))
+  self:send_protobuf(PB.device_info(self.client_id, self.crypto, device_info_id))
   Log.debug("AirPlay data channel bootstrap: sending MRP connection state")
   self:send_protobuf(PB.set_connection_state(self.crypto))
   Log.debug("AirPlay data channel bootstrap: sending MRP client updates config")
-  self:send_protobuf(PB.client_updates_config(self.crypto))
+  self:send_protobuf(PB.client_updates_config(self.crypto, updates_id))
+  Log.debug("AirPlay data channel bootstrap: sending MRP keyboard session request")
+  self:send_protobuf(PB.get_keyboard_session(self.crypto, keyboard_id))
 end
 
 function AirPlayDataChannelClient:send_reply(seqno)
@@ -5786,7 +5838,7 @@ function AirPlayDataChannelClient:handle_payload(message_type, seqno, payload)
           " head=" .. Bytes.hex(data.data:sub(1, 32)) ..
           " desc=" .. description)
       else
-        Log.debug("AirPlay data channel plist payload decoded")
+        Log.debug("AirPlay data channel plist payload: " .. BPlist.describe(decoded))
       end
     else
       Log.debug("AirPlay data channel non-plist payload: " .. tostring(decoded))
