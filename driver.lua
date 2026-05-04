@@ -5611,6 +5611,216 @@ function PB.describe(data)
   return table.concat(parts, " ")
 end
 
+local PB_MESSAGE_TYPES = {
+  [1] = "SEND_COMMAND_MESSAGE",
+  [2] = "SEND_COMMAND_RESULT_MESSAGE",
+  [3] = "GET_STATE_MESSAGE",
+  [4] = "SET_STATE_MESSAGE",
+  [15] = "DEVICE_INFO_MESSAGE",
+  [16] = "CLIENT_UPDATES_CONFIG_MESSAGE",
+  [23] = "KEYBOARD_MESSAGE",
+  [24] = "GET_KEYBOARD_SESSION_MESSAGE",
+  [32] = "PLAYBACK_QUEUE_REQUEST_MESSAGE",
+  [38] = "SET_CONNECTION_STATE_MESSAGE",
+  [46] = "SET_NOW_PLAYING_CLIENT_MESSAGE",
+  [47] = "SET_NOW_PLAYING_PLAYER_MESSAGE",
+  [55] = "UPDATE_CLIENT_MESSAGE",
+  [58] = "UPDATE_PLAYER_MESSAGE",
+  [65] = "UPDATE_OUTPUT_DEVICE_MESSAGE",
+  [72] = "SET_DEFAULT_SUPPORTED_COMMANDS_MESSAGE",
+}
+
+function PB.scan(data)
+  local fields = {}
+  local index = 1
+  while index <= #data do
+    local key
+    key, index = PB.read_varint(data, index)
+    local field = math.floor(key / 8)
+    local wire = key % 8
+    local value
+    if wire == 0 then
+      value, index = PB.read_varint(data, index)
+    elseif wire == 1 then
+      value = data:sub(index, index + 7)
+      index = index + 8
+    elseif wire == 2 then
+      local length
+      length, index = PB.read_varint(data, index)
+      value = data:sub(index, index + length - 1)
+      index = index + length
+    elseif wire == 5 then
+      value = data:sub(index, index + 3)
+      index = index + 4
+    else
+      error("unsupported protobuf wire type " .. tostring(wire))
+    end
+    fields[#fields + 1] = { field = field, wire = wire, value = value }
+  end
+  return fields
+end
+
+function PB.first_field(data, field, wire)
+  local ok, fields = pcall(PB.scan, data)
+  if not ok then return nil end
+  for _, item in ipairs(fields) do
+    if item.field == field and (wire == nil or item.wire == wire) then
+      return item.value
+    end
+  end
+  return nil
+end
+
+function PB.string_field(data, field)
+  return PB.first_field(data, field, 2)
+end
+
+function PB.varint_field(data, field)
+  return PB.first_field(data, field, 0)
+end
+
+function PB.bool_text(value)
+  if value == nil then return nil end
+  return value == 0 and "false" or "true"
+end
+
+function PB.summarize_now_playing_client(data)
+  if not data then return nil end
+  local parts = {}
+  local bundle = PB.string_field(data, 2)
+  local parent = PB.string_field(data, 3)
+  local display = PB.string_field(data, 7)
+  if bundle then parts[#parts + 1] = "bundle=" .. bundle end
+  if display then parts[#parts + 1] = "name=" .. display end
+  if parent then parts[#parts + 1] = "parent=" .. parent end
+  return #parts > 0 and table.concat(parts, " ") or nil
+end
+
+function PB.summarize_now_playing_player(data)
+  if not data then return nil end
+  local parts = {}
+  local identifier = PB.string_field(data, 1)
+  local display = PB.string_field(data, 2)
+  local default = PB.bool_text(PB.varint_field(data, 3))
+  if identifier then parts[#parts + 1] = "player=" .. identifier end
+  if display then parts[#parts + 1] = "player_name=" .. display end
+  if default then parts[#parts + 1] = "default=" .. default end
+  return #parts > 0 and table.concat(parts, " ") or nil
+end
+
+function PB.summarize_player_path(data)
+  if not data then return nil end
+  local parts = {}
+  local client = PB.summarize_now_playing_client(PB.first_field(data, 2, 2))
+  local player = PB.summarize_now_playing_player(PB.first_field(data, 3, 2))
+  if client then parts[#parts + 1] = client end
+  if player then parts[#parts + 1] = player end
+  return #parts > 0 and table.concat(parts, " ") or nil
+end
+
+function PB.summarize_content_metadata(data)
+  if not data then return nil end
+  local parts = {}
+  local title = PB.string_field(data, 1)
+  local subtitle = PB.string_field(data, 2)
+  local album = PB.string_field(data, 6)
+  local artist = PB.string_field(data, 7)
+  local series = PB.string_field(data, 63)
+  local service = PB.string_field(data, 76)
+  if title then parts[#parts + 1] = "title=" .. title end
+  if subtitle then parts[#parts + 1] = "subtitle=" .. subtitle end
+  if artist then parts[#parts + 1] = "artist=" .. artist end
+  if album then parts[#parts + 1] = "album=" .. album end
+  if series then parts[#parts + 1] = "series=" .. series end
+  if service then parts[#parts + 1] = "service=" .. service end
+  return #parts > 0 and table.concat(parts, " ") or nil
+end
+
+function PB.summarize_playback_queue(data)
+  if not data then return nil end
+  local parts = {}
+  local location = PB.varint_field(data, 1)
+  if location then parts[#parts + 1] = "location=" .. tostring(location) end
+  local ok, fields = pcall(PB.scan, data)
+  if ok then
+    for _, item in ipairs(fields) do
+      if item.field == 2 and item.wire == 2 then
+        local item_id = PB.string_field(item.value, 1)
+        local metadata = PB.summarize_content_metadata(PB.first_field(item.value, 2, 2))
+        if item_id or metadata then
+          local item_parts = {}
+          if item_id then item_parts[#item_parts + 1] = "id=" .. item_id end
+          if metadata then item_parts[#item_parts + 1] = metadata end
+          parts[#parts + 1] = "item={" .. table.concat(item_parts, " ") .. "}"
+          break
+        end
+      end
+    end
+  end
+  return #parts > 0 and table.concat(parts, " ") or nil
+end
+
+function PB.summarize_state_like(data)
+  if not data then return nil end
+  local parts = {}
+  local metadata = PB.summarize_content_metadata(PB.first_field(data, 1, 2))
+  local queue = PB.summarize_playback_queue(PB.first_field(data, 3, 2))
+  local display_id = PB.string_field(data, 4)
+  local display_name = PB.string_field(data, 5)
+  local state = PB.varint_field(data, 6)
+  local path = PB.summarize_player_path(PB.first_field(data, 9, 2))
+  if display_id then parts[#parts + 1] = "display_id=" .. display_id end
+  if display_name then parts[#parts + 1] = "display=" .. display_name end
+  if state then parts[#parts + 1] = "playback_state=" .. tostring(state) end
+  if path then parts[#parts + 1] = "path={" .. path .. "}" end
+  if metadata then parts[#parts + 1] = "metadata={" .. metadata .. "}" end
+  if queue then parts[#parts + 1] = "queue={" .. queue .. "}" end
+  return #parts > 0 and table.concat(parts, " ") or nil
+end
+
+function PB.summarize_device_info(data)
+  if not data then return nil end
+  local parts = {}
+  local name = PB.string_field(data, 2)
+  local model = PB.string_field(data, 3)
+  local build = PB.string_field(data, 4)
+  local app = PB.string_field(data, 5)
+  local media_app = PB.string_field(data, 12)
+  if name then parts[#parts + 1] = "name=" .. name end
+  if model then parts[#parts + 1] = "model=" .. model end
+  if build then parts[#parts + 1] = "build=" .. build end
+  if app then parts[#parts + 1] = "app=" .. app end
+  if media_app then parts[#parts + 1] = "media_app=" .. media_app end
+  return #parts > 0 and table.concat(parts, " ") or nil
+end
+
+function PB.describe_protocol_message(data)
+  local message_type = PB.varint_field(data, 1)
+  local type_name = PB_MESSAGE_TYPES[message_type] or ("TYPE_" .. tostring(message_type))
+  local parts = { type_name }
+  local identifier = PB.string_field(data, 2)
+  local error_code = PB.varint_field(data, 4)
+  if identifier then parts[#parts + 1] = "id=" .. identifier end
+  if error_code and error_code ~= 0 then parts[#parts + 1] = "error=" .. tostring(error_code) end
+
+  local summary
+  if message_type == 4 then
+    summary = PB.summarize_state_like(PB.first_field(data, 9, 2))
+  elseif message_type == 15 then
+    summary = PB.summarize_device_info(PB.first_field(data, 20, 2))
+  elseif message_type == 46 or message_type == 55 then
+    local inner = PB.first_field(data, message_type == 46 and 50 or 59, 2)
+    summary = PB.summarize_now_playing_client(PB.first_field(inner or "", 1, 2))
+  elseif message_type == 47 or message_type == 58 then
+    local inner = PB.first_field(data, message_type == 47 and 51 or 62, 2)
+    summary = PB.summarize_player_path(PB.first_field(inner or "", 1, 2))
+  elseif message_type == 72 then
+    summary = PB.summarize_state_like(PB.first_field(data, 75, 2))
+  end
+  if summary then parts[#parts + 1] = summary end
+  return table.concat(parts, " ")
+end
+
 function PB.uuid(crypto)
   crypto = crypto or Crypto
   local h = Bytes.hex(crypto_method(crypto, "random_bytes")(16))
@@ -5667,7 +5877,7 @@ end
 function PB.client_updates_config(crypto, identifier)
   local config = table.concat({
     PB.field_varint(1, 1),
-    PB.field_varint(2, 0),
+    PB.field_varint(2, 1),
     PB.field_varint(3, 1),
     PB.field_varint(4, 1),
     PB.field_varint(5, 1),
@@ -5832,7 +6042,9 @@ function AirPlayDataChannelClient:handle_payload(message_type, seqno, payload)
         local description = ""
         local ok_desc, value_or_err, next_index = pcall(PB.read_varint, data.data, 1)
         if ok_desc and value_or_err and next_index then
-          description = PB.describe(data.data:sub(next_index))
+          local raw_message = data.data:sub(next_index, next_index + value_or_err - 1)
+          local ok_protocol, protocol_description = pcall(PB.describe_protocol_message, raw_message)
+          description = ok_protocol and protocol_description or PB.describe(raw_message)
         end
         Log.debug("AirPlay data channel protobuf bytes: len=" .. tostring(#data.data) ..
           " head=" .. Bytes.hex(data.data:sub(1, 32)) ..
