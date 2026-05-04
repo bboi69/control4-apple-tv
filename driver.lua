@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.32-dev",
+  VERSION = "0.1.33-dev",
 }
 
 local function has_c4()
@@ -1582,6 +1582,24 @@ local function _ed_build_base_table()
   return table_by_window
 end
 
+local function _ed_build_fixed_point_table(point)
+  local table_by_window = {}
+  local base = point
+  for window = 1, math.ceil(256 / _ED_BASE_WINDOW) do
+    local multiples = {}
+    multiples[0] = _ed_identity()
+    multiples[1] = base
+    for digit = 2, _ED_BASE_WINDOW_SIZE - 1 do
+      multiples[digit] = _ed_point_add(multiples[digit - 1], base)
+    end
+    table_by_window[window] = multiples
+    for _ = 1, _ED_BASE_WINDOW do
+      base = _ed_point_add(base, base)
+    end
+  end
+  return table_by_window
+end
+
 local function _ed_base_window_digit(scalar, window_index)
   local digit = 0
   local first_bit = (window_index - 1) * _ED_BASE_WINDOW
@@ -1593,16 +1611,22 @@ local function _ed_base_window_digit(scalar, window_index)
   return digit
 end
 
+local _ed_scalar_mult_fixed_table
+
 local function _ed_scalar_mult_base(scalar)
   if not _ED_BASE_TABLE then
     _ED_BASE_TABLE = _ed_build_base_table()
     _ED_BASE_TABLE_PREWARMED = true
   end
+  return _ed_scalar_mult_fixed_table(_ED_BASE_TABLE, scalar)
+end
+
+function _ed_scalar_mult_fixed_table(fixed_table, scalar)
   local result = _ed_identity()
-  for window = 1, #_ED_BASE_TABLE do
+  for window = 1, #fixed_table do
     local digit = _ed_base_window_digit(scalar, window)
     if digit ~= 0 then
-      result = _ed_point_add(result, _ED_BASE_TABLE[window][digit])
+      result = _ed_point_add(result, fixed_table[window][digit])
     end
   end
   return result
@@ -1696,6 +1720,18 @@ function Ed25519Pure.public_key_from_private(private_key)
   return _ed_encode_point(_ed_scalar_mult_base(a))
 end
 
+function Ed25519Pure.expand_private_key(private_key)
+  assert(type(private_key) == "string" and #private_key == 32, "Ed25519 private key must be 32 bytes")
+  local h = _sha512_bytes(private_key)
+  local a = _ed_clamped_scalar_from_hash(h)
+  return {
+    private_key = private_key,
+    scalar = a,
+    prefix = h:sub(33, 64),
+    public_key = _ed_encode_point(_ed_scalar_mult_base(a)),
+  }
+end
+
 function Ed25519Pure.prewarm()
   if _ED_BASE_TABLE_PREWARMED and _ED_BASE_TABLE then
     return false
@@ -1716,11 +1752,23 @@ function Ed25519Pure.sign(private_key, public_key, message)
   return R .. _scalar_to_le32(S)
 end
 
+function Ed25519Pure.sign_expanded(expanded, message)
+  assert(type(expanded) == "table", "expanded Ed25519 private key is required")
+  assert(type(expanded.public_key) == "string" and #expanded.public_key == 32, "expanded Ed25519 public key is invalid")
+  assert(type(expanded.prefix) == "string" and #expanded.prefix == 32, "expanded Ed25519 prefix is invalid")
+  assert(type(expanded.scalar) == "table", "expanded Ed25519 scalar is invalid")
+  local r = _scalar_from_le_bytes_mod(_sha512_bytes(expanded.prefix .. message))
+  local R = _ed_encode_point(_ed_scalar_mult_base(r))
+  local k = _scalar_from_le_bytes_mod(_sha512_bytes(R .. expanded.public_key .. message))
+  local S = _scalar_add(r, _scalar_mul(k, expanded.scalar))
+  return R .. _scalar_to_le32(S)
+end
+
 local function _ed_elapsed_ms(start_time)
   return math.floor((os.clock() - start_time) * 1000 + 0.5)
 end
 
-local function _ed_verify_internal(public_key, signature, message, collect_profile, decoded_public_key)
+local function _ed_verify_internal(public_key, signature, message, collect_profile, decoded_public_key, fixed_public_table)
   local profile = collect_profile and {} or nil
   local step_start = os.clock()
   if type(signature) ~= "string" or #signature ~= 64 then
@@ -1746,7 +1794,13 @@ local function _ed_verify_internal(public_key, signature, message, collect_profi
   if profile then profile.base_mult_ms = _ed_elapsed_ms(step_start) end
 
   step_start = os.clock()
-  local right = _ed_point_add(R, _ed_scalar_mult_window(A, k))
+  local kA
+  if fixed_public_table then
+    kA = _ed_scalar_mult_fixed_table(fixed_public_table, k)
+  else
+    kA = _ed_scalar_mult_window(A, k)
+  end
+  local right = _ed_point_add(R, kA)
   if profile then profile.variable_mult_ms = _ed_elapsed_ms(step_start) end
 
   step_start = os.clock()
@@ -1760,12 +1814,16 @@ function Ed25519Pure.verify(public_key, signature, message)
   return ok
 end
 
-function Ed25519Pure.verify_profile(public_key, signature, message, decoded_public_key)
-  return _ed_verify_internal(public_key, signature, message, true, decoded_public_key)
+function Ed25519Pure.verify_profile(public_key, signature, message, decoded_public_key, fixed_public_table)
+  return _ed_verify_internal(public_key, signature, message, true, decoded_public_key, fixed_public_table)
 end
 
 function Ed25519Pure.decode_public_key(public_key)
   return _ed_decode_point(public_key)
+end
+
+function Ed25519Pure.fixed_point_table(point)
+  return _ed_build_fixed_point_table(point)
 end
 
 function SRP.sha512(data)
@@ -2028,6 +2086,7 @@ local OpenSSLCrypto = {
   in_counter = 0,
   self_tested = false,
   ed25519_public_point_cache = {},
+  ed25519_private_key_cache = {},
 }
 
 OpenSSLCrypto.EVP_CTRL_AEAD_GET_TAG = 0x10
@@ -2126,24 +2185,47 @@ function OpenSSLCrypto._derive_x25519(private_key, server_public_key)
 end
 
 function OpenSSLCrypto._sign_ed25519(private_key_bytes, data, public_key)
-  public_key = public_key or Ed25519Pure.public_key_from_private(private_key_bytes)
-  return Ed25519Pure.sign(private_key_bytes, public_key, data)
+  local expanded = OpenSSLCrypto._expanded_ed25519_private_key(private_key_bytes)
+  if public_key and public_key ~= expanded.public_key then
+    return Ed25519Pure.sign(private_key_bytes, public_key, data)
+  end
+  return Ed25519Pure.sign_expanded(expanded, data)
+end
+
+function OpenSSLCrypto._expanded_ed25519_private_key(private_key_bytes)
+  assert(type(private_key_bytes) == "string" and #private_key_bytes == 32, "Ed25519 private key must be 32 bytes")
+  local key = Bytes.hex(private_key_bytes)
+  local expanded = OpenSSLCrypto.ed25519_private_key_cache[key]
+  if not expanded then
+    expanded = Ed25519Pure.expand_private_key(private_key_bytes)
+    OpenSSLCrypto.ed25519_private_key_cache[key] = expanded
+  end
+  return expanded
+end
+
+function OpenSSLCrypto._ed25519_public_key_cache_entry(public_key_bytes)
+  assert(type(public_key_bytes) == "string" and #public_key_bytes == 32, "Ed25519 public key must be 32 bytes")
+  local key = Bytes.hex(public_key_bytes)
+  local entry = OpenSSLCrypto.ed25519_public_point_cache[key]
+  if not entry then
+    local point = assert(Ed25519Pure.decode_public_key(public_key_bytes), "invalid Ed25519 public key")
+    entry = {
+      point = point,
+      fixed_table = Ed25519Pure.fixed_point_table(point),
+    }
+    OpenSSLCrypto.ed25519_public_point_cache[key] = entry
+  end
+  return entry
 end
 
 function OpenSSLCrypto._decoded_ed25519_public_key(public_key_bytes)
-  assert(type(public_key_bytes) == "string" and #public_key_bytes == 32, "Ed25519 public key must be 32 bytes")
-  local key = Bytes.hex(public_key_bytes)
-  local point = OpenSSLCrypto.ed25519_public_point_cache[key]
-  if not point then
-    point = assert(Ed25519Pure.decode_public_key(public_key_bytes), "invalid Ed25519 public key")
-    OpenSSLCrypto.ed25519_public_point_cache[key] = point
-  end
-  return point
+  return OpenSSLCrypto._ed25519_public_key_cache_entry(public_key_bytes).point
 end
 
 function OpenSSLCrypto._default_verify_ed25519(public_key_bytes, signature, data)
+  local entry = OpenSSLCrypto._ed25519_public_key_cache_entry(public_key_bytes)
   return Ed25519Pure.verify_profile(public_key_bytes, signature, data,
-    OpenSSLCrypto._decoded_ed25519_public_key(public_key_bytes))
+    entry.point, entry.fixed_table)
 end
 
 OpenSSLCrypto._verify_ed25519 = OpenSSLCrypto._default_verify_ed25519
@@ -2152,8 +2234,9 @@ function OpenSSLCrypto._verify_ed25519_profile(public_key_bytes, signature, data
   if OpenSSLCrypto._verify_ed25519 ~= OpenSSLCrypto._default_verify_ed25519 then
     return OpenSSLCrypto._verify_ed25519(public_key_bytes, signature, data), nil
   end
+  local entry = OpenSSLCrypto._ed25519_public_key_cache_entry(public_key_bytes)
   return Ed25519Pure.verify_profile(public_key_bytes, signature, data,
-    OpenSSLCrypto._decoded_ed25519_public_key(public_key_bytes))
+    entry.point, entry.fixed_table)
 end
 
 function OpenSSLCrypto._cipher()
@@ -2453,9 +2536,9 @@ function OpenSSLCrypto.pair_verify_response(credentials, private_key, public_key
   local controller_info = public_key .. credentials.client_id .. server_public_key
   step_start = os.clock()
   if not credentials.controller_ltpk then
-    local public_ok, controller_ltpk = pcall(Ed25519Pure.public_key_from_private, credentials.ltsk)
+    local public_ok, expanded = pcall(OpenSSLCrypto._expanded_ed25519_private_key, credentials.ltsk)
     if public_ok then
-      credentials.controller_ltpk = controller_ltpk
+      credentials.controller_ltpk = expanded.public_key
     end
   end
   local controller_signature = OpenSSLCrypto._sign_ed25519(credentials.ltsk, controller_info, credentials.controller_ltpk)
@@ -4307,14 +4390,13 @@ function C4Driver.prewarm_crypto()
       ": Ed25519 fixed-base table ms=" .. tostring(elapsed_ms(start_time)))
 
     start_time = os.clock()
-    if not credentials.controller_ltpk then
-      credentials.controller_ltpk = Ed25519Pure.public_key_from_private(credentials.ltsk)
-    end
-    Log.debug("crypto prewarm controller public key ms=" .. tostring(elapsed_ms(start_time)))
+    local expanded = OpenSSLCrypto._expanded_ed25519_private_key(credentials.ltsk)
+    credentials.controller_ltpk = expanded.public_key
+    Log.debug("crypto prewarm controller signing key ms=" .. tostring(elapsed_ms(start_time)))
 
     start_time = os.clock()
-    OpenSSLCrypto._decoded_ed25519_public_key(credentials.ltpk)
-    Log.debug("crypto prewarm Apple TV public key decode ms=" .. tostring(elapsed_ms(start_time)))
+    OpenSSLCrypto._ed25519_public_key_cache_entry(credentials.ltpk)
+    Log.debug("crypto prewarm Apple TV public key fixed table ms=" .. tostring(elapsed_ms(start_time)))
   end)
   if not ok then
     Log.error("crypto prewarm failed: " .. tostring(err))
