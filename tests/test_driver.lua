@@ -946,7 +946,18 @@ function tests.companion_client_pair_verify_enables_encrypted_session()
 	    { "_c", Driver.OPACK.dict({ { "_sid", 0x87654321 } }) },
 	    { "_x", start_msg._x },
 	  }))))
-	  local ti_start_frame = client.session:try_decode(writes[6])
+	  local tv_rc_frame = client.session:try_decode(writes[6])
+	  local tv_rc_msg = Driver.OPACK.decode(tv_rc_frame.payload)
+	  assert_table_has(tv_rc_msg, "_i", "TVRCSessionStart")
+	  assert_table_has(tv_rc_msg._c, "ProtocolVersionKey", "1.2")
+
+	  client:receive(client.session:encode_frame(Driver.CompanionFrame.E_OPACK, Driver.OPACK.encode(Driver.OPACK.dict({
+	    { "_t", 3 },
+	    { "_c", Driver.OPACK.dict({}) },
+	    { "_x", tv_rc_msg._x },
+	  }))))
+
+	  local ti_start_frame = client.session:try_decode(writes[7])
 	  local ti_start_msg = Driver.OPACK.decode(ti_start_frame.payload)
 	  assert_table_has(ti_start_msg, "_i", "_tiStart")
 
@@ -2019,6 +2030,17 @@ function tests.session_start_response_advances_to_session_active()
 	  assert_eq(states[6], "SESSION_ACTIVE", "session active after _sessionStart response")
 	  assert_eq(client.session_remote_sid, remote_sid, "remote sid stored")
 	
+	  local tv_rc_frame = client.session:try_decode(writes[#writes])
+	  local tv_rc_start = Driver.OPACK.decode(tv_rc_frame.payload)
+	  assert_table_has(tv_rc_start, "_i", "TVRCSessionStart")
+	  assert_table_has(tv_rc_start._c, "ProtocolVersionKey", "1.2")
+
+	  client:receive(client.session:encode_frame(Driver.CompanionFrame.E_OPACK, Driver.OPACK.encode(Driver.OPACK.dict({
+	    { "_t", 3 },
+	    { "_c", Driver.OPACK.dict({}) },
+	    { "_x", tv_rc_start._x },
+	  }))))
+
 	  local ti_start_frame = client.session:try_decode(writes[#writes])
 	  local ti_start = Driver.OPACK.decode(ti_start_frame.payload)
 	  assert_table_has(ti_start, "_i", "_tiStart")

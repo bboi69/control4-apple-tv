@@ -3776,7 +3776,9 @@ function BPlist.encode(value)
   end
 
   local top_object = encode_object(value)
-  assert(#objects < 256, "bplist encoder currently supports fewer than 256 objects")
+  if #objects >= 256 then
+    error("bplist encoder: " .. tostring(#objects) .. " objects exceeds 255-object limit (single-byte refs)")
+  end
 
   local object_data = {}
   local offsets = {}
@@ -3996,7 +3998,7 @@ function AirPlayHTTP.try_parse_response(buffer)
   local body_start = header_end + 4
   local first_line, rest = header_block:match("^([^\r\n]+)\r\n?(.*)$")
   if not first_line then
-    error("malformed AirPlay HTTP response")
+    return nil, nil
   end
   local protocol, status_text = first_line:match("^(%S+)%s+(.+)$")
   local status = tonumber((status_text or ""):match("^(%d+)")) or 0
@@ -4057,11 +4059,11 @@ function AirPlayHTTP.try_parse_request(buffer)
   local body_start = header_end + 4
   local first_line, rest = header_block:match("^([^\r\n]+)\r\n?(.*)$")
   if not first_line then
-    error("malformed AirPlay HTTP request")
+    return nil, nil
   end
   local method, path, protocol = first_line:match("^(%S+)%s+(%S+)%s+(%S+)$")
   if not method then
-    error("malformed AirPlay HTTP request line: " .. tostring(first_line))
+    return nil, nil
   end
   local headers = {}
   for line in tostring(rest):gmatch("([^\r\n]+)") do
@@ -4107,6 +4109,7 @@ function Companion.content_entries(identifier, content)
     _hidC = { "_hBtS", "_hidC" },
     _sessionStart = { "_srvT", "_sid" },
     _sessionStop = { "_srvT", "_sid" },
+    TVRCSessionStart = { "ProtocolVersionKey" },
   }
 
   local seen = {}
@@ -4482,6 +4485,7 @@ function CompanionClient.new(options)
     startup_index = 0,
     startup_in_progress = false,
     post_session_started = false,
+    tv_rc_session_xid = nil,
     last_rx_ms = nil,
     last_tx_ms = nil,
     session_active_since_ms = nil,
@@ -4523,6 +4527,7 @@ function CompanionClient:clear_runtime_state(options)
   self.startup_index = 0
   self.startup_in_progress = false
   self.post_session_started = false
+  self.tv_rc_session_xid = nil
   self.session_active_since_ms = nil
   self.buffer = ""
   self.pending_responses = {}
@@ -4760,6 +4765,7 @@ function CompanionClient:start_companion_services()
     function() self:send_system_info() end,
     function() self:start_touch() end,
     function() self:start_session() end,
+    function() self:start_tv_remote_control_session() end,
     function() self:start_text_input() end,
     function() self:subscribe_initial_events() end,
   }
@@ -4805,6 +4811,46 @@ function CompanionClient:start_session()
   end)
   self.session_start_xid = request._x
   self:set_state("SESSION_STARTING")
+end
+
+function CompanionClient:finish_tv_remote_control_session(xid, reason)
+  if self.tv_rc_session_xid ~= xid then
+    return
+  end
+  self.tv_rc_session_xid = nil
+  if C4Driver and C4Driver.cancel_timer then
+    C4Driver.cancel_timer("AppleTV_tv_rc_session_start_timeout")
+  end
+  if reason and reason ~= "" then
+    Log.debug("Companion TV RC session continuing: " .. tostring(reason))
+  end
+  self:send_next_startup_step()
+end
+
+function CompanionClient:start_tv_remote_control_session()
+  local request
+  request = self:send_opack("TVRCSessionStart", {
+    ProtocolVersionKey = "1.2",
+  }, 2, function(message)
+    Log.debug("Companion TV RC session started")
+    self:finish_tv_remote_control_session(message._x or request._x, "response")
+  end, function(message)
+    Log.debug("Companion TV RC session start failed; continuing startup")
+    self:finish_tv_remote_control_session(message._x or request._x, "error")
+  end)
+  self.tv_rc_session_xid = request._x
+
+  if has_c4() and type(SetTimer) == "function" then
+    if C4Driver and C4Driver.cancel_timer then
+      C4Driver.cancel_timer("AppleTV_tv_rc_session_start_timeout")
+    end
+    local ok, err = pcall(SetTimer, "AppleTV_tv_rc_session_start_timeout", 1500, function()
+      self:finish_tv_remote_control_session(request._x, "timeout")
+    end)
+    if not ok then
+      Log.debug("Companion TV RC session fallback timer unavailable: " .. tostring(err))
+    end
+  end
 end
 
 function CompanionClient:start_text_input()
@@ -5575,6 +5621,9 @@ function PB.field_message(field, value)
   return PB.key(field, 2) .. PB.varint(#value) .. value
 end
 
+local _PB_POW2 = {}
+for _i = 0, 63, 7 do _PB_POW2[_i] = 2 ^ _i end
+
 function PB.read_varint(data, index)
   local shift = 0
   local value = 0
@@ -5582,7 +5631,7 @@ function PB.read_varint(data, index)
     local b = data:byte(index)
     assert(b, "truncated protobuf varint")
     index = index + 1
-    value = value + (b % 128) * (2 ^ shift)
+    value = value + (b % 128) * _PB_POW2[shift]
     if b < 128 then
       return value, index
     end
@@ -6131,6 +6180,10 @@ function AirPlayDataChannelClient:receive(data)
 
   while #self.buffer >= DATA_HEADER_LENGTH do
     local size = Bytes.read_uint_be(self.buffer, 1, 4)
+    if size < DATA_HEADER_LENGTH then
+      Log.error("AirPlay data channel: invalid frame size=" .. tostring(size) .. ", closing")
+      break
+    end
     if #self.buffer < size then
       return
     end
@@ -6194,6 +6247,7 @@ function AirPlayEventChannelClient.new(options)
     session = HAPSession.new(options.output_key, options.input_key, options.crypto or Crypto),
     transport = options.transport,
     buffer = "",
+    closed = false,
     on_connected = options.on_connected,
     on_error = options.on_error,
   }, { __index = AirPlayEventChannelClient })
@@ -6232,8 +6286,10 @@ function AirPlayEventChannelClient:connect()
       Log.debug("AirPlay event channel TCP disconnected: code=" .. tostring(err_code) ..
         " message=" .. tostring(err_msg))
       self.transport = nil
+      if not self.closed and self.on_error then self.on_error(err_msg or err_code) end
     end)
     :OnError(function(_, err_code, err_msg)
+      if self.closed then return end
       Log.error("AirPlay event channel TCP error: code=" .. tostring(err_code) ..
         " message=" .. tostring(err_msg))
       self.transport = nil
@@ -6265,7 +6321,7 @@ function AirPlayEventChannelClient:receive(data)
   while true do
     local request, rest = AirPlayHTTP.try_parse_request(self.buffer)
     if not request then
-      self.buffer = rest
+      if rest ~= nil then self.buffer = rest end
       return
     end
     self.buffer = rest
@@ -6278,6 +6334,7 @@ function AirPlayEventChannelClient:receive(data)
 end
 
 function AirPlayEventChannelClient:close()
+  self.closed = true
   if self.transport and self.transport.Close then
     self.transport:Close()
   elseif self.transport and self.transport.close then
@@ -6321,10 +6378,8 @@ end
 function AirPlayControlClient:set_state(state)
   if self.state ~= state then
     Log.debug("AirPlay control state: " .. tostring(self.state) .. " -> " .. tostring(state))
-  else
-    Log.debug("AirPlay control state: " .. tostring(state))
+    self.state = state
   end
-  self.state = state
   if self.on_state then
     self.on_state(state)
   end
@@ -6523,6 +6578,7 @@ function AirPlayControlClient:connect(host, port)
       if not self.closed and self.on_disconnect then self.on_disconnect(err_msg or err_code) end
     end)
     :OnError(function(_, err_code, err_msg)
+      if self.closed then return end
       Log.error("AirPlay control TCP error: code=" .. tostring(err_code) ..
         " message=" .. tostring(err_msg))
       self.transport = nil
@@ -6582,7 +6638,7 @@ function AirPlayControlClient:process_http_buffer(encrypted)
   while true do
     local response, rest = AirPlayHTTP.try_parse_response(self[buffer_name])
     if not response then
-      self[buffer_name] = rest
+      if rest ~= nil then self[buffer_name] = rest end
       return
     end
     self[buffer_name] = rest
@@ -6671,14 +6727,20 @@ function AirPlayControlClient:handle_encrypted_response(response)
     return
   end
 
-  Log.debug("AirPlay encrypted /info response: code=" .. tostring(response.status) ..
-    " content_type=" .. tostring(response.headers["content-type"] or response.headers["Content-Type"] or "") ..
-    " body_len=" .. tostring(#response.body) ..
-    " body_head=" .. Bytes.hex(response.body:sub(1, 32)))
-  self:set_state("ENCRYPTED_INFO_COMPLETE")
-  if self.on_info then
-    self.on_info(response)
+  if self.state == "ENCRYPTED_INFO" then
+    Log.debug("AirPlay encrypted /info response: code=" .. tostring(response.status) ..
+      " content_type=" .. tostring(response.headers["content-type"] or response.headers["Content-Type"] or "") ..
+      " body_len=" .. tostring(#response.body) ..
+      " body_head=" .. Bytes.hex(response.body:sub(1, 32)))
+    self:set_state("ENCRYPTED_INFO_COMPLETE")
+    if self.on_info then
+      self.on_info(response)
+    end
+    return
   end
+
+  Log.debug("AirPlay control unexpected encrypted response in state=" .. tostring(self.state) ..
+    " code=" .. tostring(response.status))
 end
 
 C4Driver = {}
@@ -7555,6 +7617,7 @@ function C4Driver.cancel_driver_timers()
   C4Driver.cancel_timer("AppleTV_crypto_prewarm_x25519")
   C4Driver.cancel_timer("AppleTV_reselect_passthrough")
   C4Driver.cancel_timer("AppleTV_mdns_timeout")
+  C4Driver.cancel_timer("AppleTV_tv_rc_session_start_timeout")
   C4Driver.cancel_timer("AppleTV_airplay_monitor_start")
   C4Driver.cancel_timer("AppleTV_airplay_monitor_retry")
   C4Driver.cancel_timer("AppleTV_airplay_monitor_watchdog")
