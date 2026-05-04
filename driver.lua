@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.1-dev",
+  VERSION = "0.1.2-dev",
 }
 
 local function has_c4()
@@ -1885,7 +1885,23 @@ end
 function OpenSSLCrypto.pair_verify_response(credentials, private_key, public_key, server_public_key, encrypted_data)
   local shared_secret = OpenSSLCrypto._derive_x25519(private_key, server_public_key)
   local session_key = OpenSSLCrypto.hkdf_sha512("Pair-Verify-Encrypt-Salt", "Pair-Verify-Encrypt-Info", shared_secret)
-  local decrypted_tlv = TLV8.decode(OpenSSLCrypto._chacha20_poly1305_decrypt(session_key, OpenSSLCrypto._hap_nonce("PV-Msg02"), encrypted_data))
+  Log.debug("Pair-Verify M2 decrypt: server_public_len=" .. tostring(#server_public_key) ..
+    " encrypted_len=" .. tostring(#encrypted_data))
+  local decrypted = OpenSSLCrypto._chacha20_poly1305_decrypt(
+    session_key,
+    OpenSSLCrypto._hap_nonce("PV-Msg02"),
+    encrypted_data
+  )
+  Log.debug("Pair-Verify M2 decrypt: decrypted_len=" .. tostring(#(decrypted or "")))
+  local ok, decrypted_tlv_or_err = pcall(TLV8.decode, decrypted)
+  if not ok then
+    Log.error("Pair-Verify decrypted TLV decode failed: len=" .. tostring(#(decrypted or "")) ..
+      " head=" .. Bytes.hex((decrypted or ""):sub(1, 32)) ..
+      " tail=" .. Bytes.hex((decrypted or ""):sub(math.max(1, #(decrypted or "") - 31))) ..
+      " encrypted_head=" .. Bytes.hex(encrypted_data:sub(1, 32)))
+    error(decrypted_tlv_or_err, 2)
+  end
+  local decrypted_tlv = decrypted_tlv_or_err
 
   local identifier = decrypted_tlv[1]
   local signature = decrypted_tlv[10]
