@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.28-dev",
+  VERSION = "0.1.29-dev",
 }
 
 local function has_c4()
@@ -1705,17 +1705,52 @@ function Ed25519Pure.sign(private_key, public_key, message)
   return R .. _scalar_to_le32(S)
 end
 
-function Ed25519Pure.verify(public_key, signature, message)
-  if type(signature) ~= "string" or #signature ~= 64 then return false end
+local function _ed_elapsed_ms(start_time)
+  return math.floor((os.clock() - start_time) * 1000 + 0.5)
+end
+
+local function _ed_verify_internal(public_key, signature, message, collect_profile)
+  local profile = collect_profile and {} or nil
+  local step_start = os.clock()
+  if type(signature) ~= "string" or #signature ~= 64 then
+    if profile then profile.decode_ms = _ed_elapsed_ms(step_start) end
+    return false, profile
+  end
   local A = _ed_decode_point(public_key)
   local R = _ed_decode_point(signature:sub(1, 32))
-  if not A or not R then return false end
+  if profile then profile.decode_ms = _ed_elapsed_ms(step_start) end
+  if not A or not R then return false, profile end
+
+  step_start = os.clock()
   local S = _scalar_from_le_bytes_mod(signature:sub(33, 64))
-  if _scalar_to_le32(S) ~= signature:sub(33, 64) then return false end
+  if _scalar_to_le32(S) ~= signature:sub(33, 64) then
+    if profile then profile.scalar_ms = _ed_elapsed_ms(step_start) end
+    return false, profile
+  end
   local k = _scalar_from_le_bytes_mod(_sha512_bytes(signature:sub(1, 32) .. public_key .. message))
+  if profile then profile.scalar_ms = _ed_elapsed_ms(step_start) end
+
+  step_start = os.clock()
   local left = _ed_scalar_mult_base(S)
+  if profile then profile.base_mult_ms = _ed_elapsed_ms(step_start) end
+
+  step_start = os.clock()
   local right = _ed_point_add(R, _ed_scalar_mult_window(A, k))
-  return _ed_point_equal(left, right)
+  if profile then profile.variable_mult_ms = _ed_elapsed_ms(step_start) end
+
+  step_start = os.clock()
+  local ok = _ed_point_equal(left, right)
+  if profile then profile.equal_ms = _ed_elapsed_ms(step_start) end
+  return ok, profile
+end
+
+function Ed25519Pure.verify(public_key, signature, message)
+  local ok = _ed_verify_internal(public_key, signature, message, false)
+  return ok
+end
+
+function Ed25519Pure.verify_profile(public_key, signature, message)
+  return _ed_verify_internal(public_key, signature, message, true)
 end
 
 function SRP.sha512(data)
@@ -2079,8 +2114,17 @@ function OpenSSLCrypto._sign_ed25519(private_key_bytes, data, public_key)
   return Ed25519Pure.sign(private_key_bytes, public_key, data)
 end
 
-function OpenSSLCrypto._verify_ed25519(public_key_bytes, signature, data)
+function OpenSSLCrypto._default_verify_ed25519(public_key_bytes, signature, data)
   return Ed25519Pure.verify(public_key_bytes, signature, data)
+end
+
+OpenSSLCrypto._verify_ed25519 = OpenSSLCrypto._default_verify_ed25519
+
+function OpenSSLCrypto._verify_ed25519_profile(public_key_bytes, signature, data)
+  if OpenSSLCrypto._verify_ed25519 ~= OpenSSLCrypto._default_verify_ed25519 then
+    return OpenSSLCrypto._verify_ed25519(public_key_bytes, signature, data), nil
+  end
+  return Ed25519Pure.verify_profile(public_key_bytes, signature, data)
 end
 
 function OpenSSLCrypto._cipher()
@@ -2366,7 +2410,15 @@ function OpenSSLCrypto.pair_verify_response(credentials, private_key, public_key
 
   local device_info = server_public_key .. identifier .. public_key
   step_start = os.clock()
-  assert(OpenSSLCrypto._verify_ed25519(credentials.ltpk, signature, device_info), "Apple TV Pair-Verify signature invalid")
+  local verify_ok, verify_profile = OpenSSLCrypto._verify_ed25519_profile(credentials.ltpk, signature, device_info)
+  if verify_profile then
+    Log.debug("Pair-Verify M2 Ed25519 verify profile: decode_ms=" .. tostring(verify_profile.decode_ms or 0) ..
+      " scalar_ms=" .. tostring(verify_profile.scalar_ms or 0) ..
+      " base_mult_ms=" .. tostring(verify_profile.base_mult_ms or 0) ..
+      " variable_mult_ms=" .. tostring(verify_profile.variable_mult_ms or 0) ..
+      " equal_ms=" .. tostring(verify_profile.equal_ms or 0))
+  end
+  assert(verify_ok, "Apple TV Pair-Verify signature invalid")
   Log.debug("Pair-Verify M2 timing: atv_signature_verify_ms=" .. tostring(elapsed_ms(step_start)))
 
   local controller_info = public_key .. credentials.client_id .. server_public_key
