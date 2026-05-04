@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.33-dev",
+  VERSION = "0.1.34-dev",
 }
 
 local function has_c4()
@@ -4232,6 +4232,7 @@ function C4Driver.import_credentials(detail_string)
   Companion.client = nil
   Storage.save(Driver.state)
   C4Driver.set_connection_state("Credentials Imported")
+  C4Driver.schedule_crypto_prewarm()
   return credentials
 end
 
@@ -4376,33 +4377,63 @@ function C4Driver.check_crypto_provider()
   return false, err
 end
 
-function C4Driver.prewarm_crypto()
+function C4Driver.prewarm_crypto_stage(stage)
   local credentials = Companion.credentials or C4Driver.load_persisted_credentials()
   if not credentials then
-    Log.debug("crypto prewarm skipped: no pairing credentials")
+    Log.debug("crypto prewarm " .. tostring(stage or "all") .. " skipped: no pairing credentials")
     return false
   end
   local ok, err = pcall(function()
-    local start_time = os.clock()
-    Log.debug("crypto prewarm started: Ed25519 fixed-base table")
-    local built = Ed25519Pure.prewarm()
-    Log.debug("crypto prewarm " .. (built and "built" or "already ready") ..
-      ": Ed25519 fixed-base table ms=" .. tostring(elapsed_ms(start_time)))
+    if stage == nil or stage == "base" then
+      local start_time = os.clock()
+      Log.debug("crypto prewarm started: Ed25519 fixed-base table")
+      local built = Ed25519Pure.prewarm()
+      Log.debug("crypto prewarm " .. (built and "built" or "already ready") ..
+        ": Ed25519 fixed-base table ms=" .. tostring(elapsed_ms(start_time)))
+    end
 
-    start_time = os.clock()
-    local expanded = OpenSSLCrypto._expanded_ed25519_private_key(credentials.ltsk)
-    credentials.controller_ltpk = expanded.public_key
-    Log.debug("crypto prewarm controller signing key ms=" .. tostring(elapsed_ms(start_time)))
+    if stage == nil or stage == "controller" then
+      local start_time = os.clock()
+      local expanded = OpenSSLCrypto._expanded_ed25519_private_key(credentials.ltsk)
+      credentials.controller_ltpk = expanded.public_key
+      Log.debug("crypto prewarm controller signing key ms=" .. tostring(elapsed_ms(start_time)))
+    end
 
-    start_time = os.clock()
-    OpenSSLCrypto._ed25519_public_key_cache_entry(credentials.ltpk)
-    Log.debug("crypto prewarm Apple TV public key fixed table ms=" .. tostring(elapsed_ms(start_time)))
+    if stage == nil or stage == "atv" then
+      local start_time = os.clock()
+      OpenSSLCrypto._ed25519_public_key_cache_entry(credentials.ltpk)
+      Log.debug("crypto prewarm Apple TV public key fixed table ms=" .. tostring(elapsed_ms(start_time)))
+    end
   end)
   if not ok then
-    Log.error("crypto prewarm failed: " .. tostring(err))
+    Log.error("crypto prewarm " .. tostring(stage or "all") .. " failed: " .. tostring(err))
     return false, err
   end
   return true
+end
+
+function C4Driver.prewarm_crypto()
+  return C4Driver.prewarm_crypto_stage(nil)
+end
+
+function C4Driver.schedule_crypto_prewarm()
+  if not (has_c4() and type(SetTimer) == "function") then
+    return
+  end
+  if not (Companion.credentials or (Driver.state and Driver.state.companion_credentials)) then
+    Log.debug("crypto prewarm schedule skipped: no pairing credentials")
+    return
+  end
+  SetTimer("AppleTV_crypto_prewarm_base", 2000, function()
+    C4Driver.prewarm_crypto_stage("base")
+  end)
+  SetTimer("AppleTV_crypto_prewarm_controller", 4000, function()
+    C4Driver.prewarm_crypto_stage("controller")
+  end)
+  SetTimer("AppleTV_crypto_prewarm_atv", 6000, function()
+    C4Driver.prewarm_crypto_stage("atv")
+  end)
+  Log.debug("crypto prewarm scheduled: base=2s controller=4s atv=6s")
 end
 
 -- EC: Composer action and command dispatch (DCP normalises spaces→underscores and handles LUA_ACTION)
@@ -4458,11 +4489,7 @@ function C4Driver.late_init()
     C4MiniApps.hide_proxy_in_all_rooms(C4MiniApps.SWITCHER_PROXY)
   end
   C4MiniApps.register_rooms()
-  if has_c4() and type(SetTimer) == "function" then
-    SetTimer("AppleTV_crypto_prewarm", 10000, function()
-      C4Driver.prewarm_crypto()
-    end)
-  end
+  C4Driver.schedule_crypto_prewarm()
   Log.debug("driver late init")
 end
 
