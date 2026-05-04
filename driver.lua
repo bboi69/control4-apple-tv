@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.8-dev",
+  VERSION = "0.1.9-dev",
 }
 
 local function has_c4()
@@ -222,7 +222,7 @@ end
 function OPACK.int64(high32, low32)
   -- Stores a 64-bit integer as two 32-bit halves to avoid Lua double precision loss
   -- (2^53 mantissa bits can't represent arbitrary 64-bit values).
-  -- Used for the combined Companion session SID: (remote_sid << 32) | local_sid.
+  -- Used for the combined Companion session SID from remote/local sid halves.
   assert(type(high32) == "number" and high32 >= 0 and high32 <= 0xFFFFFFFF, "int64 high32 out of range")
   assert(type(low32) == "number" and low32 >= 0 and low32 <= 0xFFFFFFFF, "int64 low32 out of range")
   return { __opack_type = "int64", high32 = high32, low32 = low32 }
@@ -781,22 +781,7 @@ end
 
 local Bit32 = {}
 do
-  local native_loader = load([[
-    return {
-      band = function(a, b) return (a & b) & 0xffffffff end,
-      bor  = function(a, b) return (a | b) & 0xffffffff end,
-      bxor = function(a, b) return (a ~ b) & 0xffffffff end,
-      lshift = function(a, n) return (a << n) & 0xffffffff end,
-      rshift = function(a, n) return (a >> n) & 0xffffffff end,
-    }
-  ]])
-  local ok, native = false, nil
-  if native_loader then
-    ok, native = pcall(native_loader)
-  end
-  if ok and native then
-    Bit32 = native
-  elseif bit32 then
+  if bit32 then
     Bit32.band = bit32.band
     Bit32.bor = bit32.bor
     Bit32.bxor = bit32.bxor
