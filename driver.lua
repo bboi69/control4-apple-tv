@@ -6994,6 +6994,7 @@ function C4Driver.probe_airplay_control_info()
   end
 
   local function start_probe(port)
+    C4Driver.close_airplay_control_client("restarting AirPlay encrypted /info probe")
     AirPlay.port = port or AirPlay.port or 7000
     AirPlay.control_client = AirPlayControlClient.new({
       host = host,
@@ -7048,6 +7049,7 @@ function C4Driver.probe_airplay_tunnel_setup()
   end
 
   local function start_probe(port)
+    C4Driver.close_airplay_control_client("restarting AirPlay tunnel setup probe")
     AirPlay.port = port or AirPlay.port or 7000
     AirPlay.control_client = AirPlayControlClient.new({
       host = host,
@@ -7366,6 +7368,17 @@ function C4Driver.reset_pairing()
   C4Driver.set_connection_state("Disconnected")
 end
 
+function C4Driver.close_airplay_control_client(reason)
+  if not AirPlay.control_client then return end
+  if reason and reason ~= "" then
+    Log.debug("AirPlay control closing existing session: " .. tostring(reason))
+  end
+  if AirPlay.control_client.close then
+    AirPlay.control_client:close()
+  end
+  AirPlay.control_client = nil
+end
+
 function C4Driver.disconnect_companion()
   C4Driver.cancel_timer("AppleTV_crypto_prewarm_x25519")
   MDNS.close()
@@ -7373,10 +7386,7 @@ function C4Driver.disconnect_companion()
   if Companion.client and Companion.client.close then
     Companion.client:close()
   end
-  if AirPlay.control_client and AirPlay.control_client.close then
-    AirPlay.control_client:close()
-  end
-  AirPlay.control_client = nil
+  C4Driver.close_airplay_control_client("disconnect")
   Companion.client = nil
   Companion.socket = nil
   Companion.session = nil
