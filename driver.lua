@@ -5754,6 +5754,30 @@ function PB.summarize_now_playing_info(data)
   return #parts > 0 and table.concat(parts, " ") or nil
 end
 
+function PB.copy_content_metadata(data, target)
+  if not data or type(target) ~= "table" then return end
+  local title = PB.string_field(data, 1)
+  local album = PB.string_field(data, 6)
+  local artist = PB.string_field(data, 7)
+  if title and title ~= "" then target.title = title end
+  if artist and artist ~= "" then target.artist = artist end
+  if album and album ~= "" then target.album = album end
+end
+
+function PB.copy_playback_queue_metadata(data, target)
+  if not data or type(target) ~= "table" then return end
+  local ok, fields = pcall(PB.scan, data)
+  if not ok then return end
+  for _, item in ipairs(fields) do
+    if item.field == 2 and item.wire == 2 then
+      PB.copy_content_metadata(PB.first_field(item.value, 2, 2), target)
+      if target.title or target.artist or target.album then
+        return
+      end
+    end
+  end
+end
+
 function PB.summarize_playback_queue(data)
   if not data then return nil end
   local parts = {}
@@ -5864,6 +5888,9 @@ function PB.extract_protocol_update(data)
   local function copy_state_like(state)
     if not state then return end
     copy_now_playing_info(PB.first_field(state, 1, 2))
+    if not (update.title or update.artist or update.album) then
+      PB.copy_playback_queue_metadata(PB.first_field(state, 3, 2), update)
+    end
     local playback_state = PB.varint_field(state, 6)
     if playback_state ~= nil then update.playback_state = playback_state end
     local path = PB.first_field(state, 9, 2)

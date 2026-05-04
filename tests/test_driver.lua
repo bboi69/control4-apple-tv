@@ -2383,6 +2383,24 @@ function tests.app_list_current_app_and_now_playing_are_published()
   assert_eq(Properties["Current App"], "DIRECTV | com.att.tv", "MRP state updates current app")
   assert_eq(Properties["Now Playing"], "Live TV - Channel 12", "MRP state updates now playing")
 
+  local youtube_client = Driver.PB.field_string(2, "com.google.ios.youtube")
+  local youtube_path = Driver.PB.field_message(2, youtube_client)
+  local queue_metadata = Driver.PB.field_string(1, "Last Week Tonight") ..
+    Driver.PB.field_string(7, "LastWeekTonight")
+  local queue_item = Driver.PB.field_string(1, "queue-item-id") ..
+    Driver.PB.field_message(2, queue_metadata)
+  local queue = Driver.PB.field_varint(1, 0) ..
+    Driver.PB.field_message(2, queue_item)
+  local queue_state = Driver.PB.field_message(3, queue) ..
+    Driver.PB.field_message(9, youtube_path)
+  local queue_message = Driver.PB.field_varint(1, 4) ..
+    Driver.PB.field_string(2, "queue-state-id") ..
+    Driver.PB.field_varint(4, 0) ..
+    Driver.PB.field_message(9, queue_state)
+  Driver.C4Driver.handle_airplay_mrp_update(Driver.PB.extract_protocol_update(queue_message))
+  assert_eq(Properties["Current App"], "com.google.ios.youtube", "MRP queue state updates YouTube app")
+  assert_eq(Properties["Now Playing"], "Last Week Tonight - LastWeekTonight", "MRP queue metadata updates now playing")
+
   C4 = old_c4
   Properties = old_properties
 end
