@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.15-dev",
+  VERSION = "0.1.16-dev",
 }
 
 local function has_c4()
@@ -2958,6 +2958,7 @@ function CompanionClient.new(options)
     session = nil,
     session_local_sid = nil,
     session_remote_sid = nil,
+    session_start_xid = nil,
     state = "DISCONNECTED",
     received_messages = {},
     on_state = options.on_state,
@@ -3105,10 +3106,11 @@ function CompanionClient:start_session()
     sid_bytes:byte(2) * 0x100 +
     sid_bytes:byte(3) * 0x10000 +
     sid_bytes:byte(4) * 0x1000000
-  self:send_opack("_sessionStart", {
+  local request = self:send_opack("_sessionStart", {
     _srvT = "com.apple.tvremoteservices",
     _sid = self.session_local_sid,
   }, 2)
+  self.session_start_xid = request._x
   self:set_state("SESSION_STARTING")
 end
 
@@ -3203,16 +3205,18 @@ function CompanionClient:handle_frame(frame)
   if frame.frame_type == CompanionFrame.U_OPACK or frame.frame_type == CompanionFrame.E_OPACK then
     local message = OPACK.decode(frame.payload)
     Log.debug("Companion OPACK message: id=" .. tostring(message._i) ..
-      " type=" .. tostring(message._t))
+      " type=" .. tostring(message._t) ..
+      " xid=" .. tostring(message._x))
     self.received_messages[#self.received_messages + 1] = message
 
-    -- _sessionStart response (_t == 3 is Response in pyatv MessageType enum)
+    -- _sessionStart response: Apple TV correlates responses by _x, not _i.
     if self.state == "SESSION_STARTING"
-      and message._i == "_sessionStart"
       and message._t == 3
+      and message._x == self.session_start_xid
       and type(message._c) == "table"
     then
       self.session_remote_sid = message._c._sid
+      self.session_start_xid = nil
       self:set_state("SESSION_ACTIVE")
       Log.debug("Companion session active, remote_sid=" .. tostring(self.session_remote_sid))
     end

@@ -150,9 +150,9 @@ assert_eq(session_start._c._srvT, "com.apple.tvremoteservices", "session start s
 assert_eq(session_start._c._sid, client.session_local_sid, "session start local sid")
 
 local session_response_payload = Driver.OPACK.encode(Driver.OPACK.dict({
-  { "_i", "_sessionStart" },
   { "_t", 3 },
   { "_c", Driver.OPACK.dict({ { "_sid", 0x12345678 } }) },
+  { "_x", client.session_start_xid },
 }))
 local session_response_frame = client.session:encode_frame(Driver.CompanionFrame.E_OPACK, session_response_payload)
 assert(accepted:send(session_response_frame))

@@ -1069,9 +1069,9 @@ function tests.session_start_response_advances_to_session_active()
   -- Simulate _sessionStart response from Apple TV (_t=3 is Response)
   local remote_sid = 0xABCD1234
   local session_response = Driver.OPACK.encode(Driver.OPACK.dict({
-    { "_i", "_sessionStart" },
     { "_t", 3 },
     { "_c", Driver.OPACK.dict({ { "_sid", remote_sid } }) },
+    { "_x", client.session_start_xid },
   }))
   local response_frame = client.session:encode_frame(Driver.CompanionFrame.E_OPACK, session_response)
   client:receive(response_frame)
