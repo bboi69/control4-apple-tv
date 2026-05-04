@@ -960,6 +960,27 @@ function tests.refresh_app_list_uses_existing_client()
   Properties = old_properties
 end
 
+function tests.queued_command_does_not_reenter_connect_while_connecting()
+  local client = Driver.CompanionClient.new({
+    credentials = Driver.Credentials.parse(table.concat({
+      Driver.Bytes.hex(string.rep("\x01", 32)),
+      Driver.Bytes.hex(string.rep("\x02", 32)),
+      Driver.Bytes.hex("ATV-ID"),
+      Driver.Bytes.hex("CLIENT-ID"),
+    }, ":")),
+    transport = { Write = function() end },
+  })
+  local connect_calls = 0
+  client.connecting = true
+  client.connect = function()
+    connect_calls = connect_calls + 1
+  end
+
+  client:fetch_apps()
+  assert_eq(connect_calls, 0, "queued command did not re-enter connect")
+  assert_eq(#client.pending_commands, 1, "command queued for session active")
+end
+
 function tests.opack_launch_request_roundtrip()
   Driver.Companion.tx = 0
   local request, frame = Driver.Companion.encode_opack_request("_launchApp", {

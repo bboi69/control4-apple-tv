@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.23-dev",
+  VERSION = "0.1.24-dev",
 }
 
 local function has_c4()
@@ -3102,6 +3102,9 @@ function CompanionClient.new(options)
     startup_steps = nil,
     startup_index = 0,
     post_session_started = false,
+    injected_transport = options.transport ~= nil,
+    connecting = false,
+    connected = false,
     state = "DISCONNECTED",
     received_messages = {},
     on_state = options.on_state,
@@ -3181,6 +3184,8 @@ function CompanionClient:close()
     self.transport:close()
   end
   self.transport = nil
+  self.connecting = false
+  self.connected = false
   self:set_state("DISCONNECTED")
 end
 
@@ -3188,17 +3193,33 @@ function CompanionClient:connect(host, port)
   self.host = host or self.host
   self.port = port or self.port
   assert(type(self.host) == "string" and self.host ~= "", "Apple TV address is required")
+
+  if self.connected and self.transport then
+    Log.debug("Companion TCP already connected")
+    return self
+  end
+  if self.connecting then
+    Log.debug("Companion TCP connect already in progress")
+    return self
+  end
+
   Log.debug("Companion TCP connect requested: host=" .. tostring(self.host) ..
     " port=" .. tostring(self.port))
 
-  if self.transport then
+  if self.transport and self.injected_transport then
     Log.debug("Companion TCP using injected transport")
     self:on_connected(self.transport)
+    return self
+  end
+  if self.transport and not self.injected_transport then
+    Log.debug("Companion TCP socket exists, waiting for connect callback")
+    self.connecting = true
     return self
   end
 
   assert(has_c4() and C4.CreateTCPClient, "Control4 TCP client is not available")
   local client
+  self.connecting = true
   client = C4:CreateTCPClient()
     :OnConnect(function(tcp_client)
       Log.debug("Companion TCP connected")
@@ -3217,11 +3238,17 @@ function CompanionClient:connect(host, port)
     :OnDisconnect(function(_, err_code, err_msg)
       Log.debug("Companion TCP disconnected: code=" .. tostring(err_code) ..
         " message=" .. tostring(err_msg))
+      self.connecting = false
+      self.connected = false
+      self.transport = nil
       self:set_state((err_code and err_code ~= 0) and ("DISCONNECTED: " .. tostring(err_msg)) or "DISCONNECTED")
     end)
     :OnError(function(_, err_code, err_msg)
       Log.error("Companion TCP error: code=" .. tostring(err_code) ..
         " message=" .. tostring(err_msg))
+      self.connecting = false
+      self.connected = false
+      self.transport = nil
       self:set_state("ERROR: " .. tostring(err_code) .. " " .. tostring(err_msg))
     end)
     :Connect(self.host, self.port)
@@ -3232,6 +3259,8 @@ end
 
 function CompanionClient:on_connected(transport)
   self.transport = transport
+  self.connecting = false
+  self.connected = true
   self:set_state("CONNECTED")
   Log.debug("Companion TCP ready: credentials_present=" .. tostring(self.credentials ~= nil))
   if self.credentials then
@@ -3540,7 +3569,7 @@ function CompanionClient:send_or_queue_opack(identifier, content, message_type)
     message_type = message_type,
     request = request,
   }
-  if self.state == "DISCONNECTED" or self.state:match("^DISCONNECTED") then
+  if (self.state == "DISCONNECTED" or self.state:match("^DISCONNECTED")) and not self.connecting then
     self:connect()
   end
   return request, nil
