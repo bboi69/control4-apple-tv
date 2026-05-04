@@ -1048,6 +1048,194 @@ function tests.airplay_info_probe_uses_cached_port_and_updates_state()
   Driver.AirPlay.port = old_port
 end
 
+function tests.airplay_pair_verify_probe_posts_hap_tlv_steps()
+  local old_c4 = C4
+  local old_properties = Properties
+  local old_provider = Driver.Crypto.provider
+  local old_credentials = Driver.AirPlay.credentials
+  local old_port = Driver.AirPlay.port
+  local old_control_keys = Driver.AirPlay.control_keys
+  Properties = { ["Apple TV Address"] = "192.0.2.55", ["Connection State"] = "" }
+  Driver.AirPlay.port = 7000
+
+  local credentials = Driver.Credentials.parse(table.concat({
+    Driver.Bytes.hex(bytes_range(0, 31)),
+    Driver.Bytes.hex(bytes_range(32, 63)),
+    Driver.Bytes.hex("ATV-ID"),
+    Driver.Bytes.hex("CLIENT-ID"),
+  }, ":"))
+  Driver.AirPlay.credentials = credentials
+  Driver.Crypto.provider = {
+    generate_x25519_keypair = function()
+      return { private_key = "private-key", public_key = bytes_range(64, 95) }
+    end,
+    pair_verify_response = function(received_credentials, private_key, public_key, server_public_key, encrypted_data)
+      assert_eq(received_credentials, credentials, "airplay credentials")
+      assert_eq(private_key, "private-key", "airplay private key")
+      assert_eq(public_key, bytes_range(64, 95), "airplay public key")
+      assert_eq(server_public_key, bytes_range(96, 127), "airplay server public key")
+      assert_eq(encrypted_data, "encrypted-challenge", "airplay encrypted challenge")
+      return "encrypted-response", "shared-secret"
+    end,
+    hkdf_sha512 = function(salt, info, ikm)
+      assert_eq(salt, "Control-Salt", "airplay hkdf salt")
+      assert_eq(ikm, "shared-secret", "airplay hkdf ikm")
+      if info == "Control-Write-Encryption-Key" then return "write-key" end
+      if info == "Control-Read-Encryption-Key" then return "read-key" end
+      error("unexpected airplay hkdf info: " .. tostring(info))
+    end,
+  }
+
+  local post_count = 0
+  C4 = {
+    UpdateProperty = function(_, name, value)
+      Properties[name] = value
+    end,
+    urlPost = function(_, url, body, headers, _, callback)
+      post_count = post_count + 1
+      assert_eq(url, "http://192.0.2.55:7000/pair-verify", "airplay pair verify URL")
+      assert_eq(headers["X-Apple-HKP"], "3", "airplay hkp header")
+      if post_count == 1 then
+        local tlv = Driver.TLV8.decode(body)
+        assert_eq(tlv[6], string.char(0x01), "airplay pair verify m1 seq")
+        assert_eq(tlv[3], bytes_range(64, 95), "airplay pair verify m1 public")
+        callback(1, Driver.TLV8.encode_ordered({
+          { 3, bytes_range(96, 127) },
+          { 5, "encrypted-challenge" },
+        }), 200, { ["Content-Type"] = "application/octet-stream" }, nil)
+      elseif post_count == 2 then
+        local tlv = Driver.TLV8.decode(body)
+        assert_eq(tlv[6], string.char(0x03), "airplay pair verify m3 seq")
+        assert_eq(tlv[5], "encrypted-response", "airplay pair verify m3 encrypted")
+        callback(2, "", 200, {}, nil)
+      end
+      return post_count
+    end,
+  }
+
+  Driver.C4Driver.probe_airplay_pair_verify()
+  assert_eq(post_count, 2, "airplay pair verify posts")
+  assert_eq(Properties["Connection State"], "AirPlay Pair-Verify Ready", "airplay pair verify state")
+  assert_eq(Driver.AirPlay.control_keys.output_key, "write-key", "airplay control output key")
+  assert_eq(Driver.AirPlay.control_keys.input_key, "read-key", "airplay control input key")
+
+  C4 = old_c4
+  Properties = old_properties
+  Driver.Crypto.provider = old_provider
+  Driver.AirPlay.credentials = old_credentials
+  Driver.AirPlay.port = old_port
+  Driver.AirPlay.control_keys = old_control_keys
+end
+
+function tests.airplay_pairing_flow_saves_credentials()
+  local old_c4 = C4
+  local old_properties = Properties
+  local old_provider = Driver.Crypto.provider
+  local old_storage = Driver._test_storage
+  local old_state = Driver.state
+  local old_port = Driver.AirPlay.port
+  local old_pair_setup = Driver.AirPlay.pair_setup
+  local old_pairing_active = Driver.AirPlay.pairing_active
+  local old_credentials = Driver.AirPlay.credentials
+  local old_srp = {
+    compute_A = Driver.SRP.compute_A,
+    compute_x = Driver.SRP.compute_x,
+    compute_u = Driver.SRP.compute_u,
+    compute_session_key = Driver.SRP.compute_session_key,
+    compute_M1 = Driver.SRP.compute_M1,
+    verify_M2 = Driver.SRP.verify_M2,
+  }
+
+  Properties = { ["Apple TV Address"] = "192.0.2.55", ["Connection State"] = "", ["AirPlay Credentials"] = "" }
+  Driver._test_storage = {}
+  Driver.state = Driver._test_storage
+  Driver.AirPlay.port = 7000
+  Driver.AirPlay.credentials = nil
+  Driver.SRP.compute_A = function() return string.rep("A", 384) end
+  Driver.SRP.compute_x = function() return "x" end
+  Driver.SRP.compute_u = function() return "u" end
+  Driver.SRP.compute_session_key = function() return "srp-session-key" end
+  Driver.SRP.compute_M1 = function() return string.rep("P", 64) end
+  Driver.SRP.verify_M2 = function() return true end
+  Driver.Crypto.provider = {
+    generate_ed25519_keypair = function()
+      return { private_key = string.rep("s", 32), public_key = string.rep("p", 32) }
+    end,
+    random_bytes = function(n) return string.rep("\x12", n) end,
+    hkdf_sha512 = function(salt, info, ikm)
+      return "key:" .. salt .. ":" .. info .. ":" .. tostring(ikm)
+    end,
+    ed25519_sign = function() return string.rep("g", 64) end,
+    encrypt = function(_, plaintext) return "enc:" .. plaintext end,
+    decrypt = function()
+      return Driver.TLV8.encode_ordered({
+        { 1, "AIRPLAY-ATV" },
+        { 3, string.rep("t", 32) },
+        { 10, string.rep("v", 64) },
+      })
+    end,
+  }
+
+  local post_paths = {}
+  C4 = {
+    UpdateProperty = function(_, name, value)
+      Properties[name] = value
+    end,
+    urlPost = function(_, url, body, headers, _, callback)
+      local path = url:match("http://192%.0%.2%.55:7000(.+)$")
+      post_paths[#post_paths + 1] = path
+      assert_eq(headers["X-Apple-HKP"], "3", "airplay pairing hkp header")
+      if path == "/pair-pin-start" then
+        callback(1, "", 200, {}, nil)
+      elseif path == "/pair-setup" and #post_paths == 2 then
+        local tlv = Driver.TLV8.decode(body)
+        assert_eq(tlv[6], string.char(0x01), "airplay pairing m1 seq")
+        callback(2, Driver.TLV8.encode_ordered({
+          { 2, string.rep("z", 16) },
+          { 3, string.rep("B", 384) },
+        }), 200, {}, nil)
+      elseif path == "/pair-setup" and #post_paths == 3 then
+        local tlv = Driver.TLV8.decode(body)
+        assert_eq(tlv[6], string.char(0x03), "airplay pairing m3 seq")
+        assert_eq(tlv[3], string.rep("A", 384), "airplay pairing m3 public")
+        assert_eq(tlv[4], string.rep("P", 64), "airplay pairing m3 proof")
+        callback(3, Driver.TLV8.encode_ordered({ { 4, string.rep("M", 64) } }), 200, {}, nil)
+      elseif path == "/pair-setup" and #post_paths == 4 then
+        local tlv = Driver.TLV8.decode(body)
+        assert_eq(tlv[6], string.char(0x05), "airplay pairing m5 seq")
+        assert(tlv[5] and tlv[5]:sub(1, 4) == "enc:", "airplay pairing m5 encrypted")
+        callback(4, Driver.TLV8.encode_ordered({ { 5, "server-encrypted" } }), 200, {}, nil)
+      end
+      return #post_paths
+    end,
+  }
+
+  Driver.C4Driver.pair_airplay()
+  assert_eq(Properties["Connection State"], "Enter AirPlay PIN", "airplay waiting for pin")
+  Driver.C4Driver.airplay_pairing_submit_pin("1234")
+  assert_eq(Properties["Connection State"], "AirPlay Pairing Complete", "airplay pairing complete")
+  assert_eq(#post_paths, 4, "airplay pairing post count")
+  assert_eq(Driver.AirPlay.credentials.type, "HAP", "airplay saved hap credentials")
+  assert_eq(Driver.Bytes.hex(Driver.AirPlay.credentials.ltpk), Driver.Bytes.hex(string.rep("t", 32)), "airplay saved ltpk")
+  assert_eq(Driver._test_storage.airplay_credentials, Properties["AirPlay Credentials"], "airplay persisted credentials")
+
+  C4 = old_c4
+  Properties = old_properties
+  Driver.Crypto.provider = old_provider
+  Driver._test_storage = old_storage
+  Driver.state = old_state
+  Driver.AirPlay.port = old_port
+  Driver.AirPlay.pair_setup = old_pair_setup
+  Driver.AirPlay.pairing_active = old_pairing_active
+  Driver.AirPlay.credentials = old_credentials
+  Driver.SRP.compute_A = old_srp.compute_A
+  Driver.SRP.compute_x = old_srp.compute_x
+  Driver.SRP.compute_u = old_srp.compute_u
+  Driver.SRP.compute_session_key = old_srp.compute_session_key
+  Driver.SRP.compute_M1 = old_srp.compute_M1
+  Driver.SRP.verify_M2 = old_srp.verify_M2
+end
+
 function tests.crypto_provider_failure_logs_without_last_error_property()
   local old_properties = Properties
   local old_provider = Driver.Crypto.provider

@@ -733,6 +733,14 @@
                 <command>PROBE_AIRPLAY_INFO</command>
             </action>
             <action>
+                <name>Probe AirPlay Pair Verify</name>
+                <command>PROBE_AIRPLAY_PAIR_VERIFY</command>
+            </action>
+            <action>
+                <name>Pair AirPlay</name>
+                <command>PAIR_AIRPLAY</command>
+            </action>
+            <action>
                 <name>Pair Apple TV</name>
                 <command>PAIR_COMPANION</command>
             </action>
