@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.27-dev",
+  VERSION = "0.1.28-dev",
 }
 
 local function has_c4()
@@ -1559,6 +1559,75 @@ local function _ed_scalar_mult(point, scalar)
   return result
 end
 
+local _ED_BASE_WINDOW = 4
+local _ED_BASE_WINDOW_SIZE = 2 ^ _ED_BASE_WINDOW
+local _ED_BASE_TABLE = nil
+
+local function _ed_build_base_table()
+  local table_by_window = {}
+  local base = _ED_BASE
+  for window = 1, math.ceil(256 / _ED_BASE_WINDOW) do
+    local multiples = {}
+    multiples[0] = _ed_identity()
+    multiples[1] = base
+    for digit = 2, _ED_BASE_WINDOW_SIZE - 1 do
+      multiples[digit] = _ed_point_add(multiples[digit - 1], base)
+    end
+    table_by_window[window] = multiples
+    for _ = 1, _ED_BASE_WINDOW do
+      base = _ed_point_add(base, base)
+    end
+  end
+  return table_by_window
+end
+
+local function _ed_base_window_digit(scalar, window_index)
+  local digit = 0
+  local first_bit = (window_index - 1) * _ED_BASE_WINDOW
+  for bit = 0, _ED_BASE_WINDOW - 1 do
+    if _ed_scalar_bit(scalar, first_bit + bit) == 1 then
+      digit = digit + 2 ^ bit
+    end
+  end
+  return digit
+end
+
+local function _ed_scalar_mult_base(scalar)
+  if not _ED_BASE_TABLE then
+    _ED_BASE_TABLE = _ed_build_base_table()
+  end
+  local result = _ed_identity()
+  for window = 1, #_ED_BASE_TABLE do
+    local digit = _ed_base_window_digit(scalar, window)
+    if digit ~= 0 then
+      result = _ed_point_add(result, _ED_BASE_TABLE[window][digit])
+    end
+  end
+  return result
+end
+
+local function _ed_scalar_mult_window(point, scalar)
+  local multiples = {}
+  multiples[0] = _ed_identity()
+  multiples[1] = point
+  for digit = 2, _ED_BASE_WINDOW_SIZE - 1 do
+    multiples[digit] = _ed_point_add(multiples[digit - 1], point)
+  end
+
+  local result = _ed_identity()
+  local window_count = math.ceil(math.max(1, _scalar_bit_length(scalar)) / _ED_BASE_WINDOW)
+  for window = window_count, 1, -1 do
+    for _ = 1, _ED_BASE_WINDOW do
+      result = _ed_point_add(result, result)
+    end
+    local digit = _ed_base_window_digit(scalar, window)
+    if digit ~= 0 then
+      result = _ed_point_add(result, multiples[digit])
+    end
+  end
+  return result
+end
+
 local function _ed_point_equal(P, Q)
   return _fe_compare(_fp_mul(P.X, Q.Z), _fp_mul(Q.X, P.Z)) == 0 and
     _fe_compare(_fp_mul(P.Y, Q.Z), _fp_mul(Q.Y, P.Z)) == 0
@@ -1622,7 +1691,7 @@ end
 function Ed25519Pure.public_key_from_private(private_key)
   local h = _sha512_bytes(private_key)
   local a = _ed_clamped_scalar_from_hash(h)
-  return _ed_encode_point(_ed_scalar_mult(_ED_BASE, a))
+  return _ed_encode_point(_ed_scalar_mult_base(a))
 end
 
 function Ed25519Pure.sign(private_key, public_key, message)
@@ -1630,7 +1699,7 @@ function Ed25519Pure.sign(private_key, public_key, message)
   local a = _ed_clamped_scalar_from_hash(h)
   local prefix = h:sub(33, 64)
   local r = _scalar_from_le_bytes_mod(_sha512_bytes(prefix .. message))
-  local R = _ed_encode_point(_ed_scalar_mult(_ED_BASE, r))
+  local R = _ed_encode_point(_ed_scalar_mult_base(r))
   local k = _scalar_from_le_bytes_mod(_sha512_bytes(R .. public_key .. message))
   local S = _scalar_add(r, _scalar_mul(k, a))
   return R .. _scalar_to_le32(S)
@@ -1644,8 +1713,8 @@ function Ed25519Pure.verify(public_key, signature, message)
   local S = _scalar_from_le_bytes_mod(signature:sub(33, 64))
   if _scalar_to_le32(S) ~= signature:sub(33, 64) then return false end
   local k = _scalar_from_le_bytes_mod(_sha512_bytes(signature:sub(1, 32) .. public_key .. message))
-  local left = _ed_scalar_mult(_ED_BASE, S)
-  local right = _ed_point_add(R, _ed_scalar_mult(A, k))
+  local left = _ed_scalar_mult_base(S)
+  local right = _ed_point_add(R, _ed_scalar_mult_window(A, k))
   return _ed_point_equal(left, right)
 end
 
