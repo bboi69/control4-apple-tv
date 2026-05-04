@@ -3671,6 +3671,9 @@ local AirPlay = {
   control_keys = nil,
   pair_setup = nil,
   pairing_active = false,
+  control_client = nil,
+  monitor_enabled = false,
+  monitor_retry_ms = 15000,
 }
 
 local BPlist = {}
@@ -6272,6 +6275,7 @@ function AirPlayControlClient.new(options)
     on_info = options.on_info,
     on_tunnel_setup = options.on_tunnel_setup,
     on_error = options.on_error,
+    on_disconnect = options.on_disconnect,
     on_state = options.on_state,
   }, { __index = AirPlayControlClient })
 end
@@ -6475,6 +6479,7 @@ function AirPlayControlClient:connect(host, port)
         " message=" .. tostring(err_msg))
       self.transport = nil
       self:set_state("DISCONNECTED")
+      if not self.closed and self.on_disconnect then self.on_disconnect(err_msg or err_code) end
     end)
     :OnError(function(_, err_code, err_msg)
       Log.error("AirPlay control TCP error: code=" .. tostring(err_code) ..
@@ -6489,6 +6494,7 @@ function AirPlayControlClient:connect(host, port)
 end
 
 function AirPlayControlClient:close()
+  self.closed = true
   if self.event_channel and self.event_channel.close then
     self.event_channel:close()
   end
@@ -6978,6 +6984,117 @@ function C4Driver.probe_airplay_pair_verify()
   end)
 end
 
+function C4Driver.schedule_airplay_monitor_retry(reason)
+  if not AirPlay.monitor_enabled then return end
+  if not (has_c4() and type(SetTimer) == "function") then return end
+  C4Driver.cancel_timer("AppleTV_airplay_monitor_retry")
+  Log.debug("AirPlay monitor retry scheduled: " .. tostring(reason or "unknown") ..
+    " in " .. tostring(AirPlay.monitor_retry_ms) .. "ms")
+  local ok, err = pcall(SetTimer, "AppleTV_airplay_monitor_retry", AirPlay.monitor_retry_ms, function()
+    if AirPlay.monitor_enabled then
+      C4Driver.start_airplay_monitor("retry")
+    end
+  end)
+  if not ok then
+    Log.debug("AirPlay monitor retry timer unavailable: " .. tostring(err))
+  end
+end
+
+function C4Driver.start_airplay_monitor(reason)
+  C4Driver.ensure_crypto_provider()
+  local host = Properties and Properties["Apple TV Address"]
+  if not host or host == "" then
+    Log.error("Apple TV Address is required")
+    return nil, "Apple TV Address is required"
+  end
+
+  local credentials = AirPlay.credentials or (Driver.state and Driver.state.airplay_credentials and Credentials.parse(Driver.state.airplay_credentials))
+  if not credentials or credentials.type ~= "HAP" then
+    Log.debug("AirPlay monitor skipped: AirPlay HAP credentials are not available")
+    return nil, "AirPlay HAP credentials are required"
+  end
+
+  AirPlay.monitor_enabled = true
+  C4Driver.cancel_timer("AppleTV_airplay_monitor_retry")
+
+  local function start_monitor(port)
+    C4Driver.close_airplay_control_client("starting AirPlay monitor")
+    AirPlay.port = port or AirPlay.port or 7000
+    AirPlay.control_client = AirPlayControlClient.new({
+      host = host,
+      port = AirPlay.port,
+      credentials = credentials,
+      crypto = Crypto,
+      probe = "tunnel_setup",
+      on_tunnel_setup = function(result)
+        if result and result.data_port then
+          Log.debug("AirPlay monitor active: dataPort=" .. tostring(result.data_port))
+          C4Driver.update_property("Connection State", "AirPlay Monitor Active")
+        else
+          C4Driver.update_property("Connection State", "AirPlay Monitor Incomplete")
+        end
+      end,
+      on_disconnect = function(err)
+        C4Driver.update_property("Connection State", "AirPlay Monitor Disconnected")
+        C4Driver.schedule_airplay_monitor_retry(err or "disconnect")
+      end,
+      on_error = function(err)
+        C4Driver.update_property("Connection State", "AirPlay Monitor Failed")
+        C4Driver.schedule_airplay_monitor_retry(err or "error")
+      end,
+    })
+    Log.debug("AirPlay monitor starting" .. (reason and (": " .. tostring(reason)) or ""))
+    return AirPlay.control_client:connect(host, AirPlay.port)
+  end
+
+  if AirPlay.port then
+    return start_monitor(AirPlay.port)
+  end
+
+  Log.debug("AirPlay monitor waiting for AirPlay port discovery")
+  return MDNS.discover_airplay_info(host, function(info)
+    if info and info.port then
+      AirPlay.port = info.port
+      AirPlay.txt = info.txt or {}
+      start_monitor(info.port)
+    else
+      Log.debug("AirPlay monitor skipped: AirPlay service not discovered")
+      C4Driver.update_property("Connection State", "AirPlay Not Found")
+      C4Driver.schedule_airplay_monitor_retry("AirPlay service not discovered")
+    end
+  end)
+end
+
+function C4Driver.stop_airplay_monitor(reason)
+  AirPlay.monitor_enabled = false
+  C4Driver.cancel_timer("AppleTV_airplay_monitor_retry")
+  C4Driver.close_airplay_control_client(reason or "stopping AirPlay monitor")
+  C4Driver.update_property("Connection State", "AirPlay Monitor Stopped")
+end
+
+function C4Driver.schedule_airplay_monitor_start()
+  if not (AirPlay.credentials or (Driver.state and Driver.state.airplay_credentials)) then
+    Log.debug("AirPlay monitor auto-start skipped: no AirPlay credentials")
+    return
+  end
+  if not has_c4() then
+    return
+  end
+  if type(SetTimer) == "function" then
+    C4Driver.cancel_timer("AppleTV_airplay_monitor_start")
+    local ok, err = pcall(SetTimer, "AppleTV_airplay_monitor_start", 2000, function()
+      C4Driver.start_airplay_monitor("auto-start")
+    end)
+    if not ok then
+      Log.debug("AirPlay monitor auto-start timer unavailable: " .. tostring(err))
+      return
+    end
+    Log.debug("AirPlay monitor auto-start scheduled")
+  else
+    C4Driver.start_airplay_monitor("auto-start")
+  end
+end
+
 function C4Driver.probe_airplay_control_info()
   C4Driver.ensure_crypto_provider()
   local host = Properties and Properties["Apple TV Address"]
@@ -7253,6 +7370,7 @@ function C4Driver.airplay_pairing_submit_pin(pin)
       C4Driver.update_property("AirPlay Credentials", canonical)
       C4Driver.update_property("Connection State", "AirPlay Pairing Complete")
       Log.debug("AirPlay Pair-Setup complete, credentials saved")
+      C4Driver.schedule_airplay_monitor_start()
     end)
   end)
 end
@@ -7268,6 +7386,7 @@ function C4Driver.import_airplay_credentials(detail_string)
   Storage.save(Driver.state)
   C4Driver.update_property("AirPlay Credentials", canonical)
   C4Driver.set_connection_state("AirPlay Credentials Imported")
+  C4Driver.schedule_airplay_monitor_start()
   return credentials
 end
 
@@ -7349,6 +7468,7 @@ function C4Driver.reset_pairing()
   AirPlay.credentials = nil
   AirPlay.verifier = nil
   AirPlay.control_keys = nil
+  C4Driver.stop_airplay_monitor("reset pairing")
   Companion.session = nil
   Companion.socket = nil
   Companion.client = nil
@@ -7386,7 +7506,7 @@ function C4Driver.disconnect_companion()
   if Companion.client and Companion.client.close then
     Companion.client:close()
   end
-  C4Driver.close_airplay_control_client("disconnect")
+  C4Driver.stop_airplay_monitor("disconnect")
   Companion.client = nil
   Companion.socket = nil
   Companion.session = nil
@@ -7625,6 +7745,8 @@ function C4Driver.cancel_driver_timers()
   C4Driver.cancel_timer("AppleTV_crypto_prewarm_x25519")
   C4Driver.cancel_timer("AppleTV_reselect_passthrough")
   C4Driver.cancel_timer("AppleTV_mdns_timeout")
+  C4Driver.cancel_timer("AppleTV_airplay_monitor_start")
+  C4Driver.cancel_timer("AppleTV_airplay_monitor_retry")
   MDNS.close()
 end
 
@@ -7671,6 +7793,12 @@ end
 EC.PROBE_AIRPLAY_TUNNEL_SETUP = function()
   return C4Driver.probe_airplay_tunnel_setup()
 end
+EC.START_AIRPLAY_MONITOR = function()
+  return C4Driver.start_airplay_monitor("manual")
+end
+EC.STOP_AIRPLAY_MONITOR = function()
+  return C4Driver.stop_airplay_monitor("manual")
+end
 EC.PAIR_AIRPLAY = function()
   return C4Driver.pair_airplay()
 end
@@ -7710,6 +7838,7 @@ function C4Driver.late_init()
   end
   C4MiniApps.register_rooms()
   C4Driver.schedule_crypto_prewarm()
+  C4Driver.schedule_airplay_monitor_start()
   Log.debug("driver late init")
 end
 
@@ -7722,6 +7851,8 @@ function C4Driver.destroy()
   Companion.client = nil
   Companion.socket = nil
   Companion.session = nil
+  C4Driver.close_airplay_control_client("driver destroy")
+  AirPlay.monitor_enabled = false
   Log.debug("driver destroyed")
 end
 

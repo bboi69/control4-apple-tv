@@ -745,6 +745,14 @@
                 <command>PROBE_AIRPLAY_TUNNEL_SETUP</command>
             </action>
             <action>
+                <name>Start AirPlay Monitor</name>
+                <command>START_AIRPLAY_MONITOR</command>
+            </action>
+            <action>
+                <name>Stop AirPlay Monitor</name>
+                <command>STOP_AIRPLAY_MONITOR</command>
+            </action>
+            <action>
                 <name>Pair AirPlay</name>
                 <command>PAIR_AIRPLAY</command>
             </action>

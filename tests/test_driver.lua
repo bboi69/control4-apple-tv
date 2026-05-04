@@ -1666,11 +1666,14 @@ end
 function tests.driver_destroy_closes_client_and_cancels_timers()
   local old_cancel_timer = CancelTimer
   local old_client = Driver.Companion.client
+  local old_airplay_client = Driver.AirPlay.control_client
   local old_socket = Driver.Companion.socket
   local old_session = Driver.Companion.session
+  local old_monitor_enabled = Driver.AirPlay.monitor_enabled
   local old_pregen = Driver.OpenSSLCrypto._pregenerated_x25519_keypair
   local cancelled = {}
   local closed = false
+  local airplay_closed = false
 
   CancelTimer = function(name)
     cancelled[#cancelled + 1] = name
@@ -1682,6 +1685,12 @@ function tests.driver_destroy_closes_client_and_cancels_timers()
   }
   Driver.Companion.socket = Driver.Companion.client
   Driver.Companion.session = {}
+  Driver.AirPlay.control_client = {
+    close = function()
+      airplay_closed = true
+    end,
+  }
+  Driver.AirPlay.monitor_enabled = true
   Driver.OpenSSLCrypto._pregenerated_x25519_keypair = {
     private_key = "cached",
     public_key = "cached",
@@ -1690,21 +1699,28 @@ function tests.driver_destroy_closes_client_and_cancels_timers()
   Driver.C4Driver.destroy()
 
   assert_eq(closed, true, "destroy closes Companion client")
+  assert_eq(airplay_closed, true, "destroy closes AirPlay client")
   assert_eq(Driver.Companion.client, nil, "destroy clears client")
   assert_eq(Driver.Companion.socket, nil, "destroy clears socket")
   assert_eq(Driver.Companion.session, nil, "destroy clears session")
+  assert_eq(Driver.AirPlay.control_client, nil, "destroy clears AirPlay client")
+  assert_eq(Driver.AirPlay.monitor_enabled, false, "destroy disables AirPlay monitor")
   assert_contains(cancelled, "AppleTV_crypto_prewarm_all", "all prewarm timer cancelled")
   assert_contains(cancelled, "AppleTV_crypto_prewarm_base", "base prewarm timer cancelled")
   assert_contains(cancelled, "AppleTV_crypto_prewarm_controller", "controller prewarm timer cancelled")
   assert_contains(cancelled, "AppleTV_crypto_prewarm_atv", "atv prewarm timer cancelled")
   assert_contains(cancelled, "AppleTV_crypto_prewarm_x25519", "x25519 prewarm timer cancelled")
   assert_contains(cancelled, "AppleTV_reselect_passthrough", "passthrough timer cancelled")
+  assert_contains(cancelled, "AppleTV_airplay_monitor_start", "AirPlay monitor start timer cancelled")
+  assert_contains(cancelled, "AppleTV_airplay_monitor_retry", "AirPlay monitor retry timer cancelled")
   assert_eq(Driver.OpenSSLCrypto._pregenerated_x25519_keypair, nil, "destroy clears pregenerated x25519 keypair")
 
   CancelTimer = old_cancel_timer
   Driver.Companion.client = old_client
+  Driver.AirPlay.control_client = old_airplay_client
   Driver.Companion.socket = old_socket
   Driver.Companion.session = old_session
+  Driver.AirPlay.monitor_enabled = old_monitor_enabled
   Driver.OpenSSLCrypto._pregenerated_x25519_keypair = old_pregen
 end
 
