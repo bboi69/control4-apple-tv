@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.29-dev",
+  VERSION = "0.1.30-dev",
 }
 
 local function has_c4()
@@ -1562,6 +1562,7 @@ end
 local _ED_BASE_WINDOW = 4
 local _ED_BASE_WINDOW_SIZE = 2 ^ _ED_BASE_WINDOW
 local _ED_BASE_TABLE = nil
+local _ED_BASE_TABLE_PREWARMED = false
 
 local function _ed_build_base_table()
   local table_by_window = {}
@@ -1595,6 +1596,7 @@ end
 local function _ed_scalar_mult_base(scalar)
   if not _ED_BASE_TABLE then
     _ED_BASE_TABLE = _ed_build_base_table()
+    _ED_BASE_TABLE_PREWARMED = true
   end
   local result = _ed_identity()
   for window = 1, #_ED_BASE_TABLE do
@@ -1692,6 +1694,15 @@ function Ed25519Pure.public_key_from_private(private_key)
   local h = _sha512_bytes(private_key)
   local a = _ed_clamped_scalar_from_hash(h)
   return _ed_encode_point(_ed_scalar_mult_base(a))
+end
+
+function Ed25519Pure.prewarm()
+  if _ED_BASE_TABLE_PREWARMED and _ED_BASE_TABLE then
+    return false
+  end
+  _ED_BASE_TABLE = _ed_build_base_table()
+  _ED_BASE_TABLE_PREWARMED = true
+  return true
 end
 
 function Ed25519Pure.sign(private_key, public_key, message)
@@ -4238,6 +4249,25 @@ function C4Driver.check_crypto_provider()
   return false, err
 end
 
+function C4Driver.prewarm_crypto()
+  if not (Companion.credentials or (Driver.state and Driver.state.companion_credentials)) then
+    Log.debug("crypto prewarm skipped: no pairing credentials")
+    return false
+  end
+  local ok, err = pcall(function()
+    local start_time = os.clock()
+    Log.debug("crypto prewarm started: Ed25519 fixed-base table")
+    local built = Ed25519Pure.prewarm()
+    Log.debug("crypto prewarm " .. (built and "built" or "already ready") ..
+      ": Ed25519 fixed-base table ms=" .. tostring(elapsed_ms(start_time)))
+  end)
+  if not ok then
+    Log.error("crypto prewarm failed: " .. tostring(err))
+    return false, err
+  end
+  return true
+end
+
 -- EC: Composer action and command dispatch (DCP normalises spaces→underscores and handles LUA_ACTION)
 EC.LAUNCH_APP = function(params)
   return C4Driver.launch_app(params.BUNDLE_ID_OR_URL or params.bundle_id_or_url)
@@ -4291,6 +4321,11 @@ function C4Driver.late_init()
     C4MiniApps.hide_proxy_in_all_rooms(C4MiniApps.SWITCHER_PROXY)
   end
   C4MiniApps.register_rooms()
+  if has_c4() and type(SetTimer) == "function" then
+    SetTimer("AppleTV_crypto_prewarm", 10000, function()
+      C4Driver.prewarm_crypto()
+    end)
+  end
   Log.debug("driver late init")
 end
 
