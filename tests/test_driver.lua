@@ -214,33 +214,32 @@ local function make_fake_openssl(options)
           end,
         }
       end,
-      new = function(factors)
-        record("pkey.new:" .. tostring(factors and factors.alg))
-        assert_eq(factors.alg, "dh", "pkey.new algorithm")
-        assert_eq(#factors.p, 384, "dh p length")
-        assert_eq(factors.g, "\5", "dh generator")
-        if factors.priv_key then
-          return {
-            kind = "dh-private",
-            priv_key = factors.priv_key,
-          }
-        end
-        return {
-          kind = "dh-public",
-          pub_key = factors.pub_key,
-        }
-      end,
       derive = function(private_key, peer_key)
         record("pkey.derive")
         assert(private_key.kind:match("private"), "derive expected private key")
         assert(peer_key.kind:match("public"), "derive expected public key")
-        if private_key.kind == "dh-private" then
-          return Driver.BigInt.to_bytes_be(
-            Driver.BigInt.sub(Driver.SRP.N, Driver.BigInt.from_number(8)),
-            384
-          )
-        end
         return string.rep("S", 32)
+      end,
+    },
+    bn = {
+      text = function(value)
+        record("bn.text:" .. tostring(#value))
+        return {
+          bytes = value,
+        }
+      end,
+      powmod = function(base, exponent, modulus)
+        record("bn.powmod")
+        assert_eq(base.bytes, "\5", "bn powmod base")
+        assert_eq(exponent.bytes, "\3", "bn powmod exponent")
+        assert_eq(#modulus.bytes, 384, "bn powmod modulus")
+        return {
+          bytes = string.char(125),
+        }
+      end,
+      totext = function(value)
+        record("bn.totext")
+        return value.bytes
       end,
     },
     cipher = {
@@ -504,8 +503,7 @@ function tests.openssl_crypto_self_test_uses_documented_call_shapes()
   assert_contains(fake.calls, "cipher:encrypt_new", "encrypt context")
   assert_contains(fake.calls, "cipher:decrypt_new", "decrypt context")
   assert_contains(fake.calls, "hmac.hmac:sha512:true", "hmac call")
-  assert_contains(fake.calls, "pkey.new:dh", "native SRP DH key creation")
-  assert_contains(fake.calls, "pkey.derive", "native SRP DH derive")
+  assert_contains(fake.calls, "bn.powmod", "native SRP BN modpow")
   assert_contains(fake.calls, "rand.bytes:32", "secure random call")
 end
 

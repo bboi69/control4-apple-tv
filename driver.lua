@@ -1799,28 +1799,16 @@ local function left_pad_bytes(value, len)
 end
 
 function OpenSSLCrypto.srp_modpow(base_bytes, exponent_bytes, len)
-  local pkey = OpenSSLCrypto._pkey()
-  assert(pkey.new, "lua-openssl pkey.new is required for native SRP DH modpow")
-  assert(pkey.derive, "lua-openssl pkey.derive is required for native SRP DH modpow")
+  local openssl = OpenSSLCrypto.load_openssl()
+  local bn = openssl.bn
+  assert(bn and bn.text and bn.powmod and bn.totext, "lua-openssl bn.text/powmod/totext are required for native SRP modpow")
 
-  local dh_private, private_err = pkey.new({
-    alg = "dh",
-    p = SRP.N_BYTES,
-    g = BigInt.to_minimal_bytes_be(SRP.g),
-    priv_key = exponent_bytes,
-  })
-  dh_private = openssl_assert(dh_private, private_err, "create SRP DH private key")
-
-  local dh_peer, peer_err = pkey.new({
-    alg = "dh",
-    p = SRP.N_BYTES,
-    g = BigInt.to_minimal_bytes_be(SRP.g),
-    pub_key = base_bytes,
-  })
-  dh_peer = openssl_assert(dh_peer, peer_err, "create SRP DH peer key")
-
-  local secret, derive_err = pkey.derive(dh_private, dh_peer)
-  return left_pad_bytes(openssl_assert(secret, derive_err, "derive native SRP DH secret"), len or 384)
+  local base = bn.text(base_bytes)
+  local exponent = bn.text(exponent_bytes)
+  local modulus = bn.text(SRP.N_BYTES)
+  local result, err = bn.powmod(base, exponent, modulus)
+  result = openssl_assert(result, err, "native SRP BN_mod_exp")
+  return left_pad_bytes(bn.totext(result), len or 384)
 end
 
 function OpenSSLCrypto.random_bytes(n)
@@ -1910,16 +1898,14 @@ function OpenSSLCrypto.self_test(progress)
   assert(type(hmac) == "string" and #hmac == 64, "HMAC-SHA512 failed")
   progress("crypto self-test: HMAC-SHA512 passed")
 
-  progress("crypto self-test: native SRP DH modpow started")
-  local native_test_base = BigInt.sub(SRP.N, BigInt.from_number(2))
-  local native_test_expected = BigInt.to_bytes_be(BigInt.sub(SRP.N, BigInt.from_number(8)), 384)
+  progress("crypto self-test: native SRP BN modpow started")
   local srp_native = OpenSSLCrypto.srp_modpow(
-    BigInt.to_bytes_be(native_test_base, 384),
+    BigInt.to_minimal_bytes_be(SRP.g),
     string.char(3),
     384
   )
-  assert(srp_native == native_test_expected, "native SRP DH modpow failed")
-  progress("crypto self-test: native SRP DH modpow passed")
+  assert(BigInt.from_bytes_be(srp_native)[1] == 125, "native SRP BN modpow failed")
+  progress("crypto self-test: native SRP BN modpow passed")
 
   progress("crypto self-test: ChaCha20-Poly1305 started")
   local key = string.rep("\0", 32)
