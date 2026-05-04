@@ -1384,7 +1384,7 @@ function tests.airplay_control_client_runs_rtsp_tunnel_setup_probe()
   assert_eq(tunnel_result.event_port, 49152, "event port")
   assert_eq(tunnel_result.data_port, 49153, "data port")
   assert(client.data_channel ~= nil, "data channel created")
-  assert(#event_writes >= 3, "data channel bootstrap writes")
+  assert_eq(#event_writes, 1, "data channel sends initial device info only")
   C4 = old_c4
 end
 
@@ -2302,7 +2302,9 @@ function tests.remote_passthrough_uses_configurable_button_mapping()
 end
 
 function tests.app_list_current_app_and_now_playing_are_published()
+  local old_c4 = C4
   local old_properties = Properties
+  C4 = nil
   Properties = {}
   Driver._test_storage = {}
   Driver.Companion.app_list = {}
@@ -2335,6 +2337,21 @@ function tests.app_list_current_app_and_now_playing_are_published()
   })
   assert_eq(Properties["Now Playing"], "Episode One - A Show - Season 1", "now playing property")
 
+  local client = Driver.PB.field_string(2, "com.att.tv") .. Driver.PB.field_string(7, "DIRECTV")
+  local path = Driver.PB.field_message(2, client)
+  local now_playing = Driver.PB.field_string(2, "Channel 12") .. Driver.PB.field_string(9, "Live TV")
+  local state = Driver.PB.field_message(1, now_playing) ..
+    Driver.PB.field_varint(6, 2) ..
+    Driver.PB.field_message(9, path)
+  local message = Driver.PB.field_varint(1, 4) ..
+    Driver.PB.field_string(2, "state-id") ..
+    Driver.PB.field_varint(4, 0) ..
+    Driver.PB.field_message(9, state)
+  Driver.C4Driver.handle_airplay_mrp_update(Driver.PB.extract_protocol_update(message))
+  assert_eq(Properties["Current App"], "DIRECTV | com.att.tv", "MRP state updates current app")
+  assert_eq(Properties["Now Playing"], "Live TV - Channel 12", "MRP state updates now playing")
+
+  C4 = old_c4
   Properties = old_properties
 end
 

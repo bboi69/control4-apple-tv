@@ -5736,6 +5736,18 @@ function PB.summarize_content_metadata(data)
   return #parts > 0 and table.concat(parts, " ") or nil
 end
 
+function PB.summarize_now_playing_info(data)
+  if not data then return nil end
+  local parts = {}
+  local album = PB.string_field(data, 1)
+  local artist = PB.string_field(data, 2)
+  local title = PB.string_field(data, 9)
+  if title then parts[#parts + 1] = "title=" .. title end
+  if artist then parts[#parts + 1] = "artist=" .. artist end
+  if album then parts[#parts + 1] = "album=" .. album end
+  return #parts > 0 and table.concat(parts, " ") or nil
+end
+
 function PB.summarize_playback_queue(data)
   if not data then return nil end
   local parts = {}
@@ -5821,6 +5833,55 @@ function PB.describe_protocol_message(data)
   return table.concat(parts, " ")
 end
 
+function PB.extract_protocol_update(data)
+  local message_type = PB.varint_field(data, 1)
+  local update = {}
+
+  local function copy_client(client)
+    if not client then return end
+    local bundle = PB.string_field(client, 2)
+    local name = PB.string_field(client, 7)
+    if bundle and bundle ~= "" then update.app_bundle = bundle end
+    if name and name ~= "" then update.app_name = name end
+  end
+
+  local function copy_now_playing_info(info)
+    if not info then return end
+    local album = PB.string_field(info, 1)
+    local artist = PB.string_field(info, 2)
+    local title = PB.string_field(info, 9)
+    if title and title ~= "" then update.title = title end
+    if artist and artist ~= "" then update.artist = artist end
+    if album and album ~= "" then update.album = album end
+  end
+
+  local function copy_state_like(state)
+    if not state then return end
+    copy_now_playing_info(PB.first_field(state, 1, 2))
+    local playback_state = PB.varint_field(state, 6)
+    if playback_state ~= nil then update.playback_state = playback_state end
+    local path = PB.first_field(state, 9, 2)
+    if path then
+      copy_client(PB.first_field(path, 2, 2))
+    end
+  end
+
+  if message_type == 4 then
+    copy_state_like(PB.first_field(data, 9, 2))
+  elseif message_type == 46 or message_type == 55 then
+    local inner = PB.first_field(data, message_type == 46 and 50 or 59, 2)
+    copy_client(PB.first_field(inner or "", 1, 2))
+  elseif message_type == 72 then
+    copy_state_like(PB.first_field(data, 75, 2))
+  end
+
+  update.message_type = message_type
+  if update.app_bundle or update.app_name or update.title or update.artist or update.album or update.playback_state ~= nil then
+    return update
+  end
+  return nil
+end
+
 function PB.uuid(crypto)
   crypto = crypto or Crypto
   local h = Bytes.hex(crypto_method(crypto, "random_bytes")(16))
@@ -5877,7 +5938,7 @@ end
 function PB.client_updates_config(crypto, identifier)
   local config = table.concat({
     PB.field_varint(1, 1),
-    PB.field_varint(2, 1),
+    PB.field_varint(2, 0),
     PB.field_varint(3, 1),
     PB.field_varint(4, 1),
     PB.field_varint(5, 1),
@@ -5902,6 +5963,7 @@ function AirPlayDataChannelClient.new(options)
     buffer = "",
     send_seqno = 0x100000000 + 1,
     client_id = options.client_id,
+    startup_stage = "idle",
     on_connected = options.on_connected,
     on_error = options.on_error,
   }, { __index = AirPlayDataChannelClient })
@@ -5988,10 +6050,18 @@ end
 
 function AirPlayDataChannelClient:send_bootstrap()
   local device_info_id = PB.uuid(self.crypto)
-  local updates_id = PB.uuid(self.crypto)
-  local keyboard_id = PB.uuid(self.crypto)
+  self.startup_stage = "device_info_sent"
   Log.debug("AirPlay data channel bootstrap: sending MRP device info")
   self:send_protobuf(PB.device_info(self.client_id, self.crypto, device_info_id))
+end
+
+function AirPlayDataChannelClient:send_post_device_info_bootstrap()
+  if self.startup_stage == "post_device_info_sent" then
+    return
+  end
+  self.startup_stage = "post_device_info_sent"
+  local updates_id = PB.uuid(self.crypto)
+  local keyboard_id = PB.uuid(self.crypto)
   Log.debug("AirPlay data channel bootstrap: sending MRP connection state")
   self:send_protobuf(PB.set_connection_state(self.crypto))
   Log.debug("AirPlay data channel bootstrap: sending MRP client updates config")
@@ -6045,6 +6115,13 @@ function AirPlayDataChannelClient:handle_payload(message_type, seqno, payload)
           local raw_message = data.data:sub(next_index, next_index + value_or_err - 1)
           local ok_protocol, protocol_description = pcall(PB.describe_protocol_message, raw_message)
           description = ok_protocol and protocol_description or PB.describe(raw_message)
+          local ok_update, update = pcall(PB.extract_protocol_update, raw_message)
+          if ok_update and update and C4Driver and C4Driver.handle_airplay_mrp_update then
+            C4Driver.handle_airplay_mrp_update(update)
+          end
+          if PB.varint_field(raw_message, 1) == 15 then
+            self:send_post_device_info_bootstrap()
+          end
         end
         Log.debug("AirPlay data channel protobuf bytes: len=" .. tostring(#data.data) ..
           " head=" .. Bytes.hex(data.data:sub(1, 32)) ..
@@ -6578,7 +6655,10 @@ end
 function C4Driver.update_property(name, value)
   local str_value = tostring(value or "")
   if has_c4() and type(UpdateProperty) == "function" and type(Properties) == "table" then
-    UpdateProperty(name, str_value)
+    local ok, err = pcall(UpdateProperty, name, str_value)
+    if not ok then
+      Log.debug("UpdateProperty failed for " .. tostring(name) .. ": " .. tostring(err))
+    end
   end
   if type(Properties) == "table" then
     Properties[name] = str_value
@@ -6628,6 +6708,28 @@ function C4Driver.handle_companion_message(message)
     C4Driver.publish_current_app()
   end
   if changed.now_playing then
+    C4Driver.publish_now_playing()
+  end
+end
+
+function C4Driver.handle_airplay_mrp_update(update)
+  if type(update) ~= "table" then
+    return
+  end
+  if update.app_bundle or update.app_name then
+    local identifier = update.app_bundle or update.app_name
+    Companion.current_app = {
+      identifier = identifier,
+      name = Companion.app_name_for_bundle(identifier) or update.app_name or identifier,
+    }
+    C4Driver.publish_current_app()
+  end
+  if update.title or update.artist or update.album then
+    Companion.now_playing = {
+      title = update.title,
+      artist = update.artist,
+      album = update.album,
+    }
     C4Driver.publish_now_playing()
   end
 end
@@ -7694,6 +7796,7 @@ Driver.AirPlay = AirPlay
 Driver.AirPlayHTTP = AirPlayHTTP
 Driver.AirPlayControlClient = AirPlayControlClient
 Driver.BPlist = BPlist
+Driver.PB = PB
 Driver.PairVerify = PairVerify
 Driver.PairSetup = PairSetup
 Driver.Crypto = Crypto
