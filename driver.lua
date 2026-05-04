@@ -625,6 +625,12 @@ function BigInt.bit_length(v)
   return bits
 end
 
+function BigInt.bit_at(v, bit_index)
+  local limb = v[math.floor(bit_index / BigInt.BITS) + 1] or 0
+  local mask = 2 ^ (bit_index % BigInt.BITS)
+  return math.floor(limb / mask) % 2
+end
+
 local function bi_shr1(v)
   local B, carry, result = BigInt.BASE, 0, {}
   for i = #v, 1, -1 do
@@ -733,11 +739,12 @@ function BigInt.mont_modpow(base, exp, N, R2, k, n_prime)
   if BigInt.is_zero(exp) then return {1} end
   local base_hat = mont_mul(base, R2, N, k, n_prime)
   local result_hat = mont_mul({1}, R2, N, k, n_prime)
-  local e = {}; for i = 1, #exp do e[i] = exp[i] end
-  while not BigInt.is_zero(e) do
-    if e[1] % 2 == 1 then result_hat = mont_mul(result_hat, base_hat, N, k, n_prime) end
+  local exp_bits = BigInt.bit_length(exp)
+  for bit = 0, exp_bits - 1 do
+    if BigInt.bit_at(exp, bit) == 1 then
+      result_hat = mont_mul(result_hat, base_hat, N, k, n_prime)
+    end
     base_hat = mont_mul(base_hat, base_hat, N, k, n_prime)
-    e = bi_shr1(e)
   end
   local padded = {}
   for i = 1, #result_hat do padded[i] = result_hat[i] end
@@ -773,6 +780,7 @@ SRP._initialized = false
 SRP._n_prime = nil
 SRP._R2 = nil
 SRP._k_bytes = nil
+SRP._modpow = nil
 
 -- Pure-Lua X25519 (RFC 7748) over GF(2^255-19).
 -- Used because Control4's lua-openssl pkey.derive rejects Curve25519/OKP keys.
@@ -1375,9 +1383,13 @@ end
 
 function SRP.compute_A(a_bytes)
   SRP.init()
+  local modpow = SRP._modpow
+  if modpow then
+    return modpow(BigInt.to_minimal_bytes_be(SRP.g), a_bytes, 384)
+  end
   local a = BigInt.from_bytes_be(a_bytes)
   local A = BigInt.mont_modpow(SRP.g, a, SRP.N, SRP._R2, SRP.N_LIMBS, SRP._n_prime)
-  return BigInt.to_bytes_be(A, 384), A
+  return BigInt.to_bytes_be(A, 384)
 end
 
 function SRP.compute_u(A_bytes, B_bytes)
@@ -1389,7 +1401,18 @@ function SRP.compute_session_key(B_bytes, a_bytes, x, u)
   local B_big = BigInt.from_bytes_be(B_bytes)
   local a = BigInt.from_bytes_be(a_bytes)
   local k_big = BigInt.from_bytes_be(SRP._k_bytes)
-  local gx = BigInt.mont_modpow(SRP.g, x, SRP.N, SRP._R2, SRP.N_LIMBS, SRP._n_prime)
+  Log.debug("Pair-Setup M3 progress: SRP g^x started")
+  local gx
+  if SRP._modpow then
+    gx = BigInt.from_bytes_be(SRP._modpow(
+      BigInt.to_minimal_bytes_be(SRP.g),
+      BigInt.to_minimal_bytes_be(x),
+      384
+    ))
+  else
+    gx = BigInt.mont_modpow(SRP.g, x, SRP.N, SRP._R2, SRP.N_LIMBS, SRP._n_prime)
+  end
+  Log.debug("Pair-Setup M3 progress: SRP g^x computed")
   local kgx = BigInt.mod(BigInt.mul(k_big, gx), SRP.N)
   local Bkgx
   if BigInt.compare(B_big, kgx) >= 0 then
@@ -1399,7 +1422,18 @@ function SRP.compute_session_key(B_bytes, a_bytes, x, u)
     if BigInt.compare(Bkgx, SRP.N) >= 0 then Bkgx = BigInt.sub(Bkgx, SRP.N) end
   end
   local exp = BigInt.add(a, BigInt.mul(u, x))
-  local S = BigInt.mont_modpow(Bkgx, exp, SRP.N, SRP._R2, SRP.N_LIMBS, SRP._n_prime)
+  Log.debug("Pair-Setup M3 progress: SRP shared secret started")
+  local S
+  if SRP._modpow then
+    S = BigInt.from_bytes_be(SRP._modpow(
+      BigInt.to_minimal_bytes_be(Bkgx),
+      BigInt.to_minimal_bytes_be(exp),
+      384
+    ))
+  else
+    S = BigInt.mont_modpow(Bkgx, exp, SRP.N, SRP._R2, SRP.N_LIMBS, SRP._n_prime)
+  end
+  Log.debug("Pair-Setup M3 progress: SRP shared secret computed")
   local K = SRP.sha512(BigInt.to_minimal_bytes_be(S))
   return K
 end
@@ -1496,6 +1530,17 @@ local function crypto_method(crypto, name)
   error("crypto provider does not implement " .. name)
 end
 
+local function optional_crypto_method(crypto, name)
+  local provider = crypto
+  if provider == nil or provider == Crypto then
+    provider = Crypto.provider
+  end
+  if provider and type(provider[name]) == "function" then
+    return provider[name]
+  end
+  return nil
+end
+
 function Crypto.hmac_sha512(key, data)
   if Crypto.provider and type(Crypto.provider.hmac_sha512) == "function" then
     return Crypto.provider.hmac_sha512(key, data)
@@ -1564,6 +1609,7 @@ local OpenSSLCrypto = {
   openssl = nil,
   out_counter = 0,
   in_counter = 0,
+  self_tested = false,
 }
 
 OpenSSLCrypto.EVP_CTRL_AEAD_GET_TAG = 0x10
@@ -1750,6 +1796,46 @@ function OpenSSLCrypto.hkdf_sha512(salt, info, ikm)
   return OpenSSLCrypto.hmac_sha512(prk, info .. string.char(0x01)):sub(1, 32)
 end
 
+local function left_pad_bytes(value, len)
+  if #value > len then
+    local i = 1
+    while i <= #value - len and value:byte(i) == 0 do
+      i = i + 1
+    end
+    value = value:sub(i)
+  end
+  assert(#value <= len, "native SRP modpow returned too many bytes")
+  if #value < len then
+    return string.rep("\0", len - #value) .. value
+  end
+  return value
+end
+
+function OpenSSLCrypto.srp_modpow(base_bytes, exponent_bytes, len)
+  local pkey = OpenSSLCrypto._pkey()
+  assert(pkey.new, "lua-openssl pkey.new is required for native SRP DH modpow")
+  assert(pkey.derive, "lua-openssl pkey.derive is required for native SRP DH modpow")
+
+  local dh_private, private_err = pkey.new({
+    alg = "dh",
+    p = SRP.N_BYTES,
+    g = BigInt.to_minimal_bytes_be(SRP.g),
+    priv_key = exponent_bytes,
+  })
+  dh_private = openssl_assert(dh_private, private_err, "create SRP DH private key")
+
+  local dh_peer, peer_err = pkey.new({
+    alg = "dh",
+    p = SRP.N_BYTES,
+    g = BigInt.to_minimal_bytes_be(SRP.g),
+    pub_key = base_bytes,
+  })
+  dh_peer = openssl_assert(dh_peer, peer_err, "create SRP DH peer key")
+
+  local secret, derive_err = pkey.derive(dh_private, dh_peer)
+  return left_pad_bytes(openssl_assert(secret, derive_err, "derive native SRP DH secret"), len or 384)
+end
+
 function OpenSSLCrypto.random_bytes(n)
   assert(type(n) == "number" and n >= 0, "random byte count must be non-negative")
   local openssl = OpenSSLCrypto.load_openssl()
@@ -1837,6 +1923,15 @@ function OpenSSLCrypto.self_test(progress)
   assert(type(hmac) == "string" and #hmac == 64, "HMAC-SHA512 failed")
   progress("crypto self-test: HMAC-SHA512 passed")
 
+  progress("crypto self-test: native SRP DH modpow started")
+  local srp_native = OpenSSLCrypto.srp_modpow(
+    BigInt.to_minimal_bytes_be(SRP.g),
+    string.char(3),
+    384
+  )
+  assert(BigInt.from_bytes_be(srp_native)[1] == 125, "native SRP DH modpow failed")
+  progress("crypto self-test: native SRP DH modpow passed")
+
   progress("crypto self-test: ChaCha20-Poly1305 started")
   local key = string.rep("\0", 32)
   local nonce = string.rep("\0", 12)
@@ -1866,6 +1961,7 @@ function OpenSSLCrypto.self_test(progress)
   assert(Ed25519Pure.verify(ed_public, ed_signature, ""), "Ed25519 RFC 8032 verify vector failed")
   progress("crypto self-test: Ed25519 passed")
 
+  OpenSSLCrypto.self_tested = true
   return true
 end
 
@@ -2018,16 +2114,29 @@ end
 function PairSetup:compute_m3(pin)
   Log.debug("Pair-Setup M3 compute started: deriving SRP proof from PIN")
   assert(self.state == "M2_RECEIVED", "must receive M2 before computing M3")
+  local old_modpow = SRP._modpow
+  SRP._modpow = optional_crypto_method(self.crypto, "srp_modpow")
+  if SRP._modpow then
+    Log.debug("Pair-Setup M3 using native SRP DH modpow")
+  else
+    Log.debug("Pair-Setup M3 using pure Lua SRP modpow")
+  end
   self.a_bytes = crypto_method(self.crypto, "random_bytes")(32)
   Log.debug("Pair-Setup M3 progress: random SRP secret generated")
-  self.A_bytes = SRP.compute_A(self.a_bytes)
-  Log.debug("Pair-Setup M3 progress: SRP public key computed")
-  local x = SRP.compute_x(self._salt, pin)
-  Log.debug("Pair-Setup M3 progress: SRP x computed")
-  local u = SRP.compute_u(self.A_bytes, self._B_bytes)
-  Log.debug("Pair-Setup M3 progress: SRP u computed")
-  self.K = SRP.compute_session_key(self._B_bytes, self.a_bytes, x, u)
-  Log.debug("Pair-Setup M3 progress: SRP session key computed")
+  local ok, err = pcall(function()
+    self.A_bytes = SRP.compute_A(self.a_bytes)
+    Log.debug("Pair-Setup M3 progress: SRP public key computed")
+    local x = SRP.compute_x(self._salt, pin)
+    Log.debug("Pair-Setup M3 progress: SRP x computed")
+    local u = SRP.compute_u(self.A_bytes, self._B_bytes)
+    Log.debug("Pair-Setup M3 progress: SRP u computed")
+    self.K = SRP.compute_session_key(self._B_bytes, self.a_bytes, x, u)
+    Log.debug("Pair-Setup M3 progress: SRP session key computed")
+  end)
+  SRP._modpow = old_modpow
+  if not ok then
+    error(err, 2)
+  end
   self._M1 = SRP.compute_M1(self.A_bytes, self._B_bytes, self.K, self._salt)
   Log.debug("Pair-Setup M3 progress: SRP client proof computed")
   local pairing_data = TLV8.encode_ordered({
@@ -3025,6 +3134,15 @@ function C4Driver.ensure_crypto_provider()
   return Crypto.provider
 end
 
+function C4Driver.ensure_pairing_crypto_ready()
+  C4Driver.ensure_crypto_provider()
+  if Crypto.provider == OpenSSLCrypto and not OpenSSLCrypto.self_tested then
+    Log.debug("pairing crypto preflight started")
+    OpenSSLCrypto.self_test(Log.debug)
+    Log.debug("pairing crypto preflight passed")
+  end
+end
+
 function C4Driver.update_property(name, value)
   local str_value = tostring(value or "")
   if has_c4() and type(UpdateProperty) == "function" and type(Properties) == "table" then
@@ -3172,7 +3290,7 @@ function C4Driver.connect_companion()
 end
 
 function C4Driver.pair_companion()
-  C4Driver.ensure_crypto_provider()
+  C4Driver.ensure_pairing_crypto_ready()
   local host = Properties and Properties["Apple TV Address"]
   if not host or host == "" then
     Log.error("set Apple TV Address before pairing")
