@@ -540,6 +540,12 @@
                 <readonly>false</readonly>
             </property>
             <property>
+                <name>AirPlay Credentials</name>
+                <default />
+                <type>STRING</type>
+                <readonly>false</readonly>
+            </property>
+            <property>
                 <name>Passthrough Mode</name>
                 <type>LIST</type>
                 <items>
@@ -679,14 +685,6 @@
                 <readonly>false</readonly>
             </property>
             <property>
-                <name>Button Hold Threshold</name>
-                <type>RANGED_INTEGER</type>
-                <default>400</default>
-                <minimum>100</minimum>
-                <maximum>2000</maximum>
-                <readonly>false</readonly>
-            </property>
-            <property>
                 <name>Debug Mode</name>
                 <type>LIST</type>
                 <items>
@@ -721,6 +719,14 @@
             <action>
                 <name>Prewarm Crypto</name>
                 <command>PREWARM_CRYPTO</command>
+            </action>
+            <action>
+                <name>Probe Metadata Service</name>
+                <command>PROBE_METADATA_SERVICE</command>
+            </action>
+            <action>
+                <name>Probe AirPlay Service</name>
+                <command>PROBE_AIRPLAY_SERVICE</command>
             </action>
             <action>
                 <name>Pair Apple TV</name>

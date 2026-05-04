@@ -88,6 +88,331 @@ function Bytes.from_hex(hex)
   end))
 end
 
+local MDNS = {}
+MDNS.SERVICE = "_companion-link._tcp.local"
+MDNS.MRP_SERVICE = "_mediaremotetv._tcp.local"
+MDNS.AIRPLAY_SERVICE = "_airplay._tcp.local"
+MDNS.PORT = 5353
+MDNS.DEFAULT_COMPANION_PORT = 49153
+MDNS.binding = nil
+MDNS.host = nil
+MDNS.pending_callback = nil
+MDNS.pending_fallback_port = nil
+MDNS.pending_label = nil
+MDNS.pending_cache_companion_port = false
+MDNS.pending_info_callback = false
+MDNS.timeout_timer = nil
+MDNS.last_port_by_host = {}
+
+local function dns_encode_name(name)
+  local out = {}
+  for label in tostring(name):gmatch("[^%.]+") do
+    assert(#label <= 63, "DNS label too long")
+    out[#out + 1] = string.char(#label)
+    out[#out + 1] = label
+  end
+  out[#out + 1] = "\0"
+  return table.concat(out)
+end
+
+local function dns_read_u16(data, index)
+  local b1, b2 = data:byte(index, index + 1)
+  assert(b1 and b2, "truncated DNS u16")
+  return b1 * 0x100 + b2, index + 2
+end
+
+local function dns_read_u32(data, index)
+  local high, next_index = dns_read_u16(data, index)
+  local low
+  low, next_index = dns_read_u16(data, next_index)
+  return high * 0x10000 + low, next_index
+end
+
+local function dns_read_name(data, index, depth)
+  depth = depth or 0
+  assert(depth < 16, "DNS name compression loop")
+  local labels = {}
+  local jumped = false
+  local original_next = nil
+
+  while true do
+    local length = data:byte(index)
+    assert(length, "truncated DNS name")
+
+    if length == 0 then
+      index = index + 1
+      break
+    end
+
+    local prefix = math.floor(length / 0x40)
+    if prefix == 3 then
+      local b2 = data:byte(index + 1)
+      assert(b2, "truncated DNS compression pointer")
+      local pointer = ((length % 0x40) * 0x100) + b2 + 1
+      if not jumped then original_next = index + 2 end
+      local pointed_name = dns_read_name(data, pointer, depth + 1)
+      if pointed_name ~= "" then labels[#labels + 1] = pointed_name end
+      jumped = true
+      index = original_next
+      break
+    end
+
+    assert(prefix == 0, "unsupported DNS label type")
+    local label = data:sub(index + 1, index + length)
+    assert(#label == length, "truncated DNS label")
+    labels[#labels + 1] = label
+    index = index + length + 1
+  end
+
+  return table.concat(labels, "."), index
+end
+
+function MDNS.build_query(service_name)
+  local id = 0
+  local flags = 0
+  local qdcount = 1
+  local header = string.char(
+    math.floor(id / 0x100), id % 0x100,
+    math.floor(flags / 0x100), flags % 0x100,
+    0, qdcount,
+    0, 0,
+    0, 0,
+    0, 0
+  )
+  -- PTR query, QU class bit set so the Apple TV can reply directly to us.
+  return header .. dns_encode_name(service_name) .. string.char(0, 12, 0x80, 1)
+end
+
+function MDNS.parse_service_port(data, service_name)
+  local info = MDNS.parse_service_info(data, service_name)
+  return info and info.port or nil
+end
+
+function MDNS.parse_txt_rdata(data, rdata_start, rdata_end)
+  local txt = {}
+  local index = rdata_start
+  while index <= rdata_end do
+    local length = data:byte(index)
+    if not length then break end
+    index = index + 1
+    local item = data:sub(index, index + length - 1)
+    index = index + length
+    local key, value = item:match("^([^=]+)=(.*)$")
+    if key then
+      txt[key] = value
+      txt[key:lower()] = value
+    elseif item ~= "" then
+      txt[item] = true
+      txt[item:lower()] = true
+    end
+  end
+  return txt
+end
+
+function MDNS.parse_service_info(data, service_name)
+  if type(data) ~= "string" or #data < 12 then return nil end
+  service_name = service_name or MDNS.SERVICE
+  local qdcount = data:byte(5) * 0x100 + data:byte(6)
+  local ancount = data:byte(7) * 0x100 + data:byte(8)
+  local nscount = data:byte(9) * 0x100 + data:byte(10)
+  local arcount = data:byte(11) * 0x100 + data:byte(12)
+  local index = 13
+  local service_names = {
+    [service_name] = true,
+    [service_name .. "."] = true,
+  }
+
+  local parse_ok, info = pcall(function()
+    local result = { port = nil, txt = {}, instance = nil, service = service_name }
+    for _ = 1, qdcount do
+      local _
+      _, index = dns_read_name(data, index)
+      index = index + 4
+    end
+    for _ = 1, ancount + nscount + arcount do
+      local name
+      name, index = dns_read_name(data, index)
+      local rr_type; rr_type, index = dns_read_u16(data, index)
+      local _rr_class; _rr_class, index = dns_read_u16(data, index)
+      local _ttl; _ttl, index = dns_read_u32(data, index)
+      local rdlength; rdlength, index = dns_read_u16(data, index)
+      local rdata_start = index
+      local rdata_end = rdata_start + rdlength - 1
+      assert(rdata_end <= #data, "truncated DNS rdata")
+      if rr_type == 12 and (name == service_name or name == service_name .. ".") then
+        local ptr_name = dns_read_name(data, rdata_start)
+        service_names[ptr_name] = true
+        result.instance = result.instance or ptr_name
+      elseif rr_type == 33 and service_names[name] then
+        local _priority, i = dns_read_u16(data, rdata_start)
+        local _weight; _weight, i = dns_read_u16(data, i)
+        local srv_port; srv_port = dns_read_u16(data, i)
+        if srv_port and srv_port > 0 then result.port = srv_port end
+      elseif rr_type == 16 and service_names[name] then
+        result.txt = MDNS.parse_txt_rdata(data, rdata_start, rdata_end)
+      end
+      index = rdata_end + 1
+    end
+    if result.port or next(result.txt) ~= nil then
+      return result
+    end
+    return nil
+  end)
+  return parse_ok and info or nil
+end
+
+function MDNS.parse_companion_port(data)
+  return MDNS.parse_service_port(data, MDNS.SERVICE)
+end
+
+function MDNS.cached_port(host)
+  return MDNS.last_port_by_host[host] or MDNS.DEFAULT_COMPANION_PORT
+end
+
+function MDNS.has_cached_port(host)
+  return host ~= nil and MDNS.last_port_by_host[host] ~= nil
+end
+
+function MDNS.invalidate(host)
+  if host then
+    MDNS.last_port_by_host[host] = nil
+  end
+end
+
+function MDNS.allocate_binding()
+  if MDNS.binding then return MDNS.binding end
+  local binding = 6889
+  if has_c4() and C4.GetBindingAddress then
+    while binding >= 6850 do
+      local address = C4:GetBindingAddress(binding)
+      if address == nil or address == "" then
+        MDNS.binding = binding
+        return binding
+      end
+      binding = binding - 1
+    end
+  end
+  MDNS.binding = 6889
+  return MDNS.binding
+end
+
+function MDNS.close()
+  if MDNS.timeout_timer then
+    if type(CancelTimer) == "function" then pcall(CancelTimer, MDNS.timeout_timer) end
+    MDNS.timeout_timer = nil
+  end
+  if has_c4() and MDNS.binding then
+    pcall(function() C4:NetDisconnect(MDNS.binding, MDNS.PORT, "UDP") end)
+    if RFN then RFN[MDNS.binding] = nil end
+    if OCS then OCS[MDNS.binding] = nil end
+    if C4.SetBindingAddress then pcall(function() C4:SetBindingAddress(MDNS.binding, "") end) end
+  end
+  MDNS.pending_callback = nil
+  MDNS.pending_fallback_port = nil
+  MDNS.pending_label = nil
+  MDNS.pending_cache_companion_port = false
+  MDNS.pending_info_callback = false
+  MDNS.host = nil
+end
+
+function MDNS.finish(info_or_port, source)
+  local callback = MDNS.pending_callback
+  local host = MDNS.host
+  local fallback_port = MDNS.pending_fallback_port
+  local label = MDNS.pending_label or "mDNS"
+  local cache_companion_port = MDNS.pending_cache_companion_port
+  local info_callback = MDNS.pending_info_callback
+  local info = type(info_or_port) == "table" and info_or_port or { port = info_or_port }
+  local port = info.port
+  if port and host and cache_companion_port then
+    MDNS.last_port_by_host[host] = port
+  end
+  if port then
+    Log.debug(tostring(label) .. " discovered port=" .. tostring(port) ..
+      " source=" .. tostring(source or "response"))
+  end
+  MDNS.close()
+  if callback then
+    if info_callback then
+      if port or (info.txt and next(info.txt) ~= nil) then
+        callback(info)
+      else
+        callback(nil)
+      end
+    else
+      callback(port or fallback_port)
+    end
+  end
+end
+
+function MDNS.discover_service_info(host, service_name, fallback_port, label, callback)
+  if not host or host == "" then
+    callback(fallback_port and { port = fallback_port } or nil)
+    return
+  end
+
+  if not (has_c4() and C4.CreateNetworkConnection and C4.NetConnect and C4.SendToNetwork) then
+    callback(fallback_port and { port = fallback_port } or nil)
+    return
+  end
+
+  MDNS.close()
+  RFN = RFN or {}
+  OCS = OCS or {}
+  local binding = MDNS.allocate_binding()
+  MDNS.host = host
+  MDNS.pending_callback = callback
+  MDNS.pending_fallback_port = fallback_port
+  MDNS.pending_label = label
+  MDNS.pending_cache_companion_port = service_name == MDNS.SERVICE
+  MDNS.pending_info_callback = true
+
+  RFN[binding] = function(_, _, data)
+    local info = MDNS.parse_service_info(data, service_name)
+    if info and (info.port or (info.txt and next(info.txt) ~= nil)) then
+      MDNS.finish(info, "mdns")
+    end
+  end
+
+  OCS[binding] = function(_, _, status)
+    if status == "ONLINE" then
+      Log.debug(tostring(label or "mDNS") .. " query requested: host=" .. tostring(host) ..
+        " service=" .. tostring(service_name))
+      C4:SendToNetwork(binding, MDNS.PORT, MDNS.build_query(service_name))
+    end
+  end
+
+  Log.debug(tostring(label or "mDNS") .. " discovery starting: host=" .. tostring(host))
+  C4:CreateNetworkConnection(binding, host)
+  C4:NetConnect(binding, MDNS.PORT, "UDP")
+
+  if type(SetTimer) == "function" then
+    MDNS.timeout_timer = "AppleTV_mdns_timeout"
+    SetTimer(MDNS.timeout_timer, 1500, function()
+      Log.debug(tostring(label or "mDNS") .. " discovery timed out")
+      MDNS.finish(nil, "timeout")
+    end)
+  end
+end
+
+function MDNS.discover_service_port(host, service_name, fallback_port, label, callback)
+  return MDNS.discover_service_info(host, service_name, fallback_port, label, function(info)
+    callback((info and info.port) or fallback_port)
+  end)
+end
+
+function MDNS.discover_companion_port(host, callback)
+  return MDNS.discover_service_port(host, MDNS.SERVICE, MDNS.cached_port(host), "Companion mDNS", callback)
+end
+
+function MDNS.discover_mrp_port(host, callback)
+  return MDNS.discover_service_port(host, MDNS.MRP_SERVICE, nil, "MRP mDNS", callback)
+end
+
+function MDNS.discover_airplay_info(host, callback)
+  return MDNS.discover_service_info(host, MDNS.AIRPLAY_SERVICE, nil, "AirPlay mDNS", callback)
+end
+
 function Bytes.uint_le(value, length)
   assert(value >= 0 and value == math.floor(value), "integer required")
   local out = {}
@@ -2012,7 +2337,7 @@ function Credentials.parse(detail_string)
     parts[#parts + 1] = part
   end
 
-  assert(#parts == 4, "Companion credentials must be pyatv HAP credentials: ltpk:ltsk:atv_id:client_id")
+  assert(#parts == 4, "credentials must be HAP credentials: ltpk:ltsk:atv_id:client_id")
 
   local credentials = {
     ltpk = Bytes.from_hex(parts[1]),
@@ -3080,6 +3405,12 @@ local Companion = {
   now_playing = {},
 }
 
+local AirPlay = {
+  port = nil,
+  txt = {},
+  credentials = nil,
+}
+
 function Companion.next_x()
   Companion.tx = Companion.tx + 1
   return Companion.tx
@@ -3485,6 +3816,7 @@ function CompanionClient.new(options)
     on_message = options.on_message,
     on_paired = options.on_paired,
     on_pair_setup_m2 = options.on_pair_setup_m2,
+    on_connection_refused = options.on_connection_refused,
   }, { __index = CompanionClient })
 end
 
@@ -3663,6 +3995,9 @@ function CompanionClient:connect(host, port)
       self.transport = nil
       self:clear_runtime_state({ clear_pending_commands = false })
       self:set_state("ERROR: " .. tostring(err_code) .. " " .. tostring(err_msg))
+      if tostring(err_code) == "111" and self.on_connection_refused then
+        self.on_connection_refused(self, err_code, err_msg)
+      end
     end)
     :Connect(self.host, self.port)
 
@@ -3674,6 +4009,7 @@ function CompanionClient:on_connected(transport)
   self.transport = transport
   self.connecting = false
   self.connected = true
+  self._port_rediscover_attempted = false
   self.last_rx_ms = nil
   self.last_tx_ms = nil
   self:set_state("CONNECTED")
@@ -4617,6 +4953,96 @@ function C4Driver.refresh_app_list()
   return Companion.fetch_apps()
 end
 
+function C4Driver.probe_metadata_service()
+  local host = Properties and Properties["Apple TV Address"]
+  if not host or host == "" then
+    Log.error("Apple TV Address is required")
+    return nil, "Apple TV Address is required"
+  end
+  Log.debug("MRP metadata service probe requested")
+  return MDNS.discover_mrp_port(host, function(port)
+    if port then
+      Log.debug("MRP metadata service available: host=" .. tostring(host) ..
+        " port=" .. tostring(port))
+      C4Driver.update_property("Connection State", "MRP Metadata Port " .. tostring(port))
+    else
+      Log.debug("MRP metadata service not discovered; metadata may require tunneled media remote")
+      C4Driver.update_property("Connection State", "MRP Metadata Not Found")
+    end
+  end)
+end
+
+function C4Driver.render_airplay_txt(txt)
+  if type(txt) ~= "table" then return "" end
+  local keys = {
+    "deviceid", "features", "fex", "flags", "model", "osvers", "protovers",
+    "srcvers", "vv", "pi", "psi", "pk", "acl", "gcgl", "igl",
+  }
+  local parts = {}
+  for _, key in ipairs(keys) do
+    local value = txt[key]
+    if value ~= nil then
+      parts[#parts + 1] = key .. "=" .. tostring(value)
+    end
+  end
+  return table.concat(parts, " ")
+end
+
+function C4Driver.probe_airplay_service()
+  local host = Properties and Properties["Apple TV Address"]
+  if not host or host == "" then
+    Log.error("Apple TV Address is required")
+    return nil, "Apple TV Address is required"
+  end
+  Log.debug("AirPlay service probe requested")
+  return MDNS.discover_airplay_info(host, function(info)
+    if info and info.port then
+      local txt = info.txt or {}
+      AirPlay.port = info.port
+      AirPlay.txt = txt
+      Log.debug("AirPlay service available: host=" .. tostring(host) ..
+        " port=" .. tostring(info.port) ..
+        " txt={" .. C4Driver.render_airplay_txt(txt) .. "}")
+      C4Driver.update_property("Connection State", "AirPlay Port " .. tostring(info.port))
+    else
+      Log.debug("AirPlay service not discovered")
+      C4Driver.update_property("Connection State", "AirPlay Not Found")
+    end
+  end)
+end
+
+function C4Driver.import_airplay_credentials(detail_string)
+  assert(type(detail_string) == "string" and detail_string ~= "", "AirPlay credentials are required")
+  local credentials = Credentials.parse(detail_string)
+  local canonical = Credentials.stringify(credentials)
+
+  Driver.state = Driver.state or {}
+  Driver.state.airplay_credentials = canonical
+  AirPlay.credentials = credentials
+  Storage.save(Driver.state)
+  C4Driver.update_property("AirPlay Credentials", canonical)
+  C4Driver.set_connection_state("AirPlay Credentials Imported")
+  return credentials
+end
+
+function C4Driver.load_persisted_airplay_credentials()
+  local raw = Driver.state and Driver.state.airplay_credentials
+  if not raw or raw == "" then
+    return nil
+  end
+
+  local ok, credentials_or_err = pcall(Credentials.parse, raw)
+  if not ok then
+    Log.error("stored AirPlay credentials are invalid: " .. tostring(credentials_or_err))
+    return nil
+  end
+
+  AirPlay.credentials = credentials_or_err
+  C4Driver.update_property("AirPlay Credentials", raw)
+  Log.debug("AirPlay credentials loaded")
+  return credentials_or_err
+end
+
 function C4Driver.launch_selected_app()
   local selection = Properties and Properties["Selected App"] or ""
   local app_id, err = Companion.resolve_app_selection(selection)
@@ -4671,8 +5097,10 @@ function C4Driver.reset_pairing()
   end
   Driver.state = Driver.state or {}
   Driver.state.companion_credentials = nil
+  Driver.state.airplay_credentials = nil
   Driver.state.app_list = nil
   Companion.credentials = nil
+  AirPlay.credentials = nil
   Companion.session = nil
   Companion.socket = nil
   Companion.client = nil
@@ -4688,11 +5116,13 @@ function C4Driver.reset_pairing()
   C4Driver.update_property_list("Selected App", { "" })
   C4Driver.update_property("Current App", "")
   C4Driver.update_property("Now Playing", "")
+  C4Driver.update_property("AirPlay Credentials", "")
   C4Driver.set_connection_state("Disconnected")
 end
 
 function C4Driver.disconnect_companion()
   C4Driver.cancel_timer("AppleTV_crypto_prewarm_x25519")
+  MDNS.close()
   OpenSSLCrypto._pregenerated_x25519_keypair = nil
   if Companion.client and Companion.client.close then
     Companion.client:close()
@@ -4706,11 +5136,39 @@ end
 function C4Driver.ensure_companion_client()
   if Companion.client then
     if Companion.client.needs_reconnect and Companion.client:needs_reconnect() then
-      Companion.client:connect()
+      local host = Companion.client.host
+      if MDNS.has_cached_port(host) then
+        Companion.client.port = MDNS.cached_port(host)
+        Companion.client:connect()
+      else
+        Log.debug("Companion reconnect waiting for Companion port discovery")
+        MDNS.discover_companion_port(host, function(port)
+          if not Companion.client then return end
+          Companion.client.port = port or MDNS.DEFAULT_COMPANION_PORT
+          Companion.client:connect()
+        end)
+      end
     end
     return Companion.client
   end
   return C4Driver.connect_companion()
+end
+
+function C4Driver.start_companion_client(client, host, label)
+  if MDNS.has_cached_port(host) then
+    client.port = MDNS.cached_port(host)
+    client:connect()
+    return
+  end
+
+  Log.debug((label or "Companion") .. " waiting for Companion port discovery")
+  MDNS.discover_companion_port(host, function(port)
+    if Companion.client ~= client then return end
+    client.port = port or MDNS.DEFAULT_COMPANION_PORT
+    Log.debug((label or "Companion") .. " connecting after port discovery: port=" ..
+      tostring(client.port))
+    client:connect()
+  end)
 end
 
 function C4Driver.connect_companion()
@@ -4728,7 +5186,7 @@ function C4Driver.connect_companion()
 
   local client = CompanionClient.new({
     host = host,
-    port = Companion.port,
+    port = MDNS.cached_port(host),
     credentials = credentials,
     crypto = Crypto,
     on_state = function(state)
@@ -4737,10 +5195,26 @@ function C4Driver.connect_companion()
     on_message = function(message)
       C4Driver.handle_companion_message(message)
     end,
+    on_connection_refused = function(refused_client)
+      if refused_client._port_rediscover_attempted then
+        Log.debug("Companion TCP refused after rediscovery; not retrying again")
+        return
+      end
+      refused_client._port_rediscover_attempted = true
+      MDNS.invalidate(host)
+      Log.debug("Companion TCP refused; rediscovering Companion port")
+      MDNS.discover_companion_port(host, function(port)
+        if Companion.client ~= refused_client then return end
+        refused_client.port = port or MDNS.DEFAULT_COMPANION_PORT
+        Log.debug("Companion retrying TCP connect after port discovery: port=" ..
+          tostring(refused_client.port))
+        refused_client:connect()
+      end)
+    end,
   })
   Companion.client = client
   Companion.socket = client
-  client:connect()
+  C4Driver.start_companion_client(client, host, "Companion")
   return client
 end
 
@@ -4753,10 +5227,26 @@ function C4Driver.pair_companion()
   end
   local client = CompanionClient.new({
     host = host,
-    port = Companion.port,
+    port = MDNS.cached_port(host),
     crypto = Crypto,
     on_state = function(state) C4Driver.set_connection_state(state) end,
     on_message = function(message) C4Driver.handle_companion_message(message) end,
+    on_connection_refused = function(refused_client)
+      if refused_client._port_rediscover_attempted then
+        Log.debug("Pair-Setup TCP refused after rediscovery; not retrying again")
+        return
+      end
+      refused_client._port_rediscover_attempted = true
+      MDNS.invalidate(host)
+      Log.debug("Pair-Setup TCP refused; rediscovering Companion port")
+      MDNS.discover_companion_port(host, function(port)
+        if Companion.client ~= refused_client then return end
+        refused_client.port = port or MDNS.DEFAULT_COMPANION_PORT
+        Log.debug("Pair-Setup retrying TCP connect after port discovery: port=" ..
+          tostring(refused_client.port))
+        refused_client:connect()
+      end)
+    end,
     on_pair_setup_m2 = function()
       C4Driver.set_connection_state("Enter PIN from Apple TV")
     end,
@@ -4767,7 +5257,7 @@ function C4Driver.pair_companion()
   })
   Companion.client = client
   Companion.socket = client
-  client:connect()
+  C4Driver.start_companion_client(client, host, "Pair-Setup")
   client:request_pair_setup()
   return client
 end
@@ -4874,6 +5364,8 @@ function C4Driver.cancel_driver_timers()
   C4Driver.cancel_timer("AppleTV_crypto_prewarm_atv")
   C4Driver.cancel_timer("AppleTV_crypto_prewarm_x25519")
   C4Driver.cancel_timer("AppleTV_reselect_passthrough")
+  C4Driver.cancel_timer("AppleTV_mdns_timeout")
+  MDNS.close()
 end
 
 -- EC: Composer action and command dispatch (DCP normalises spaces→underscores and handles LUA_ACTION)
@@ -4901,8 +5393,17 @@ end
 EC.PREWARM_CRYPTO = function()
   return C4Driver.prewarm_crypto()
 end
+EC.PROBE_METADATA_SERVICE = function()
+  return C4Driver.probe_metadata_service()
+end
+EC.PROBE_AIRPLAY_SERVICE = function()
+  return C4Driver.probe_airplay_service()
+end
 EC.IMPORT_COMPANION_CREDENTIALS = function(params)
   return C4Driver.import_credentials(params.CREDENTIALS or params.credentials or "")
+end
+EC.IMPORT_AIRPLAY_CREDENTIALS = function(params)
+  return C4Driver.import_airplay_credentials(params.CREDENTIALS or params.credentials or "")
 end
 EC.PAIR_COMPANION = function()
   return C4Driver.pair_companion()
@@ -4918,6 +5419,7 @@ function C4Driver.init()
   C4Driver.update_property("Driver Version", Driver.VERSION)
   C4Driver.publish_app_list()
   C4Driver.load_persisted_credentials()
+  C4Driver.load_persisted_airplay_credentials()
   C4MiniApps.PASSTHROUGH_PROXY = 5001
   C4MiniApps.SWITCHER_PROXY = 5002
   C4MiniApps.USES_DEDICATED_SWITCHER = true
@@ -4956,6 +5458,15 @@ OPC.Pairing_PIN = function(value)
       if not ok then
         Log.error("PIN submission failed: " .. tostring(err))
       end
+    end
+  end
+end
+
+OPC.AirPlay_Credentials = function(value)
+  if value and value ~= "" and value ~= (Driver.state and Driver.state.airplay_credentials) then
+    local ok, err = pcall(function() C4Driver.import_airplay_credentials(value) end)
+    if not ok then
+      Log.error("AirPlay credentials import failed: " .. tostring(err))
     end
   end
 end
@@ -5001,6 +5512,7 @@ end
 
 Driver.Log = Log
 Driver.Bytes = Bytes
+Driver.MDNS = MDNS
 Driver.TLV8 = TLV8
 Driver.OPACK = OPACK
 Driver.BigInt = BigInt
@@ -5009,6 +5521,7 @@ Driver.CompanionFrame = CompanionFrame
 Driver.CompanionSession = CompanionSession
 Driver.CompanionClient = CompanionClient
 Driver.Companion = Companion
+Driver.AirPlay = AirPlay
 Driver.PairVerify = PairVerify
 Driver.PairSetup = PairSetup
 Driver.Crypto = Crypto

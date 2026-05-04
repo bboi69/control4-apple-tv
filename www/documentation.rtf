@@ -37,13 +37,14 @@ This driver controls Apple TV directly over the Apple TV remote-control protocol
 {\pntext\f0 -\tab}App List and App Count: latest launchable-app data returned by Refresh App List.\par
 {\pntext\f0 -\tab}Selected App: dynamic list populated from the Apple TV app list. Use Launch Selected App to launch the selected row.\par
 {\pntext\f0 -\tab}Pairing PIN: enter the Apple TV PIN here after running Pair Apple TV.\par
+{\pntext\f0 -\tab}AirPlay Credentials: optional credentials for the separate metadata tunnel path. Leave blank unless importing credentials from an existing setup or a future AirPlay pairing flow.\par
 {\pntext\f0 -\tab}Passthrough Mode: when On, MiniApp launches return selection to the main Apple TV device so remote commands keep controlling Apple TV.\par
 {\pntext\f0 -\tab}Debug Mode: when On, driver diagnostic messages are printed to the Lua output tab.\par
 \pard\par
 \b Button Mapping\b0\par
 The MENU, GUIDE, INFO, CANCEL, PVR, STAR, POUND, and RECORD Button properties let installers map remote buttons to Apple TV actions. Available actions are Home, Menu, Back, Guide, Select, Play/Pause, Dashboard (Hold TV Button), and Do Nothing.\par
 \par
-Back and Menu both use the Apple TV menu/back HID command. Dashboard uses a hold-style Home command. Button Hold Threshold is reserved for hold behavior tuning and defaults to 400 ms.\par
+Back and Menu both use the Apple TV menu/back HID command. Dashboard uses the Apple TV Home command.\par
 \par
 \b Actions\b0\par
 \pard{\pntext\f0 -\tab}{\*\pn\pnlvlblt\pnf0\pnindent360}\fi-360\li720 Refresh App List: requests launchable apps from the Apple TV and updates App List, App Count, and Selected App.\par
@@ -52,6 +53,8 @@ Back and Menu both use the Apple TV menu/back HID command. Dashboard uses a hold
 {\pntext\f0 -\tab}Disconnect Apple TV: sends cleanup commands and closes the connection.\par
 {\pntext\f0 -\tab}Check Crypto Provider: verifies X25519, HMAC-SHA512, HKDF-SHA512, SRP modpow, ChaCha20-Poly1305, secure random, and Ed25519 support.\par
 {\pntext\f0 -\tab}Prewarm Crypto: manually runs the same crypto prewarm normally scheduled after driver load.\par
+{\pntext\f0 -\tab}Probe Metadata Service: checks whether the Apple TV advertises a direct media metadata service and logs the discovered port if available.\par
+{\pntext\f0 -\tab}Probe AirPlay Service: checks whether the Apple TV advertises AirPlay and logs the port plus key service fields used to evaluate metadata tunneling support.\par
 {\pntext\f0 -\tab}Pair Apple TV: starts native Apple TV Pair-Setup.\par
 {\pntext\f0 -\tab}Reset Pairing: clears saved credentials so the Apple TV can be paired again.\par
 \pard\par

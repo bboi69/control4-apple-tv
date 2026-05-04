@@ -19,6 +19,32 @@ local function bytes_range(first_value, last_value)
   return table.concat(out)
 end
 
+local function dns_name(name)
+  local out = {}
+  for label in tostring(name):gmatch("[^%.]+") do
+    out[#out + 1] = string.char(#label)
+    out[#out + 1] = label
+  end
+  out[#out + 1] = "\0"
+  return table.concat(out)
+end
+
+local function u16be(value)
+  return string.char(math.floor(value / 0x100) % 0x100, value % 0x100)
+end
+
+local function u32be(value)
+  return u16be(math.floor(value / 0x10000) % 0x10000) .. u16be(value % 0x10000)
+end
+
+local function dns_txt(items)
+  local out = {}
+  for _, item in ipairs(items) do
+    out[#out + 1] = string.char(#item) .. item
+  end
+  return table.concat(out)
+end
+
 local function assert_contains(list, expected, label)
   for _, value in ipairs(list) do
     if value == expected then
@@ -407,6 +433,77 @@ function tests.frame_roundtrip()
   assert_eq(decoded.length, 3, "frame length")
   assert_eq(decoded.payload, "abc", "frame payload")
   assert_eq(rest, "tail", "frame rest")
+end
+
+function tests.mdns_parses_companion_srv_port()
+  local service = "_companion-link._tcp.local"
+  local instance = "Office Apple TV._companion-link._tcp.local"
+  local question = dns_name(service) .. u16be(12) .. u16be(0x8001)
+  local ptr_rdata = dns_name(instance)
+  local srv_rdata = u16be(0) .. u16be(0) .. u16be(49222) .. dns_name("Office-Apple-TV.local")
+  local response = table.concat({
+    u16be(0), u16be(0x8400), u16be(1), u16be(2), u16be(0), u16be(0),
+    question,
+    string.char(0xC0, 0x0C), u16be(12), u16be(1), u32be(120), u16be(#ptr_rdata), ptr_rdata,
+    dns_name(instance), u16be(33), u16be(1), u32be(120), u16be(#srv_rdata), srv_rdata,
+  })
+
+  assert_eq(Driver.MDNS.parse_companion_port(response), 49222, "companion SRV port")
+end
+
+function tests.mdns_parses_mrp_srv_port()
+  local service = "_mediaremotetv._tcp.local"
+  local instance = "Office Apple TV._mediaremotetv._tcp.local"
+  local question = dns_name(service) .. u16be(12) .. u16be(0x8001)
+  local ptr_rdata = dns_name(instance)
+  local srv_rdata = u16be(0) .. u16be(0) .. u16be(49154) .. dns_name("Office-Apple-TV.local")
+  local response = table.concat({
+    u16be(0), u16be(0x8400), u16be(1), u16be(2), u16be(0), u16be(0),
+    question,
+    string.char(0xC0, 0x0C), u16be(12), u16be(1), u32be(120), u16be(#ptr_rdata), ptr_rdata,
+    dns_name(instance), u16be(33), u16be(1), u32be(120), u16be(#srv_rdata), srv_rdata,
+  })
+
+  assert_eq(Driver.MDNS.parse_service_port(response, service), 49154, "mrp SRV port")
+  assert_eq(Driver.MDNS.parse_companion_port(response), nil, "mrp response is not companion port")
+end
+
+function tests.mdns_parses_airplay_srv_and_txt()
+  local service = "_airplay._tcp.local"
+  local instance = "Office Apple TV._airplay._tcp.local"
+  local question = dns_name(service) .. u16be(12) .. u16be(0x8001)
+  local ptr_rdata = dns_name(instance)
+  local srv_rdata = u16be(0) .. u16be(0) .. u16be(7000) .. dns_name("Office-Apple-TV.local")
+  local txt_rdata = dns_txt({
+    "deviceid=AA:BB:CC:DD:EE:FF",
+    "features=0x4A7FDFD5,0x3C155FDE",
+    "model=AppleTV14,1",
+    "srcvers=750.0",
+    "vv=2",
+  })
+  local response = table.concat({
+    u16be(0), u16be(0x8400), u16be(1), u16be(3), u16be(0), u16be(0),
+    question,
+    string.char(0xC0, 0x0C), u16be(12), u16be(1), u32be(120), u16be(#ptr_rdata), ptr_rdata,
+    dns_name(instance), u16be(33), u16be(1), u32be(120), u16be(#srv_rdata), srv_rdata,
+    dns_name(instance), u16be(16), u16be(1), u32be(120), u16be(#txt_rdata), txt_rdata,
+  })
+
+  local info = Driver.MDNS.parse_service_info(response, service)
+  assert_eq(info.port, 7000, "airplay SRV port")
+  assert_eq(info.txt.deviceid, "AA:BB:CC:DD:EE:FF", "airplay TXT deviceid")
+  assert_eq(info.txt.model, "AppleTV14,1", "airplay TXT model")
+  assert_eq(info.txt.srcvers, "750.0", "airplay TXT source version")
+end
+
+function tests.mdns_cached_port_falls_back_to_default()
+  Driver.MDNS.invalidate("192.0.2.10")
+  assert_eq(Driver.MDNS.has_cached_port("192.0.2.10"), false, "no cached companion port")
+  assert_eq(Driver.MDNS.cached_port("192.0.2.10"), 49153, "default companion port")
+  Driver.MDNS.last_port_by_host["192.0.2.10"] = 49222
+  assert_eq(Driver.MDNS.has_cached_port("192.0.2.10"), true, "has cached companion port")
+  assert_eq(Driver.MDNS.cached_port("192.0.2.10"), 49222, "cached companion port")
+  Driver.MDNS.invalidate("192.0.2.10")
 end
 
 function tests.tlv8_roundtrip()
@@ -871,7 +968,7 @@ end
 
 function tests.driver_imports_and_resets_companion_credentials()
   local old_properties = Properties
-  Properties = { ["App List"] = "", ["App Count"] = "0", ["Selected App"] = "", ["Current App"] = "" }
+  Properties = { ["App List"] = "", ["App Count"] = "0", ["Selected App"] = "", ["Current App"] = "", ["AirPlay Credentials"] = "" }
   Driver._test_storage = {}
 
   local credentials = table.concat({
@@ -888,8 +985,36 @@ function tests.driver_imports_and_resets_companion_credentials()
 
   Driver.C4Driver.reset_pairing()
   assert_eq(Driver._test_storage.companion_credentials, nil, "reset credentials")
+  assert_eq(Driver._test_storage.airplay_credentials, nil, "reset airplay credentials")
   assert_eq(Driver.Companion.credentials, nil, "reset companion credentials")
+  assert_eq(Driver.AirPlay.credentials, nil, "reset airplay credentials table")
   assert_eq(Properties["Connection State"], "Disconnected", "reset state")
+
+  Properties = old_properties
+end
+
+function tests.driver_imports_and_loads_airplay_credentials()
+  local old_properties = Properties
+  Properties = { ["AirPlay Credentials"] = "", ["Connection State"] = "" }
+  Driver._test_storage = {}
+  Driver.state = Driver._test_storage
+
+  local credentials = table.concat({
+    Driver.Bytes.hex(bytes_range(0, 31)),
+    Driver.Bytes.hex(bytes_range(32, 63)),
+    Driver.Bytes.hex("AIRPLAY-ID"),
+    Driver.Bytes.hex("AIRPLAY-CLIENT"),
+  }, ":")
+
+  Driver.C4Driver.import_airplay_credentials(credentials)
+  assert_eq(Driver._test_storage.airplay_credentials, credentials, "stored airplay credentials")
+  assert_eq(Properties["AirPlay Credentials"], credentials, "airplay credentials property")
+  assert_eq(Properties["Connection State"], "AirPlay Credentials Imported", "airplay import state")
+  assert_eq(Driver.AirPlay.credentials.type, "HAP", "airplay credential type")
+
+  Driver.AirPlay.credentials = nil
+  Driver.C4Driver.load_persisted_airplay_credentials()
+  assert_eq(Driver.Bytes.hex(Driver.AirPlay.credentials.client_id), Driver.Bytes.hex("AIRPLAY-CLIENT"), "loaded airplay client id")
 
   Properties = old_properties
 end
