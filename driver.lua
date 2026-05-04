@@ -4381,7 +4381,10 @@ function Companion.update_from_message(message)
     changed.current_app = true
   end
 
-  local title = content.title or content._title or content.name
+  local title = content.title or content._title
+  if not title and message._i == "NowPlaying" then
+    title = content.name
+  end
   local artist = content.artist or content._artist
   local album = content.album or content._album
   if title or artist or album or content.duration or content.position then
@@ -6235,7 +6238,16 @@ function AirPlayEventChannelClient:receive(data)
     self.buffer = rest
     Log.debug("AirPlay event channel request: method=" .. tostring(request.method) ..
       " path=" .. tostring(request.path) ..
-      " cseq=" .. tostring(request.headers.CSeq or request.headers.cseq))
+      " cseq=" .. tostring(request.headers.CSeq or request.headers.cseq) ..
+      " body_len=" .. tostring(#(request.body or "")))
+    if request.body and request.body ~= "" then
+      local ok, decoded = pcall(BPlist.decode, request.body)
+      if ok then
+        Log.debug("AirPlay event channel plist payload: " .. BPlist.describe(decoded))
+      else
+        Log.debug("AirPlay event channel body head=" .. Bytes.hex(request.body:sub(1, 64)))
+      end
+    end
     self:send_response(request.headers.CSeq or request.headers.cseq, request.headers.Server or request.headers.server)
   end
 end
@@ -6724,11 +6736,16 @@ function C4Driver.handle_airplay_mrp_update(update)
   end
   if update.app_bundle or update.app_name then
     local identifier = update.app_bundle or update.app_name
+    local changed_app = not Companion.current_app or Companion.current_app.identifier ~= identifier
     Companion.current_app = {
       identifier = identifier,
       name = Companion.app_name_for_bundle(identifier) or update.app_name or identifier,
     }
     C4Driver.publish_current_app()
+    if changed_app and not (update.title or update.artist or update.album) then
+      Companion.now_playing = {}
+      C4Driver.publish_now_playing()
+    end
   end
   if update.title or update.artist or update.album then
     Companion.now_playing = {

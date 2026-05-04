@@ -2353,6 +2353,22 @@ function tests.app_list_current_app_and_now_playing_are_published()
   })
   assert_eq(Properties["Now Playing"], "Episode One - A Show - Season 1", "now playing property")
 
+  Driver.C4Driver.handle_companion_message({
+    _i = "_iMC",
+    _t = 1,
+    _c = {
+      name = "Office",
+    },
+  })
+  assert_eq(Properties["Now Playing"], "Episode One - A Show - Season 1", "generic Companion name does not replace now playing")
+
+  Driver.C4Driver.handle_airplay_mrp_update({
+    app_bundle = "com.apple.TVWatchList",
+    app_name = "Apple TV",
+  })
+  assert_eq(Properties["Current App"], "Apple TV | com.apple.TVWatchList", "MRP app-only update changes current app")
+  assert_eq(Properties["Now Playing"], "", "MRP app-only update clears stale now playing")
+
   local client = Driver.PB.field_string(2, "com.att.tv") .. Driver.PB.field_string(7, "DIRECTV")
   local path = Driver.PB.field_message(2, client)
   local now_playing = Driver.PB.field_string(2, "Channel 12") .. Driver.PB.field_string(9, "Live TV")
