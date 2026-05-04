@@ -5011,6 +5011,63 @@ function C4Driver.probe_airplay_service()
   end)
 end
 
+function C4Driver.probe_airplay_info()
+  local host = Properties and Properties["Apple TV Address"]
+  if not host or host == "" then
+    Log.error("Apple TV Address is required")
+    return nil, "Apple TV Address is required"
+  end
+
+  local function request_info(port)
+    port = port or AirPlay.port or 7000
+    local url = "http://" .. tostring(host) .. ":" .. tostring(port) .. "/info"
+    if not (has_c4() and C4.urlGet) then
+      Log.error("AirPlay /info probe requires Control4 HTTP client")
+      return nil, "Control4 HTTP client unavailable"
+    end
+
+    Log.debug("AirPlay /info probe requested: " .. url)
+    local headers = {
+      ["User-Agent"] = "AirPlay/550.10",
+      ["Connection"] = "keep-alive",
+    }
+    return C4:urlGet(url, headers, false, function(_, body, response_code, response_headers, error_text)
+      if error_text ~= nil then
+        Log.error("AirPlay /info probe failed: " .. tostring(error_text))
+        C4Driver.update_property("Connection State", "AirPlay Info Failed")
+        return
+      end
+
+      body = body or ""
+      local content_type = ""
+      if type(response_headers) == "table" then
+        content_type = response_headers["Content-Type"] or response_headers["content-type"] or ""
+      end
+      Log.debug("AirPlay /info response: code=" .. tostring(response_code) ..
+        " content_type=" .. tostring(content_type) ..
+        " body_len=" .. tostring(#body) ..
+        " body_head=" .. Bytes.hex(body:sub(1, 32)))
+      C4Driver.update_property("Connection State", "AirPlay Info " .. tostring(response_code))
+    end)
+  end
+
+  if AirPlay.port then
+    return request_info(AirPlay.port)
+  end
+
+  Log.debug("AirPlay /info probe waiting for AirPlay port discovery")
+  return MDNS.discover_airplay_info(host, function(info)
+    if info and info.port then
+      AirPlay.port = info.port
+      AirPlay.txt = info.txt or {}
+      request_info(info.port)
+    else
+      Log.debug("AirPlay /info probe skipped: AirPlay service not discovered")
+      C4Driver.update_property("Connection State", "AirPlay Not Found")
+    end
+  end)
+end
+
 function C4Driver.import_airplay_credentials(detail_string)
   assert(type(detail_string) == "string" and detail_string ~= "", "AirPlay credentials are required")
   local credentials = Credentials.parse(detail_string)
@@ -5398,6 +5455,9 @@ EC.PROBE_METADATA_SERVICE = function()
 end
 EC.PROBE_AIRPLAY_SERVICE = function()
   return C4Driver.probe_airplay_service()
+end
+EC.PROBE_AIRPLAY_INFO = function()
+  return C4Driver.probe_airplay_info()
 end
 EC.IMPORT_COMPANION_CREDENTIALS = function(params)
   return C4Driver.import_credentials(params.CREDENTIALS or params.credentials or "")

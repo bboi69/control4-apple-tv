@@ -1019,6 +1019,35 @@ function tests.driver_imports_and_loads_airplay_credentials()
   Properties = old_properties
 end
 
+function tests.airplay_info_probe_uses_cached_port_and_updates_state()
+  local old_c4 = C4
+  local old_properties = Properties
+  local old_port = Driver.AirPlay.port
+  local requested_url = nil
+  Properties = { ["Apple TV Address"] = "192.0.2.55", ["Connection State"] = "" }
+  Driver.AirPlay.port = 7000
+  C4 = {
+    UpdateProperty = function(_, name, value)
+      Properties[name] = value
+    end,
+    urlGet = function(_, url, headers, _, callback)
+      requested_url = url
+      assert_eq(headers["User-Agent"], "AirPlay/550.10", "airplay info user agent")
+      callback(1, "bplist-body", 200, { ["Content-Type"] = "application/x-apple-binary-plist" }, nil)
+      return 123
+    end,
+  }
+
+  local ticket = Driver.C4Driver.probe_airplay_info()
+  assert_eq(ticket, 123, "airplay info ticket")
+  assert_eq(requested_url, "http://192.0.2.55:7000/info", "airplay info URL")
+  assert_eq(Properties["Connection State"], "AirPlay Info 200", "airplay info state")
+
+  C4 = old_c4
+  Properties = old_properties
+  Driver.AirPlay.port = old_port
+end
+
 function tests.crypto_provider_failure_logs_without_last_error_property()
   local old_properties = Properties
   local old_provider = Driver.Crypto.provider
