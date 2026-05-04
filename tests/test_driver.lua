@@ -802,36 +802,63 @@ function tests.companion_client_pair_verify_enables_encrypted_session()
   local ack_payload = Driver.OPACK.encode(Driver.OPACK.dict({
     { "_pd", Driver.OPACK.bytes(Driver.TLV8.encode_ordered({ { 6, string.char(0x04) } })) },
   }))
-  client:receive(Driver.CompanionFrame.encode(Driver.CompanionFrame.PV_NEXT, ack_payload))
-
-  assert_eq(states[4], "READY", "ready state")
-  assert_eq(states[5], "SESSION_STARTING", "session starting state")
-  assert(client.session ~= nil, "session enabled")
-  assert_eq(Driver.Companion.session, client.session, "global session")
-  assert_eq(Driver.Companion.socket, client, "global socket")
-  assert_eq(client.session_local_sid, 0x12345678, "local sid from crypto random")
-
-  local second = Driver.CompanionFrame.try_decode(writes[2])
-  local tlv = Driver.PairVerify.decode_pairing_data(second.payload)
+	  client:receive(Driver.CompanionFrame.encode(Driver.CompanionFrame.PV_NEXT, ack_payload))
+	
+	  assert_eq(states[4], "READY", "ready state")
+	  assert(client.session ~= nil, "session enabled")
+	  assert_eq(Driver.Companion.session, client.session, "global session")
+	  assert_eq(Driver.Companion.socket, client, "global socket")
+	
+	  local second = Driver.CompanionFrame.try_decode(writes[2])
+	  local tlv = Driver.PairVerify.decode_pairing_data(second.payload)
   assert_eq(tlv[6], string.char(0x03), "pair verify next seq")
   assert_eq(tlv[5], encrypted_response, "pair verify next encrypted")
 
-  local decoded_system_info = client.session:try_decode(writes[3])
-  local system_info_msg = Driver.OPACK.decode(decoded_system_info.payload)
-  assert_table_has(system_info_msg, "_i", "_systemInfo")
+	  local decoded_system_info = client.session:try_decode(writes[3])
+	  local system_info_msg = Driver.OPACK.decode(decoded_system_info.payload)
+	  assert_table_has(system_info_msg, "_i", "_systemInfo")
 
-  local decoded_touch_start = client.session:try_decode(writes[4])
-  local touch_start_msg = Driver.OPACK.decode(decoded_touch_start.payload)
-  assert_table_has(touch_start_msg, "_i", "_touchStart")
+	  client:receive(client.session:encode_frame(Driver.CompanionFrame.E_OPACK, Driver.OPACK.encode(Driver.OPACK.dict({
+	    { "_t", 3 },
+	    { "_c", Driver.OPACK.dict({}) },
+	    { "_x", system_info_msg._x },
+	  }))))
+	
+	  local decoded_touch_start = client.session:try_decode(writes[4])
+	  local touch_start_msg = Driver.OPACK.decode(decoded_touch_start.payload)
+	  assert_table_has(touch_start_msg, "_i", "_touchStart")
 
-  local decoded_start_frame = client.session:try_decode(writes[5])
-  local start_msg = Driver.OPACK.decode(decoded_start_frame.payload)
-  assert_table_has(start_msg, "_i", "_sessionStart")
-  assert_table_has(start_msg._c, "_srvT", "com.apple.tvremoteservices")
-  assert_eq(start_msg._c._sid, client.session_local_sid, "session start sid matches local sid")
+	  client:receive(client.session:encode_frame(Driver.CompanionFrame.E_OPACK, Driver.OPACK.encode(Driver.OPACK.dict({
+	    { "_t", 3 },
+	    { "_c", Driver.OPACK.dict({}) },
+	    { "_x", touch_start_msg._x },
+	  }))))
+	
+	  local decoded_start_frame = client.session:try_decode(writes[5])
+	  local start_msg = Driver.OPACK.decode(decoded_start_frame.payload)
+	  assert_table_has(start_msg, "_i", "_sessionStart")
+	  assert_table_has(start_msg._c, "_srvT", "com.apple.tvremoteservices")
+	  assert_eq(start_msg._c._sid, client.session_local_sid, "session start sid matches local sid")
+	  assert_eq(states[5], "SESSION_STARTING", "session starting state")
+	  assert_eq(client.session_local_sid, 0x12345678, "local sid from crypto random")
 
-  local launch_request, launch_frame = client:launch_app("com.netflix.Netflix")
-  assert_table_has(launch_request, "_i", "_launchApp")
+	  client:receive(client.session:encode_frame(Driver.CompanionFrame.E_OPACK, Driver.OPACK.encode(Driver.OPACK.dict({
+	    { "_t", 3 },
+	    { "_c", Driver.OPACK.dict({ { "_sid", 0x87654321 } }) },
+	    { "_x", start_msg._x },
+	  }))))
+	  local ti_start_frame = client.session:try_decode(writes[6])
+	  local ti_start_msg = Driver.OPACK.decode(ti_start_frame.payload)
+	  assert_table_has(ti_start_msg, "_i", "_tiStart")
+
+	  client:receive(client.session:encode_frame(Driver.CompanionFrame.E_OPACK, Driver.OPACK.encode(Driver.OPACK.dict({
+	    { "_t", 3 },
+	    { "_c", Driver.OPACK.dict({}) },
+	    { "_x", ti_start_msg._x },
+	  }))))
+	
+	  local launch_request, launch_frame = client:launch_app("com.netflix.Netflix")
+	  assert_table_has(launch_request, "_i", "_launchApp")
   assert_eq(launch_frame:byte(1), Driver.CompanionFrame.E_OPACK, "encrypted launch frame type")
   assert_eq(#launch_frame, #Driver.Companion.encode_request_payload(launch_request) + 20, "encrypted launch frame length")
   local decoded_launch = client.session:try_decode(launch_frame)
@@ -1069,28 +1096,50 @@ function tests.session_start_response_advances_to_session_active()
   local ack_payload = Driver.OPACK.encode(Driver.OPACK.dict({
     { "_pd", Driver.OPACK.bytes(Driver.TLV8.encode_ordered({ { 6, string.char(0x04) } })) },
   }))
-  client:receive(Driver.CompanionFrame.encode(Driver.CompanionFrame.PV_NEXT, ack_payload))
-  assert_eq(states[5], "SESSION_STARTING", "session starting after pair-verify ack")
-
-  -- Simulate _sessionStart response from Apple TV (_t=3 is Response)
-  local remote_sid = 0xABCD1234
+	  client:receive(Driver.CompanionFrame.encode(Driver.CompanionFrame.PV_NEXT, ack_payload))
+	  local system_info_frame = client.session:try_decode(writes[3])
+	  local system_info = Driver.OPACK.decode(system_info_frame.payload)
+	  assert_table_has(system_info, "_i", "_systemInfo")
+	  client:receive(client.session:encode_frame(Driver.CompanionFrame.E_OPACK, Driver.OPACK.encode(Driver.OPACK.dict({
+	    { "_t", 3 },
+	    { "_c", Driver.OPACK.dict({}) },
+	    { "_x", system_info._x },
+	  }))))
+	  local touch_start_frame = client.session:try_decode(writes[4])
+	  local touch_start = Driver.OPACK.decode(touch_start_frame.payload)
+	  assert_table_has(touch_start, "_i", "_touchStart")
+	  client:receive(client.session:encode_frame(Driver.CompanionFrame.E_OPACK, Driver.OPACK.encode(Driver.OPACK.dict({
+	    { "_t", 3 },
+	    { "_c", Driver.OPACK.dict({}) },
+	    { "_x", touch_start._x },
+	  }))))
+	  assert_eq(states[5], "SESSION_STARTING", "session starting after sequential startup responses")
+	
+	  -- Simulate _sessionStart response from Apple TV (_t=3 is Response)
+	  local remote_sid = 0xABCD1234
   local session_response = Driver.OPACK.encode(Driver.OPACK.dict({
     { "_t", 3 },
     { "_c", Driver.OPACK.dict({ { "_sid", remote_sid } }) },
     { "_x", client.session_start_xid },
   }))
   local response_frame = client.session:encode_frame(Driver.CompanionFrame.E_OPACK, session_response)
-  client:receive(response_frame)
+	  client:receive(response_frame)
+	
+	  assert_eq(states[6], "SESSION_ACTIVE", "session active after _sessionStart response")
+	  assert_eq(client.session_remote_sid, remote_sid, "remote sid stored")
+	
+	  local ti_start_frame = client.session:try_decode(writes[#writes])
+	  local ti_start = Driver.OPACK.decode(ti_start_frame.payload)
+	  assert_table_has(ti_start, "_i", "_tiStart")
 
-  assert_eq(states[6], "SESSION_ACTIVE", "session active after _sessionStart response")
-  assert_eq(client.session_remote_sid, remote_sid, "remote sid stored")
-
-  local ti_start_frame = client.session:try_decode(writes[#writes - 1])
-  local ti_start = Driver.OPACK.decode(ti_start_frame.payload)
-  assert_table_has(ti_start, "_i", "_tiStart")
-
-  local interest_frame = client.session:try_decode(writes[#writes])
-  local interest = Driver.OPACK.decode(interest_frame.payload)
+	  client:receive(client.session:encode_frame(Driver.CompanionFrame.E_OPACK, Driver.OPACK.encode(Driver.OPACK.dict({
+	    { "_t", 3 },
+	    { "_c", Driver.OPACK.dict({}) },
+	    { "_x", ti_start._x },
+	  }))))
+	
+	  local interest_frame = client.session:try_decode(writes[#writes])
+	  local interest = Driver.OPACK.decode(interest_frame.payload)
   assert_table_has(interest, "_i", "_interest")
   assert_eq(interest._t, 1, "interest is event message")
 end
@@ -1148,17 +1197,32 @@ function tests.session_stop_sent_on_close()
   }))
   client:receive(Driver.CompanionFrame.encode(Driver.CompanionFrame.PV_NEXT, ack_payload))
 
-  -- Set remote_sid so _sessionStop is triggered on close
-  client.session_remote_sid = 0xDEADBEEF
+	  -- Set remote_sid so _sessionStop is triggered on close
+	  client.session_remote_sid = 0xDEADBEEF
+	  client.session_local_sid = client.session_local_sid or 0x12345678
 
   local local_sid = client.session_local_sid
-  local writes_before_close = #writes
-  client:close()
-  assert(#writes > writes_before_close, "_sessionStop was written before close")
-  local stop_frame = client.session:try_decode(writes[writes_before_close + 1])
-  local stop_msg = Driver.OPACK.decode(stop_frame.payload)
-  assert_table_has(stop_msg, "_i", "_sessionStop")
-  -- Verify the _sid was encoded as a 64-bit int (0x33 tag) by checking the raw payload bytes.
+	  local writes_before_close = #writes
+	  client:close()
+	  assert(#writes > writes_before_close, "_sessionStop was written before close")
+	  local stop_msg, stop_frame
+	  local saw_interest, saw_touch_stop, saw_ti_stop = false, false, false
+	  for i = writes_before_close + 1, #writes do
+	    local decoded = client.session:try_decode(writes[i])
+	    local msg = Driver.OPACK.decode(decoded.payload)
+	    if msg._i == "_interest" then saw_interest = true end
+	    if msg._i == "_touchStop" then saw_touch_stop = true end
+	    if msg._i == "_tiStop" then saw_ti_stop = true end
+	    if msg._i == "_sessionStop" then
+	      stop_msg = msg
+	      stop_frame = decoded
+	    end
+	  end
+	  assert(saw_interest, "_interest deregistration was written before close")
+	  assert(saw_touch_stop, "_touchStop was written before close")
+	  assert(saw_ti_stop, "_tiStop was written before close")
+	  assert(stop_msg, "_sessionStop was written before close")
+	  -- Verify the _sid was encoded as a 64-bit int (0x33 tag) by checking the raw payload bytes.
   -- OPACK.decode returns a number for 0x33, not the int64 table; check encoded bytes directly.
   local payload = stop_frame.payload
   assert(payload:find("\x33", 1, true) ~= nil, "_sessionStop payload contains 0x33 int64 tag")

@@ -141,21 +141,35 @@ local ack_frame = Driver.CompanionFrame.encode(Driver.CompanionFrame.PV_NEXT, ac
 assert(accepted:send(ack_frame))
 client:receive(read_exact(transport, #ack_frame))
 assert_eq(states[4], "READY", "ready state")
-assert_eq(states[5], "SESSION_STARTING", "session starting state")
 
 frame_type, payload = read_frame(accepted)
 local system_info = decode_encrypted_message(client.session, frame_type, payload)
 assert_eq(system_info._i, "_systemInfo", "system info identifier")
+local system_info_response = client.session:encode_frame(Driver.CompanionFrame.E_OPACK, Driver.OPACK.encode(Driver.OPACK.dict({
+  { "_t", 3 },
+  { "_c", Driver.OPACK.dict({}) },
+  { "_x", system_info._x },
+})))
+assert(accepted:send(system_info_response))
+client:receive(read_exact(transport, #system_info_response))
 
 frame_type, payload = read_frame(accepted)
 local touch_start = decode_encrypted_message(client.session, frame_type, payload)
 assert_eq(touch_start._i, "_touchStart", "touch start identifier")
+local touch_start_response = client.session:encode_frame(Driver.CompanionFrame.E_OPACK, Driver.OPACK.encode(Driver.OPACK.dict({
+  { "_t", 3 },
+  { "_c", Driver.OPACK.dict({}) },
+  { "_x", touch_start._x },
+})))
+assert(accepted:send(touch_start_response))
+client:receive(read_exact(transport, #touch_start_response))
 
 frame_type, payload = read_frame(accepted)
 local session_start = decode_encrypted_message(client.session, frame_type, payload)
 assert_eq(session_start._i, "_sessionStart", "session start identifier")
 assert_eq(session_start._c._srvT, "com.apple.tvremoteservices", "session start service")
 assert_eq(session_start._c._sid, client.session_local_sid, "session start local sid")
+assert_eq(states[5], "SESSION_STARTING", "session starting state")
 
 local session_response_payload = Driver.OPACK.encode(Driver.OPACK.dict({
   { "_t", 3 },
@@ -170,6 +184,13 @@ assert_eq(states[6], "SESSION_ACTIVE", "session active state")
 frame_type, payload = read_frame(accepted)
 local ti_start = decode_encrypted_message(client.session, frame_type, payload)
 assert_eq(ti_start._i, "_tiStart", "text input start identifier")
+local ti_start_response = client.session:encode_frame(Driver.CompanionFrame.E_OPACK, Driver.OPACK.encode(Driver.OPACK.dict({
+  { "_t", 3 },
+  { "_c", Driver.OPACK.dict({}) },
+  { "_x", ti_start._x },
+})))
+assert(accepted:send(ti_start_response))
+client:receive(read_exact(transport, #ti_start_response))
 
 frame_type, payload = read_frame(accepted)
 local interest = decode_encrypted_message(client.session, frame_type, payload)

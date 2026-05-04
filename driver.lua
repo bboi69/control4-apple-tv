@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.18-dev",
+  VERSION = "0.1.19-dev",
 }
 
 local function has_c4()
@@ -2702,6 +2702,7 @@ local Companion = {
   tx = 0,
   socket = nil,
   sent_messages = {},
+  pending_commands = {},
   session = nil,
   credentials = nil,
   client = nil,
@@ -2785,6 +2786,10 @@ function Companion.encode_pair_setup_start()
 end
 
 function Companion.send_opack(identifier, content, message_type)
+  if Companion.client and Companion.client.send_or_queue_opack then
+    return Companion.client:send_or_queue_opack(identifier, content, message_type)
+  end
+
   local request, frame = Companion.encode_opack_request(identifier, content, message_type)
   Companion.sent_messages[#Companion.sent_messages + 1] = request
 
@@ -3001,6 +3006,10 @@ function CompanionClient.new(options)
     session_local_sid = nil,
     session_remote_sid = nil,
     session_start_xid = nil,
+    pending_responses = {},
+    pending_commands = {},
+    startup_steps = nil,
+    startup_index = 0,
     post_session_started = false,
     state = "DISCONNECTED",
     received_messages = {},
@@ -3051,10 +3060,28 @@ function CompanionClient:send(frame)
 end
 
 function CompanionClient:close()
+  if self.session then
+    pcall(function()
+      self:send_opack("_interest", {
+        _deregEvents = OPACK.array({ "_iMC" }),
+      }, 1)
+    end)
+  end
   if self.session and self.session_local_sid and self.session_remote_sid then
     local sid = OPACK.int64(self.session_remote_sid, self.session_local_sid)
     pcall(function()
-      self:send_opack("_sessionStop", { _sid = sid }, 2)
+      self:send_opack("_sessionStop", {
+        _srvT = "com.apple.tvremoteservices",
+        _sid = sid,
+      }, 2)
+    end)
+  end
+  if self.session then
+    pcall(function()
+      self:send_opack("_touchStop", { _i = 1 }, 2)
+    end)
+    pcall(function()
+      self:send_opack("_tiStop", {}, 2)
     end)
   end
   if self.transport and self.transport.Close then
@@ -3153,7 +3180,9 @@ function CompanionClient:send_system_info()
     _sv = Driver.VERSION,
     model = "Control4",
     name = "Control4",
-  }, 2)
+  }, 2, function()
+    self:send_next_startup_step()
+  end)
 end
 
 function CompanionClient:start_touch()
@@ -3161,13 +3190,34 @@ function CompanionClient:start_touch()
     _height = 1000,
     _tFl = 0,
     _width = 1000,
-  }, 2)
+  }, 2, function()
+    self:send_next_startup_step()
+  end)
 end
 
 function CompanionClient:start_companion_services()
-  self:send_system_info()
-  self:start_touch()
-  self:start_session()
+  self.startup_steps = {
+    function() self:send_system_info() end,
+    function() self:start_touch() end,
+    function() self:start_session() end,
+    function() self:start_text_input() end,
+    function() self:subscribe_initial_events() end,
+  }
+  self.startup_index = 0
+  self:send_next_startup_step()
+end
+
+function CompanionClient:send_next_startup_step()
+  if not self.startup_steps then return end
+  self.startup_index = self.startup_index + 1
+  local step = self.startup_steps[self.startup_index]
+  if step then
+    step()
+    return
+  end
+  self.startup_steps = nil
+  self.startup_index = 0
+  self:flush_pending_commands()
 end
 
 function CompanionClient:start_session()
@@ -3181,18 +3231,33 @@ function CompanionClient:start_session()
   local request = self:send_opack("_sessionStart", {
     _srvT = "com.apple.tvremoteservices",
     _sid = self.session_local_sid,
-  }, 2)
+  }, 2, function(message)
+    if type(message._c) ~= "table" then
+      error("_sessionStart response missing content")
+    end
+    self.session_remote_sid = message._c._sid
+    self.session_start_xid = nil
+    self:set_state("SESSION_ACTIVE")
+    Log.debug("Companion session active, remote_sid=" .. tostring(self.session_remote_sid))
+    self:send_next_startup_step()
+  end)
   self.session_start_xid = request._x
   self:set_state("SESSION_STARTING")
 end
 
-function CompanionClient:after_session_active()
+function CompanionClient:start_text_input()
   if self.post_session_started then return end
   self.post_session_started = true
-  self:send_opack("_tiStart", {}, 2)
+  self:send_opack("_tiStart", {}, 2, function()
+    self:send_next_startup_step()
+  end)
+end
+
+function CompanionClient:subscribe_initial_events()
   self:send_opack("_interest", {
     _regEvents = OPACK.array({ "_iMC" }),
   }, 1)
+  self:send_next_startup_step()
 end
 
 function CompanionClient:receive(data)
@@ -3290,17 +3355,21 @@ function CompanionClient:handle_frame(frame)
       " xid=" .. tostring(message._x))
     self.received_messages[#self.received_messages + 1] = message
 
-    -- _sessionStart response: Apple TV correlates responses by _x, not _i.
-    if self.state == "SESSION_STARTING"
-      and message._t == 3
-      and message._x == self.session_start_xid
-      and type(message._c) == "table"
-    then
-      self.session_remote_sid = message._c._sid
-      self.session_start_xid = nil
-      self:set_state("SESSION_ACTIVE")
-      Log.debug("Companion session active, remote_sid=" .. tostring(self.session_remote_sid))
-      self:after_session_active()
+    if message._t == 3 and message._x ~= nil then
+      local pending = self.pending_responses[message._x]
+      if pending then
+        self.pending_responses[message._x] = nil
+        if message._em ~= nil then
+          local err = "Companion command failed: " .. tostring(message._em)
+          Log.error(err)
+          if pending.on_error then pending.on_error(message) end
+          if not pending.on_error then self:set_state("ERROR: " .. err) end
+        elseif pending.on_response then
+          pending.on_response(message)
+        end
+      else
+        Log.debug("Companion response without pending request: xid=" .. tostring(message._x))
+      end
     end
 
     if self.on_message then
@@ -3345,22 +3414,67 @@ function CompanionClient:pair_setup_submit_pin(pin)
   return m3_frame
 end
 
-function CompanionClient:send_opack(identifier, content, message_type)
-  local request = Companion.build_request(identifier, content, message_type)
+function CompanionClient:send_opack(identifier, content, message_type, on_response, on_error, request)
+  request = request or Companion.build_request(identifier, content, message_type)
   local payload = Companion.encode_request_payload(request)
   local frame = self.session and self.session:encode_frame(CompanionFrame.E_OPACK, payload) or CompanionFrame.encode(CompanionFrame.E_OPACK, payload)
+  if request._t == 2 then
+    self.pending_responses[request._x] = {
+      identifier = identifier,
+      on_response = on_response,
+      on_error = on_error,
+    }
+  end
   self:send_raw(frame)
   return request, frame
+end
+
+function CompanionClient:is_ready_for_commands()
+  return self.state == "SESSION_ACTIVE" and self.session ~= nil
+end
+
+function CompanionClient:send_or_queue_opack(identifier, content, message_type)
+  local request = Companion.build_request(identifier, content, message_type)
+  Companion.sent_messages[#Companion.sent_messages + 1] = request
+  if self:is_ready_for_commands() then
+    return self:send_opack(identifier, content, message_type, nil, nil, request)
+  end
+  Log.debug("queued Companion request until session active: " .. tostring(identifier))
+  self.pending_commands[#self.pending_commands + 1] = {
+    identifier = identifier,
+    content = content,
+    message_type = message_type,
+    request = request,
+  }
+  if self.state == "DISCONNECTED" or self.state:match("^DISCONNECTED") then
+    self:connect()
+  end
+  return request, nil
+end
+
+function CompanionClient:flush_pending_commands()
+  if not self:is_ready_for_commands() then
+    return
+  end
+  if #self.pending_commands == 0 then
+    return
+  end
+  local queued = self.pending_commands
+  self.pending_commands = {}
+  Log.debug("flushing queued Companion requests: count=" .. tostring(#queued))
+  for _, item in ipairs(queued) do
+    self:send_opack(item.identifier, item.content, item.message_type, nil, nil, item.request)
+  end
 end
 
 function CompanionClient:launch_app(bundle_id_or_url)
   assert(type(bundle_id_or_url) == "string" and bundle_id_or_url ~= "", "bundle id or URL required")
   local key = string.match(bundle_id_or_url, "^[%a][%w+.-]*:") and "_urlS" or "_bundleID"
-  return self:send_opack("_launchApp", { [key] = bundle_id_or_url }, 2)
+  return self:send_or_queue_opack("_launchApp", { [key] = bundle_id_or_url }, 2)
 end
 
 function CompanionClient:fetch_apps()
-  return self:send_opack("FetchLaunchableApplicationsEvent", {}, 2)
+  return self:send_or_queue_opack("FetchLaunchableApplicationsEvent", {}, 2)
 end
 
 local C4Driver
@@ -3591,6 +3705,9 @@ function C4MiniApps.handle_proxy_command(binding_id, command, params)
 
   local hid = remote_command[command]
   if hid then
+    if Companion.credentials or (Driver.state and Driver.state.companion_credentials) then
+      C4Driver.ensure_companion_client()
+    end
     return Companion.button_action(hid, action)
   end
 
@@ -3664,6 +3781,9 @@ function C4Driver.handle_companion_message(message)
 end
 
 function C4Driver.launch_app(bundle_id_or_url)
+  if Companion.credentials or (Driver.state and Driver.state.companion_credentials) then
+    C4Driver.ensure_companion_client()
+  end
   local request, frame = Companion.launch_app(bundle_id_or_url)
   C4Driver.publish_current_app()
   return request, frame
@@ -3714,6 +3834,7 @@ function C4Driver.reset_pairing()
   Companion.session = nil
   Companion.socket = nil
   Companion.client = nil
+  Companion.pending_commands = {}
   Companion.app_list = {}
   Companion.app_list_rows = {}
   Companion.current_app = nil
@@ -3735,6 +3856,16 @@ function C4Driver.disconnect_companion()
   C4Driver.set_connection_state("Disconnected")
 end
 
+function C4Driver.ensure_companion_client()
+  if Companion.client then
+    if Companion.client.state == "DISCONNECTED" or tostring(Companion.client.state):match("^DISCONNECTED") then
+      Companion.client:connect()
+    end
+    return Companion.client
+  end
+  return C4Driver.connect_companion()
+end
+
 function C4Driver.connect_companion()
   C4Driver.ensure_crypto_provider()
   local host = Properties and Properties["Apple TV Address"]
@@ -3742,6 +3873,10 @@ function C4Driver.connect_companion()
   if not credentials then
     Log.error("pair this driver before connecting")
     error("pair this driver before connecting")
+  end
+  if Companion.client and Companion.client.state ~= "DISCONNECTED" and not tostring(Companion.client.state):match("^DISCONNECTED") then
+    Log.debug("Companion connect requested while client exists: state=" .. tostring(Companion.client.state))
+    return Companion.client
   end
 
   local client = CompanionClient.new({
