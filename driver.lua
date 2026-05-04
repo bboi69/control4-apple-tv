@@ -1383,6 +1383,9 @@ end
 
 function SRP.compute_A(a_bytes)
   SRP.init()
+  if SRP._modpow then
+    return SRP._modpow(BigInt.to_minimal_bytes_be(SRP.g), a_bytes, 384)
+  end
   local a = BigInt.from_bytes_be(a_bytes)
   local A = BigInt.mont_modpow(SRP.g, a, SRP.N, SRP._R2, SRP.N_LIMBS, SRP._n_prime)
   return BigInt.to_bytes_be(A, 384)
@@ -1398,7 +1401,16 @@ function SRP.compute_session_key(B_bytes, a_bytes, x, u)
   local a = BigInt.from_bytes_be(a_bytes)
   local k_big = BigInt.from_bytes_be(SRP._k_bytes)
   Log.debug("Pair-Setup M3 progress: SRP g^x started")
-  local gx = BigInt.mont_modpow(SRP.g, x, SRP.N, SRP._R2, SRP.N_LIMBS, SRP._n_prime)
+  local gx
+  if SRP._modpow then
+    gx = BigInt.from_bytes_be(SRP._modpow(
+      BigInt.to_minimal_bytes_be(SRP.g),
+      BigInt.to_minimal_bytes_be(x),
+      384
+    ))
+  else
+    gx = BigInt.mont_modpow(SRP.g, x, SRP.N, SRP._R2, SRP.N_LIMBS, SRP._n_prime)
+  end
   Log.debug("Pair-Setup M3 progress: SRP g^x computed")
   local kgx = BigInt.mod(BigInt.mul(k_big, gx), SRP.N)
   local Bkgx
@@ -2092,7 +2104,7 @@ function PairSetup:compute_m3(pin)
   local old_modpow = SRP._modpow
   SRP._modpow = optional_crypto_method(self.crypto, "srp_modpow")
   if SRP._modpow then
-    Log.debug("Pair-Setup M3 using native SRP DH modpow")
+    Log.debug("Pair-Setup M3 using native SRP BN modpow")
   else
     Log.debug("Pair-Setup M3 using pure Lua SRP modpow")
   end
