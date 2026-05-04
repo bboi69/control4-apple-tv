@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.30-dev",
+  VERSION = "0.1.31-dev",
 }
 
 local function has_c4()
@@ -1720,14 +1720,14 @@ local function _ed_elapsed_ms(start_time)
   return math.floor((os.clock() - start_time) * 1000 + 0.5)
 end
 
-local function _ed_verify_internal(public_key, signature, message, collect_profile)
+local function _ed_verify_internal(public_key, signature, message, collect_profile, decoded_public_key)
   local profile = collect_profile and {} or nil
   local step_start = os.clock()
   if type(signature) ~= "string" or #signature ~= 64 then
     if profile then profile.decode_ms = _ed_elapsed_ms(step_start) end
     return false, profile
   end
-  local A = _ed_decode_point(public_key)
+  local A = decoded_public_key or _ed_decode_point(public_key)
   local R = _ed_decode_point(signature:sub(1, 32))
   if profile then profile.decode_ms = _ed_elapsed_ms(step_start) end
   if not A or not R then return false, profile end
@@ -1760,8 +1760,12 @@ function Ed25519Pure.verify(public_key, signature, message)
   return ok
 end
 
-function Ed25519Pure.verify_profile(public_key, signature, message)
-  return _ed_verify_internal(public_key, signature, message, true)
+function Ed25519Pure.verify_profile(public_key, signature, message, decoded_public_key)
+  return _ed_verify_internal(public_key, signature, message, true, decoded_public_key)
+end
+
+function Ed25519Pure.decode_public_key(public_key)
+  return _ed_decode_point(public_key)
 end
 
 function SRP.sha512(data)
@@ -2023,6 +2027,7 @@ local OpenSSLCrypto = {
   out_counter = 0,
   in_counter = 0,
   self_tested = false,
+  ed25519_public_point_cache = {},
 }
 
 OpenSSLCrypto.EVP_CTRL_AEAD_GET_TAG = 0x10
@@ -2125,8 +2130,20 @@ function OpenSSLCrypto._sign_ed25519(private_key_bytes, data, public_key)
   return Ed25519Pure.sign(private_key_bytes, public_key, data)
 end
 
+function OpenSSLCrypto._decoded_ed25519_public_key(public_key_bytes)
+  assert(type(public_key_bytes) == "string" and #public_key_bytes == 32, "Ed25519 public key must be 32 bytes")
+  local key = Bytes.hex(public_key_bytes)
+  local point = OpenSSLCrypto.ed25519_public_point_cache[key]
+  if not point then
+    point = assert(Ed25519Pure.decode_public_key(public_key_bytes), "invalid Ed25519 public key")
+    OpenSSLCrypto.ed25519_public_point_cache[key] = point
+  end
+  return point
+end
+
 function OpenSSLCrypto._default_verify_ed25519(public_key_bytes, signature, data)
-  return Ed25519Pure.verify(public_key_bytes, signature, data)
+  return Ed25519Pure.verify_profile(public_key_bytes, signature, data,
+    OpenSSLCrypto._decoded_ed25519_public_key(public_key_bytes))
 end
 
 OpenSSLCrypto._verify_ed25519 = OpenSSLCrypto._default_verify_ed25519
@@ -2135,7 +2152,8 @@ function OpenSSLCrypto._verify_ed25519_profile(public_key_bytes, signature, data
   if OpenSSLCrypto._verify_ed25519 ~= OpenSSLCrypto._default_verify_ed25519 then
     return OpenSSLCrypto._verify_ed25519(public_key_bytes, signature, data), nil
   end
-  return Ed25519Pure.verify_profile(public_key_bytes, signature, data)
+  return Ed25519Pure.verify_profile(public_key_bytes, signature, data,
+    OpenSSLCrypto._decoded_ed25519_public_key(public_key_bytes))
 end
 
 function OpenSSLCrypto._cipher()
@@ -4250,7 +4268,8 @@ function C4Driver.check_crypto_provider()
 end
 
 function C4Driver.prewarm_crypto()
-  if not (Companion.credentials or (Driver.state and Driver.state.companion_credentials)) then
+  local credentials = Companion.credentials or C4Driver.load_persisted_credentials()
+  if not credentials then
     Log.debug("crypto prewarm skipped: no pairing credentials")
     return false
   end
@@ -4260,6 +4279,16 @@ function C4Driver.prewarm_crypto()
     local built = Ed25519Pure.prewarm()
     Log.debug("crypto prewarm " .. (built and "built" or "already ready") ..
       ": Ed25519 fixed-base table ms=" .. tostring(elapsed_ms(start_time)))
+
+    start_time = os.clock()
+    if not credentials.controller_ltpk then
+      credentials.controller_ltpk = Ed25519Pure.public_key_from_private(credentials.ltsk)
+    end
+    Log.debug("crypto prewarm controller public key ms=" .. tostring(elapsed_ms(start_time)))
+
+    start_time = os.clock()
+    OpenSSLCrypto._decoded_ed25519_public_key(credentials.ltpk)
+    Log.debug("crypto prewarm Apple TV public key decode ms=" .. tostring(elapsed_ms(start_time)))
   end)
   if not ok then
     Log.error("crypto prewarm failed: " .. tostring(err))
