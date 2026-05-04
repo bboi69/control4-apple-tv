@@ -1308,6 +1308,37 @@ function tests.app_list_current_app_and_now_playing_are_published()
   Properties = old_properties
 end
 
+function tests.response_matching_adds_identifier_for_app_list()
+  local received
+  local client = Driver.CompanionClient.new({
+    credentials = Driver.Credentials.parse(table.concat({
+      Driver.Bytes.hex(string.rep("\x01", 32)),
+      Driver.Bytes.hex(string.rep("\x02", 32)),
+      Driver.Bytes.hex("ATV-ID"),
+      Driver.Bytes.hex("CLIENT-ID"),
+    }, ":")),
+    crypto = {
+      encrypt = function(_, plaintext) return plaintext .. string.rep("\0", 16) end,
+      decrypt = function(_, ciphertext) return ciphertext:sub(1, #ciphertext - 16) end,
+    },
+    transport = {
+      Write = function() end,
+    },
+    on_message = function(message) received = message end,
+  })
+  client.session = Driver.CompanionSession.new("out", "in", client.crypto)
+  client.state = "SESSION_ACTIVE"
+  local request = client:fetch_apps()
+  local response_payload = Driver.OPACK.encode(Driver.OPACK.dict({
+    { "_t", 3 },
+    { "_c", Driver.OPACK.dict({ { "com.netflix.Netflix", "Netflix" } }) },
+    { "_x", request._x },
+  }))
+  client:receive(client.session:encode_frame(Driver.CompanionFrame.E_OPACK, response_payload))
+  assert_eq(received._i, "FetchLaunchableApplicationsEvent", "matched response gets request identifier")
+  assert_eq(received._c["com.netflix.Netflix"], "Netflix", "response content preserved")
+end
+
 function tests.disconnect_companion_keeps_credentials()
   local old_properties = Properties
   Properties = {}

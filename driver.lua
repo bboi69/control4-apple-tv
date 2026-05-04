@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.20-dev",
+  VERSION = "0.1.21-dev",
 }
 
 local function has_c4()
@@ -3403,6 +3403,9 @@ function CompanionClient:handle_frame(frame)
       local pending = self.pending_responses[message._x]
       if pending then
         self.pending_responses[message._x] = nil
+        if message._i == nil then
+          message._i = pending.identifier
+        end
         if message._em ~= nil then
           local err = "Companion command failed: " .. tostring(message._em)
           Log.error(err)
