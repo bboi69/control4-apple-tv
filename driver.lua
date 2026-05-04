@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.4-dev",
+  VERSION = "0.1.5-dev",
 }
 
 local function has_c4()
@@ -1747,6 +1747,11 @@ function OpenSSLCrypto._cipher()
   return openssl.cipher
 end
 
+function OpenSSLCrypto._cipher_ctrl(name, fallback)
+  local cipher = OpenSSLCrypto._cipher()
+  return cipher[name] or fallback
+end
+
 function OpenSSLCrypto._cipher_ctx(encrypting, key, nonce)
   local cipher = OpenSSLCrypto._cipher()
   local algorithm, algorithm_err = cipher.get("chacha20-poly1305")
@@ -1760,8 +1765,9 @@ function OpenSSLCrypto._cipher_ctx(encrypting, key, nonce)
     ctx = openssl_assert(ctx, err, "create ChaCha20-Poly1305 decrypt context")
   end
   assert(ctx.init, "lua-openssl cipher context init is required for ChaCha20-Poly1305 AEAD")
-  ctx:ctrl(OpenSSLCrypto.EVP_CTRL_AEAD_SET_IVLEN, #nonce)
-  openssl_assert(ctx:init(key, nonce, false), nil, "initialize ChaCha20-Poly1305 context")
+  openssl_assert(ctx:ctrl(OpenSSLCrypto._cipher_ctrl("EVP_CTRL_GCM_SET_IVLEN", OpenSSLCrypto.EVP_CTRL_AEAD_SET_IVLEN), #nonce),
+    nil, "set ChaCha20-Poly1305 IV length")
+  openssl_assert(ctx:init(key, nonce), nil, "initialize ChaCha20-Poly1305 context")
   return ctx
 end
 
@@ -1773,7 +1779,8 @@ function OpenSSLCrypto._chacha20_poly1305_encrypt(key, nonce, plaintext, aad)
     ctx:update(aad, true)
   end
   local ciphertext = (ctx:update(plaintext) or "") .. (ctx:final() or "")
-  local tag = assert(ctx:ctrl(OpenSSLCrypto.EVP_CTRL_AEAD_GET_TAG, 16), "failed to get ChaCha20-Poly1305 auth tag")
+  local tag = assert(ctx:ctrl(OpenSSLCrypto._cipher_ctrl("EVP_CTRL_GCM_GET_TAG", OpenSSLCrypto.EVP_CTRL_AEAD_GET_TAG), 16),
+    "failed to get ChaCha20-Poly1305 auth tag")
   return ciphertext .. tag
 end
 
@@ -1787,7 +1794,8 @@ function OpenSSLCrypto._chacha20_poly1305_decrypt(key, nonce, ciphertext_and_tag
   if aad and aad ~= "" then
     ctx:update(aad, true)
   end
-  assert(ctx:ctrl(OpenSSLCrypto.EVP_CTRL_AEAD_SET_TAG, tag), "failed to set ChaCha20-Poly1305 auth tag")
+  assert(ctx:ctrl(OpenSSLCrypto._cipher_ctrl("EVP_CTRL_GCM_SET_TAG", OpenSSLCrypto.EVP_CTRL_AEAD_SET_TAG), tag),
+    "failed to set ChaCha20-Poly1305 auth tag")
   return (ctx:update(ciphertext) or "") .. (ctx:final() or "")
 end
 
@@ -1996,7 +2004,10 @@ function OpenSSLCrypto.self_test(progress)
   local aad = "aad"
   local expected_ciphertext = Bytes.from_hex("f99769694763c038c388540d8367db9102148f2c2034e779d0")
   local ciphertext = OpenSSLCrypto._chacha20_poly1305_encrypt(key, nonce, plaintext, aad)
-  assert(ciphertext == expected_ciphertext, "ChaCha20-Poly1305 encrypt vector failed")
+  if ciphertext ~= expected_ciphertext then
+    error("ChaCha20-Poly1305 encrypt vector failed: got " ..
+      Bytes.hex(ciphertext) .. " expected " .. Bytes.hex(expected_ciphertext))
+  end
   plaintext = OpenSSLCrypto._chacha20_poly1305_decrypt(key, nonce, ciphertext, aad)
   assert(plaintext == "plaintext", "ChaCha20-Poly1305 roundtrip failed")
   local bad_tag = ciphertext:sub(1, #ciphertext - 1) ..

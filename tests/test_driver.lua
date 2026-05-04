@@ -163,7 +163,7 @@ local function make_fake_openssl(options)
         record("cipher." .. mode .. ".init")
         assert_eq(#key, 32, mode .. " key length")
         assert_eq(#nonce, 12, mode .. " nonce length")
-        assert_eq(pad, false, mode .. " padding")
+        assert_eq(pad, nil, mode .. " padding")
         return true
       end,
       update = function(_, data, aad)
