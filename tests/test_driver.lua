@@ -1287,6 +1287,8 @@ function tests.airplay_control_client_runs_rtsp_tunnel_setup_probe()
       if info == "Control-Read-Encryption-Key" then return "read-key" end
       if info == "Events-Read-Encryption-Key" then return "event-write-key" end
       if info == "Events-Write-Encryption-Key" then return "event-read-key" end
+      if info == "DataStream-Output-Encryption-Key" then return "data-write-key" end
+      if info == "DataStream-Input-Encryption-Key" then return "data-read-key" end
       error("unexpected hkdf info")
     end,
     random_bytes = function(n)
@@ -1377,10 +1379,12 @@ function tests.airplay_control_client_runs_rtsp_tunnel_setup_probe()
     },
   }), "RTSP/1.0")))
 
-  assert_eq(client.state, "RTSP_TUNNEL_READY", "tunnel ready state")
+  assert_eq(client.state, "DATA_CHANNEL_ACTIVE", "data channel active state")
   assert(tunnel_result ~= nil, "tunnel callback")
   assert_eq(tunnel_result.event_port, 49152, "event port")
   assert_eq(tunnel_result.data_port, 49153, "data port")
+  assert(client.data_channel ~= nil, "data channel created")
+  assert(#event_writes >= 3, "data channel bootstrap writes")
   C4 = old_c4
 end
 

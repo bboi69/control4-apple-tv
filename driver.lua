@@ -3675,6 +3675,11 @@ local AirPlay = {
 
 local BPlist = {}
 
+function BPlist.bytes(data)
+  assert(type(data) == "string", "bplist bytes value must be a string")
+  return { __bplist_type = "bytes", data = data }
+end
+
 local function bplist_is_array(value)
   if type(value) ~= "table" then return false end
   local count = 0
@@ -3726,6 +3731,9 @@ function BPlist.encode(value)
       return add(BPlist.length_marker(0x50, #obj) .. obj)
     end
     if value_type == "table" then
+      if obj.__bplist_type == "bytes" then
+        return add(BPlist.length_marker(0x40, #(obj.data or "")) .. (obj.data or ""))
+      end
       if bplist_is_array(obj) then
         local refs = {}
         for i = 1, #obj do
@@ -3845,6 +3853,10 @@ function BPlist.decode(data)
       else value = nil end
     elseif kind == 1 then
       value = Bytes.read_uint_be(data, index, 2 ^ low)
+    elseif kind == 4 then
+      local length
+      length, index = read_length(low, index)
+      value = BPlist.bytes(data:sub(index, index + length - 1))
     elseif kind == 5 then
       local length
       length, index = read_length(low, index)
@@ -5484,6 +5496,315 @@ end
 
 local AirPlayControlClient = {}
 local AirPlayEventChannelClient = {}
+local AirPlayDataChannelClient = {}
+
+local PB = {}
+
+function PB.varint(value)
+  assert(type(value) == "number" and value >= 0, "protobuf varint must be unsigned")
+  local out = {}
+  repeat
+    local byte = value % 128
+    value = math.floor(value / 128)
+    if value > 0 then byte = byte + 128 end
+    out[#out + 1] = string.char(byte)
+  until value == 0
+  return table.concat(out)
+end
+
+function PB.key(field, wire_type)
+  return PB.varint(field * 8 + wire_type)
+end
+
+function PB.field_varint(field, value)
+  return PB.key(field, 0) .. PB.varint(value)
+end
+
+function PB.field_string(field, value)
+  value = tostring(value or "")
+  return PB.key(field, 2) .. PB.varint(#value) .. value
+end
+
+function PB.field_message(field, value)
+  return PB.key(field, 2) .. PB.varint(#value) .. value
+end
+
+function PB.read_varint(data, index)
+  local shift = 0
+  local value = 0
+  while true do
+    local b = data:byte(index)
+    assert(b, "truncated protobuf varint")
+    index = index + 1
+    value = value + (b % 128) * (2 ^ shift)
+    if b < 128 then
+      return value, index
+    end
+    shift = shift + 7
+    assert(shift <= 63, "protobuf varint too large")
+  end
+end
+
+function PB.describe(data)
+  local parts = {}
+  local index = 1
+  while index <= #data and #parts < 10 do
+    local ok, key_or_err = pcall(PB.read_varint, data, index)
+    if not ok then break end
+    local key
+    key, index = PB.read_varint(data, index)
+    local field = math.floor(key / 8)
+    local wire = key % 8
+    if wire == 0 then
+      local value
+      value, index = PB.read_varint(data, index)
+      parts[#parts + 1] = tostring(field) .. "=" .. tostring(value)
+    elseif wire == 2 then
+      local length
+      length, index = PB.read_varint(data, index)
+      local value = data:sub(index, index + length - 1)
+      index = index + length
+      local printable = value:gsub("[^%g ]", ".")
+      if #printable > 48 then printable = printable:sub(1, 48) .. "..." end
+      parts[#parts + 1] = tostring(field) .. "=\"" .. printable .. "\""
+    else
+      parts[#parts + 1] = tostring(field) .. "(wire=" .. tostring(wire) .. ")"
+      break
+    end
+  end
+  return table.concat(parts, " ")
+end
+
+function PB.protocol_message(message_type, extension_field, extension_body, crypto)
+  crypto = crypto or Crypto
+  local h = Bytes.hex(crypto_method(crypto, "random_bytes")(16))
+  local uuid = string.upper(h:sub(1, 8) .. "-" ..
+    h:sub(9, 12) .. "-" ..
+    h:sub(13, 16) .. "-" ..
+    h:sub(17, 20) .. "-" ..
+    h:sub(21, 32))
+  local out = {
+    PB.field_varint(1, message_type),
+    PB.field_varint(4, 0),
+    PB.field_string(85, uuid),
+  }
+  if extension_field and extension_body then
+    out[#out + 1] = PB.field_message(extension_field, extension_body)
+  end
+  return table.concat(out)
+end
+
+function PB.device_info(client_id, crypto)
+  local info = table.concat({
+    PB.field_string(1, tostring(client_id or "Control4")),
+    PB.field_string(2, "Control4"),
+    PB.field_string(3, "iPhone"),
+    PB.field_string(4, "20A"),
+    PB.field_string(5, "com.apple.TVRemote"),
+    PB.field_string(6, "344.28"),
+    PB.field_varint(7, 1),
+    PB.field_varint(8, 108),
+    PB.field_varint(9, 1),
+    PB.field_varint(10, 1),
+    PB.field_string(12, "com.apple.TVMusic"),
+    PB.field_varint(13, 1),
+    PB.field_varint(14, 1),
+    PB.field_varint(15, 1),
+    PB.field_varint(17, 2),
+    PB.field_varint(21, 1),
+    PB.field_varint(22, 1),
+  })
+  return PB.protocol_message(15, 20, info, crypto)
+end
+
+function PB.set_connection_state(crypto)
+  return PB.protocol_message(38, 42, PB.field_varint(1, 2), crypto)
+end
+
+function PB.client_updates_config(crypto)
+  local config = table.concat({
+    PB.field_varint(1, 1),
+    PB.field_varint(2, 1),
+    PB.field_varint(3, 1),
+    PB.field_varint(4, 1),
+    PB.field_varint(5, 1),
+  })
+  return PB.protocol_message(16, 21, config, crypto)
+end
+
+local DATA_HEADER_LENGTH = 32
+
+function AirPlayDataChannelClient.new(options)
+  options = options or {}
+  return setmetatable({
+    host = options.host,
+    port = options.port,
+    session = HAPSession.new(options.output_key, options.input_key, options.crypto or Crypto),
+    crypto = options.crypto or Crypto,
+    transport = options.transport,
+    buffer = "",
+    send_seqno = 0x100000000 + 1,
+    client_id = options.client_id,
+    on_connected = options.on_connected,
+    on_error = options.on_error,
+  }, { __index = AirPlayDataChannelClient })
+end
+
+function AirPlayDataChannelClient:connect()
+  assert(type(self.host) == "string" and self.host ~= "", "AirPlay data host is required")
+  assert(type(self.port) == "number", "AirPlay data port is required")
+
+  if self.transport then
+    if self.on_connected then self.on_connected(self) end
+    return self
+  end
+
+  assert(has_c4() and C4.CreateTCPClient, "Control4 TCP client is not available")
+  Log.debug("AirPlay data channel TCP connect requested: host=" .. tostring(self.host) ..
+    " port=" .. tostring(self.port))
+  local client
+  client = C4:CreateTCPClient()
+    :OnConnect(function(tcp_client)
+      Log.debug("AirPlay data channel TCP connected")
+      self.transport = tcp_client
+      if self.on_connected then self.on_connected(self) end
+      self:send_bootstrap()
+      tcp_client:ReadUpTo(4096)
+    end)
+    :OnRead(function(tcp_client, data)
+      Log.debug("AirPlay data channel TCP read: bytes=" .. tostring(#(data or "")))
+      local ok, err = pcall(function() self:receive(data or "") end)
+      if not ok then
+        Log.error("AirPlay data channel receive failed: " .. tostring(err))
+        if self.on_error then self.on_error(err) end
+      end
+      tcp_client:ReadUpTo(4096)
+    end)
+    :OnDisconnect(function(_, err_code, err_msg)
+      Log.debug("AirPlay data channel TCP disconnected: code=" .. tostring(err_code) ..
+        " message=" .. tostring(err_msg))
+      self.transport = nil
+    end)
+    :OnError(function(_, err_code, err_msg)
+      Log.error("AirPlay data channel TCP error: code=" .. tostring(err_code) ..
+        " message=" .. tostring(err_msg))
+      self.transport = nil
+      if self.on_error then self.on_error(err_msg or err_code) end
+    end)
+    :Connect(self.host, self.port)
+  self.transport = client
+  return self
+end
+
+function AirPlayDataChannelClient:encode_message(message_type, command, seqno, payload)
+  payload = payload or ""
+  message_type = message_type .. string.rep("\0", math.max(0, 12 - #message_type))
+  command = command .. string.rep("\0", math.max(0, 4 - #command))
+  local seqno_bytes
+  if type(seqno) == "string" then
+    assert(#seqno == 8, "AirPlay data channel seqno bytes must be 8 bytes")
+    seqno_bytes = seqno
+  else
+    seqno_bytes = Bytes.uint_be(seqno, 8)
+  end
+  local size = DATA_HEADER_LENGTH + #payload
+  return Bytes.uint_be(size, 4) ..
+    message_type:sub(1, 12) ..
+    command:sub(1, 4) ..
+    seqno_bytes ..
+    Bytes.uint_be(0, 4) ..
+    payload
+end
+
+function AirPlayDataChannelClient:send_payload(plist_payload)
+  local frame = self:encode_message("sync", "comm", self.send_seqno, BPlist.encode(plist_payload))
+  Log.debug("AirPlay data channel send frame: seqno=" .. tostring(self.send_seqno) ..
+    " payload_len=" .. tostring(#frame - DATA_HEADER_LENGTH))
+  self.send_seqno = self.send_seqno + 1
+  return self.transport:Write(self.session:encrypt(frame))
+end
+
+function AirPlayDataChannelClient:send_protobuf(message)
+  local payload = PB.varint(#message) .. message
+  return self:send_payload({ params = { data = BPlist.bytes(payload) } })
+end
+
+function AirPlayDataChannelClient:send_bootstrap()
+  Log.debug("AirPlay data channel bootstrap: sending MRP device info")
+  self:send_protobuf(PB.device_info(self.client_id, self.crypto))
+  Log.debug("AirPlay data channel bootstrap: sending MRP connection state")
+  self:send_protobuf(PB.set_connection_state(self.crypto))
+  Log.debug("AirPlay data channel bootstrap: sending MRP client updates config")
+  self:send_protobuf(PB.client_updates_config(self.crypto))
+end
+
+function AirPlayDataChannelClient:send_reply(seqno)
+  local frame = self:encode_message("rply", "\0\0\0\0", seqno, "")
+  local seqno_log = type(seqno) == "string" and Bytes.hex(seqno) or tostring(seqno)
+  Log.debug("AirPlay data channel send reply: seqno=" .. seqno_log)
+  return self.transport:Write(self.session:encrypt(frame))
+end
+
+function AirPlayDataChannelClient:receive(data)
+  local plaintext = self.session:decrypt(data)
+  if plaintext == "" then return end
+  self.buffer = self.buffer .. plaintext
+
+  while #self.buffer >= DATA_HEADER_LENGTH do
+    local size = Bytes.read_uint_be(self.buffer, 1, 4)
+    if #self.buffer < size then
+      return
+    end
+    local frame = self.buffer:sub(1, size)
+    self.buffer = self.buffer:sub(size + 1)
+    local message_type = frame:sub(5, 16):gsub("%z+$", "")
+    local command = frame:sub(17, 20):gsub("%z+$", "")
+    local seqno_bytes = frame:sub(21, 28)
+    local seqno = Bytes.read_uint_be(frame, 21, 8)
+    local payload = frame:sub(DATA_HEADER_LENGTH + 1)
+    Log.debug("AirPlay data channel frame: type=" .. tostring(message_type) ..
+      " command=" .. tostring(command) ..
+      " seqno=" .. tostring(seqno) ..
+      " payload_len=" .. tostring(#payload) ..
+      " head=" .. Bytes.hex(payload:sub(1, 24)))
+    self:handle_payload(message_type, seqno_bytes, payload)
+  end
+end
+
+function AirPlayDataChannelClient:handle_payload(message_type, seqno, payload)
+  if payload ~= "" then
+    local ok, decoded = pcall(BPlist.decode, payload)
+    if ok and type(decoded) == "table" then
+      local data = decoded.params and decoded.params.data
+      if type(data) == "table" and data.__bplist_type == "bytes" then
+        local description = ""
+        local ok_desc, value_or_err, next_index = pcall(PB.read_varint, data.data, 1)
+        if ok_desc and value_or_err and next_index then
+          description = PB.describe(data.data:sub(next_index))
+        end
+        Log.debug("AirPlay data channel protobuf bytes: len=" .. tostring(#data.data) ..
+          " head=" .. Bytes.hex(data.data:sub(1, 32)) ..
+          " desc=" .. description)
+      else
+        Log.debug("AirPlay data channel plist payload decoded")
+      end
+    else
+      Log.debug("AirPlay data channel non-plist payload: " .. tostring(decoded))
+    end
+  end
+  if message_type == "sync" then
+    self:send_reply(seqno)
+  end
+end
+
+function AirPlayDataChannelClient:close()
+  if self.transport and self.transport.Close then
+    self.transport:Close()
+  elseif self.transport and self.transport.close then
+    self.transport:close()
+  end
+  self.transport = nil
+end
 
 function AirPlayEventChannelClient.new(options)
   options = options or {}
@@ -5606,6 +5927,7 @@ function AirPlayControlClient.new(options)
     data_port = nil,
     data_seed = nil,
     event_channel = nil,
+    data_channel = nil,
     on_info = options.on_info,
     on_tunnel_setup = options.on_tunnel_setup,
     on_error = options.on_error,
@@ -5747,6 +6069,35 @@ function AirPlayControlClient:open_event_channel()
   return self.event_channel:connect()
 end
 
+function AirPlayControlClient:open_data_channel()
+  assert(self.data_port, "AirPlay data port is required")
+  assert(self.data_seed, "AirPlay data seed is required")
+  local output_key = self:derive_channel_key("DataStream-Salt" .. tostring(self.data_seed), "DataStream-Output-Encryption-Key")
+  local input_key = self:derive_channel_key("DataStream-Salt" .. tostring(self.data_seed), "DataStream-Input-Encryption-Key")
+  self.data_channel = AirPlayDataChannelClient.new({
+    host = self.host,
+    port = self.data_port,
+    output_key = output_key,
+    input_key = input_key,
+    crypto = self.crypto,
+    client_id = self.credentials and self.credentials.client_id,
+    on_connected = function()
+      self:set_state("DATA_CHANNEL_ACTIVE")
+      if self.on_tunnel_setup then
+        self.on_tunnel_setup({
+          event_port = self.event_port,
+          data_port = self.data_port,
+          seed = self.data_seed,
+        })
+      end
+    end,
+    on_error = function(err)
+      if self.on_error then self.on_error(err) end
+    end,
+  })
+  return self.data_channel:connect()
+end
+
 function AirPlayControlClient:connect(host, port)
   self.host = host or self.host
   self.port = port or self.port or 7000
@@ -5801,6 +6152,10 @@ function AirPlayControlClient:close()
     self.event_channel:close()
   end
   self.event_channel = nil
+  if self.data_channel and self.data_channel.close then
+    self.data_channel:close()
+  end
+  self.data_channel = nil
   if self.transport and self.transport.Close then
     self.transport:Close()
   elseif self.transport and self.transport.close then
@@ -5923,14 +6278,8 @@ function AirPlayControlClient:handle_encrypted_response(response)
     self.data_port = stream.dataPort or stream.data_port
     Log.debug("AirPlay RTSP data channel discovered: dataPort=" .. tostring(self.data_port) ..
       " seed=" .. tostring(self.data_seed))
-    self:set_state("RTSP_TUNNEL_READY")
-    if self.on_tunnel_setup then
-      self.on_tunnel_setup({
-        event_port = self.event_port,
-        data_port = self.data_port,
-        seed = self.data_seed,
-      })
-    end
+    self:set_state("DATA_CHANNEL_CONNECTING")
+    self:open_data_channel()
     return
   end
 
