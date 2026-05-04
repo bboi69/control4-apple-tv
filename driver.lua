@@ -1232,14 +1232,50 @@ local function _fe_bit(v, bit_index)
 end
 
 local function _fp_inv(a)
-  local result = _fe_from_number(1)
-  for bit = 254, 0, -1 do
-    result = _fp_sq(result)
-    if _fe_bit(_FE_P_MINUS_2, bit) == 1 then
-      result = _fp_mul(result, a)
-    end
-  end
-  return result
+  -- a^(p-2) where p-2 = 2^255-21, using addition chain: 254 sq + 11 mul
+  -- instead of the naive 254 sq + 253 mul bit-by-bit approach.
+  -- Key identity: 2^255-21 = 32*(2^250-1) + 11, so
+  --   a^(p-2) = (a^(2^250-1))^32 * a^11
+  local a2  = _fp_sq(a)             -- a^2
+  local a4  = _fp_sq(a2)            -- a^4
+  local a8  = _fp_sq(a4)            -- a^8
+  local a9  = _fp_mul(a8, a)        -- a^9
+  local a11 = _fp_mul(a9, a2)       -- a^11
+  local a22 = _fp_sq(a11)           -- a^22
+  local a31 = _fp_mul(a22, a9)      -- a^31 = a^(2^5-1)
+
+  local t = _fp_sq(a31)             -- a^(2^6-2)
+  t = _fp_sq(t); t = _fp_sq(t); t = _fp_sq(t); t = _fp_sq(t)
+  local a10 = _fp_mul(t, a31)       -- a^(2^10-1)
+
+  t = _fp_sq(a10)
+  for _ = 1,  9 do t = _fp_sq(t) end
+  local a20 = _fp_mul(t, a10)       -- a^(2^20-1)
+
+  t = _fp_sq(a20)
+  for _ = 1, 19 do t = _fp_sq(t) end
+  local a40 = _fp_mul(t, a20)       -- a^(2^40-1)
+
+  t = _fp_sq(a40)
+  for _ = 1,  9 do t = _fp_sq(t) end
+  local a50 = _fp_mul(t, a10)       -- a^(2^50-1)
+
+  t = _fp_sq(a50)
+  for _ = 1, 49 do t = _fp_sq(t) end
+  local a100 = _fp_mul(t, a50)      -- a^(2^100-1)
+
+  t = _fp_sq(a100)
+  for _ = 1, 99 do t = _fp_sq(t) end
+  local a200 = _fp_mul(t, a100)     -- a^(2^200-1)
+
+  t = _fp_sq(a200)
+  for _ = 1, 49 do t = _fp_sq(t) end
+  t = _fp_mul(t, a50)               -- a^(2^250-1)
+
+  -- Five more squarings: a^(2^255-32)
+  t = _fp_sq(t); t = _fp_sq(t); t = _fp_sq(t); t = _fp_sq(t); t = _fp_sq(t)
+
+  return _fp_mul(t, a11)            -- a^(2^255-32+11) = a^(2^255-21) = a^(p-2)
 end
 
 local function _le32_to_fe(s)
@@ -3955,6 +3991,33 @@ function CompanionClient:needs_reconnect()
   return state == "DISCONNECTED" or state:match("^DISCONNECTED") or state:match("^ERROR")
 end
 
+function CompanionClient:queue_pending_command(item)
+  if item.identifier == "_hidC" and type(item.content) == "table" then
+    local hid_command = item.content._hidC
+    local hid_state = item.content._hBtS
+    if hid_command ~= nil and hid_state ~= nil then
+      local removed = 0
+      for i = #self.pending_commands, 1, -1 do
+        local queued = self.pending_commands[i]
+        local queued_content = queued and queued.content
+        if queued and queued.identifier == "_hidC"
+           and type(queued_content) == "table"
+           and queued_content._hidC == hid_command
+           and (queued_content._hBtS == hid_state or hid_state == 1)
+        then
+          table.remove(self.pending_commands, i)
+          removed = removed + 1
+        end
+      end
+      if removed > 0 then
+        Log.debug("coalesced queued HID command: hid=" .. tostring(hid_command) ..
+          " state=" .. tostring(hid_state) .. " removed=" .. tostring(removed))
+      end
+    end
+  end
+  self.pending_commands[#self.pending_commands + 1] = item
+end
+
 function CompanionClient:send_or_queue_opack(identifier, content, message_type)
   local request = Companion.build_request(identifier, content, message_type)
   Companion.sent_messages[#Companion.sent_messages + 1] = request
@@ -3962,12 +4025,12 @@ function CompanionClient:send_or_queue_opack(identifier, content, message_type)
     return self:send_opack(identifier, content, message_type, nil, nil, request)
   end
   Log.debug("queued Companion request until session active: " .. tostring(identifier))
-  self.pending_commands[#self.pending_commands + 1] = {
+  self:queue_pending_command({
     identifier = identifier,
     content = content,
     message_type = message_type,
     request = request,
-  }
+  })
   if self:needs_reconnect() and not self.connecting then
     self:connect()
   end
@@ -4028,6 +4091,19 @@ local C4MiniApps = {
   },
   bindings = {},
   pending_retry = nil,
+  launch_debounce_ms = 1000,
+  last_launch_id = nil,
+  last_launch_at_ms = nil,
+  button_defaults = {
+    MENU = "Home",
+    GUIDE = "Menu",
+    INFO = "Dashboard (Hold TV Button)",
+    CANCEL = "Menu",
+    PVR = "Back",
+    STAR = "Do Nothing",
+    POUND = "Do Nothing",
+    RECORD = "Play/Pause",
+  },
   room_ids = {},
   room_sources = {},
 }
@@ -4150,9 +4226,31 @@ function C4MiniApps.queue_retry(service, app_proxy_id)
   return false
 end
 
+function C4MiniApps.now_ms()
+  return (os.time() or 0) * 1000
+end
+
+function C4MiniApps.is_duplicate_launch(launch_id)
+  local now = C4MiniApps.now_ms()
+  local last_at = C4MiniApps.last_launch_at_ms
+  if C4MiniApps.last_launch_id == launch_id and last_at and
+     (now - last_at) >= 0 and (now - last_at) < C4MiniApps.launch_debounce_ms
+  then
+    Log.debug("mini app duplicate launch suppressed " .. tostring(launch_id))
+    return true
+  end
+  C4MiniApps.last_launch_id = launch_id
+  C4MiniApps.last_launch_at_ms = now
+  return false
+end
+
 function C4MiniApps.launch_service(service, app_proxy_id)
   local launch_id = C4MiniApps.resolve_launch_id(service)
   if launch_id then
+    if C4MiniApps.is_duplicate_launch(launch_id) then
+      C4MiniApps.reselect_passthrough_if_needed(app_proxy_id)
+      return nil
+    end
     Log.debug("launch mini app " .. launch_id)
     local request, frame = C4Driver.launch_app(launch_id)
     C4MiniApps.reselect_passthrough_if_needed(app_proxy_id)
@@ -4289,6 +4387,54 @@ function C4MiniApps.reselect_passthrough_if_needed(app_proxy_id)
   end
 end
 
+function C4MiniApps.normalize_proxy_button(command, params)
+  params = params or {}
+  local action = params.ACTION or params.action or params.INPUT_ACTION or params.input_action
+  if command:match("^START_") then
+    action = "down"
+    command = command:gsub("^START_", "")
+  elseif command:match("^STOP_") then
+    action = "up"
+    command = command:gsub("^STOP_", "")
+  elseif command:match("^END_") then
+    action = "up"
+    command = command:gsub("^END_", "")
+  elseif params.BEGIN then
+    action = "down"
+  elseif params.DURATION then
+    action = "up"
+  end
+  return command, action
+end
+
+function C4MiniApps.mapped_button_action(command, action)
+  local property_name = command .. " Button"
+  local configured = Properties and Properties[property_name] or nil
+  configured = configured or C4MiniApps.button_defaults[command]
+  if not configured or configured == "" then
+    return nil, nil, false
+  end
+  if configured == "Do Nothing" then
+    return nil, nil, true
+  end
+
+  local mapped = {
+    ["Home"] = { "HOME", nil },
+    ["Menu"] = { "MENU", nil },
+    ["Back"] = { "MENU", nil },
+    ["Guide"] = { "GUIDE", nil },
+    ["Select"] = { "SELECT", nil },
+    ["Play/Pause"] = { "PLAY_PAUSE", nil },
+    ["Dashboard (Hold TV Button)"] = { "HOME", "hold" },
+  }
+  local entry = mapped[configured]
+  if not entry then
+    Log.error("unknown " .. property_name .. " mapping: " .. tostring(configured))
+    return nil, nil, true
+  end
+  return entry[1], action or entry[2], true
+end
+
 function C4MiniApps.handle_proxy_command(binding_id, command, params)
   if binding_id == nil or command == nil then
     return nil
@@ -4296,10 +4442,15 @@ function C4MiniApps.handle_proxy_command(binding_id, command, params)
 
   params = params or {}
 
+  if command == "BINDING_CHANGE_ACTION" or command == "CONNECT_OUTPUT" then
+    return nil
+  end
+
   if binding_id == C4MiniApps.SWITCHER_PROXY and command == "PASSTHROUGH" then
     binding_id = C4MiniApps.PASSTHROUGH_PROXY
     command = params.PASSTHROUGH_COMMAND
   end
+  command, params._resolved_action = C4MiniApps.normalize_proxy_button(tostring(command or ""), params)
 
   if binding_id == C4MiniApps.SWITCHER_PROXY and command == "SET_INPUT" then
     local input = tonumber(params.INPUT)
@@ -4350,13 +4501,17 @@ function C4MiniApps.handle_proxy_command(binding_id, command, params)
     GUIDE = "GUIDE",
   }
 
-  local action = params.ACTION or params.action or params.INPUT_ACTION or params.input_action
-  if command:match("^START_") then
-    action = "down"
-    command = command:gsub("^START_", "")
-  elseif command:match("^STOP_") then
-    action = "up"
-    command = command:gsub("^STOP_", "")
+  local action = params._resolved_action
+
+  local mapped_hid, mapped_action, handled_mapping = C4MiniApps.mapped_button_action(command, action)
+  if handled_mapping then
+    if mapped_hid then
+      if Companion.credentials or (Driver.state and Driver.state.companion_credentials) then
+        C4Driver.ensure_companion_client()
+      end
+      return Companion.button_action(mapped_hid, mapped_action)
+    end
+    return nil
   end
 
   local hid = remote_command[command]
@@ -4677,7 +4832,13 @@ function C4Driver.prewarm_crypto_stage(stage)
 end
 
 function C4Driver.prewarm_crypto()
-  return C4Driver.prewarm_crypto_stage(nil)
+  local start_time = os.clock()
+  Log.debug("crypto prewarm all started")
+  local ok, err = C4Driver.prewarm_crypto_stage(nil)
+  if ok then
+    Log.debug("crypto prewarm all passed ms=" .. tostring(elapsed_ms(start_time)))
+  end
+  return ok, err
 end
 
 function C4Driver.schedule_crypto_prewarm()
@@ -4688,19 +4849,14 @@ function C4Driver.schedule_crypto_prewarm()
     Log.debug("crypto prewarm schedule skipped: no pairing credentials")
     return
   end
-  SetTimer("AppleTV_crypto_prewarm_base", 2000, function()
-    C4Driver.prewarm_crypto_stage("base")
+  C4Driver.cancel_timer("AppleTV_crypto_prewarm_base")
+  C4Driver.cancel_timer("AppleTV_crypto_prewarm_controller")
+  C4Driver.cancel_timer("AppleTV_crypto_prewarm_atv")
+  C4Driver.cancel_timer("AppleTV_crypto_prewarm_x25519")
+  SetTimer("AppleTV_crypto_prewarm_all", 1000, function()
+    C4Driver.prewarm_crypto()
   end)
-  SetTimer("AppleTV_crypto_prewarm_controller", 4000, function()
-    C4Driver.prewarm_crypto_stage("controller")
-  end)
-  SetTimer("AppleTV_crypto_prewarm_atv", 6000, function()
-    C4Driver.prewarm_crypto_stage("atv")
-  end)
-  SetTimer("AppleTV_crypto_prewarm_x25519", 8000, function()
-    C4Driver.prewarm_crypto_stage("x25519")
-  end)
-  Log.debug("crypto prewarm scheduled: base=2s controller=4s atv=6s x25519=8s")
+  Log.debug("crypto prewarm scheduled: all=1s")
 end
 
 function C4Driver.cancel_timer(name)
@@ -4712,6 +4868,7 @@ function C4Driver.cancel_timer(name)
 end
 
 function C4Driver.cancel_driver_timers()
+  C4Driver.cancel_timer("AppleTV_crypto_prewarm_all")
   C4Driver.cancel_timer("AppleTV_crypto_prewarm_base")
   C4Driver.cancel_timer("AppleTV_crypto_prewarm_controller")
   C4Driver.cancel_timer("AppleTV_crypto_prewarm_atv")
@@ -4740,6 +4897,9 @@ EC.DISCONNECT_COMPANION = function()
 end
 EC.CHECK_CRYPTO_PROVIDER = function()
   return C4Driver.check_crypto_provider()
+end
+EC.PREWARM_CRYPTO = function()
+  return C4Driver.prewarm_crypto()
 end
 EC.IMPORT_COMPANION_CREDENTIALS = function(params)
   return C4Driver.import_credentials(params.CREDENTIALS or params.credentials or "")

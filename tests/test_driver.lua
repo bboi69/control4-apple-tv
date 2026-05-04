@@ -1006,6 +1006,33 @@ function tests.queued_command_reconnects_from_error_state_once()
   assert_eq(#client.pending_commands, 2, "commands queued while reconnecting")
 end
 
+function tests.queued_hid_commands_are_coalesced_while_connecting()
+  local client = Driver.CompanionClient.new({
+    credentials = Driver.Credentials.parse(table.concat({
+      Driver.Bytes.hex(string.rep("\x01", 32)),
+      Driver.Bytes.hex(string.rep("\x02", 32)),
+      Driver.Bytes.hex("ATV-ID"),
+      Driver.Bytes.hex("CLIENT-ID"),
+    }, ":")),
+    transport = { Write = function() end },
+  })
+  client.connecting = true
+  client.connect = function() end
+
+  client:send_or_queue_opack("_hidC", { _hidC = 5, _hBtS = 1 }, 2)
+  client:send_or_queue_opack("_hidC", { _hidC = 5, _hBtS = 2 }, 2)
+  client:send_or_queue_opack("_hidC", { _hidC = 5, _hBtS = 1 }, 2)
+  client:send_or_queue_opack("_hidC", { _hidC = 5, _hBtS = 2 }, 2)
+  client:send_or_queue_opack("_hidC", { _hidC = 1, _hBtS = 1 }, 2)
+
+  assert_eq(#client.pending_commands, 3, "queued HID commands coalesced by button")
+  assert_eq(client.pending_commands[1].content._hidC, 5, "menu HID retained")
+  assert_eq(client.pending_commands[1].content._hBtS, 1, "menu press retained")
+  assert_eq(client.pending_commands[2].content._hidC, 5, "menu release retained")
+  assert_eq(client.pending_commands[2].content._hBtS, 2, "menu release retained")
+  assert_eq(client.pending_commands[3].content._hidC, 1, "different HID retained")
+end
+
 function tests.active_session_command_reuses_connection()
   local writes = {}
   local client = Driver.CompanionClient.new({
@@ -1063,6 +1090,7 @@ function tests.driver_destroy_closes_client_and_cancels_timers()
   assert_eq(Driver.Companion.client, nil, "destroy clears client")
   assert_eq(Driver.Companion.socket, nil, "destroy clears socket")
   assert_eq(Driver.Companion.session, nil, "destroy clears session")
+  assert_contains(cancelled, "AppleTV_crypto_prewarm_all", "all prewarm timer cancelled")
   assert_contains(cancelled, "AppleTV_crypto_prewarm_base", "base prewarm timer cancelled")
   assert_contains(cancelled, "AppleTV_crypto_prewarm_controller", "controller prewarm timer cancelled")
   assert_contains(cancelled, "AppleTV_crypto_prewarm_atv", "atv prewarm timer cancelled")
@@ -1075,6 +1103,44 @@ function tests.driver_destroy_closes_client_and_cancels_timers()
   Driver.Companion.socket = old_socket
   Driver.Companion.session = old_session
   Driver.OpenSSLCrypto._pregenerated_x25519_keypair = old_pregen
+end
+
+function tests.crypto_prewarm_schedules_single_all_timer()
+  local old_c4 = C4
+  local old_set_timer = SetTimer
+  local old_cancel_timer = CancelTimer
+  local old_state = Driver.state
+  local old_credentials = Driver.Companion.credentials
+  local scheduled = {}
+  local cancelled = {}
+
+  C4 = { GetDeviceID = function() return 42 end }
+  SetTimer = function(name, delay, fn)
+    scheduled[#scheduled + 1] = { name = name, delay = delay, fn = fn }
+    return name
+  end
+  CancelTimer = function(name)
+    cancelled[#cancelled + 1] = name
+  end
+  Driver.state = { companion_credentials = "present" }
+  Driver.Companion.credentials = { type = "HAP" }
+
+  Driver.C4Driver.schedule_crypto_prewarm()
+
+  assert_eq(#scheduled, 1, "one prewarm timer scheduled")
+  assert_eq(scheduled[1].name, "AppleTV_crypto_prewarm_all", "all prewarm timer name")
+  assert_eq(scheduled[1].delay, 1000, "all prewarm timer delay")
+  assert(type(scheduled[1].fn) == "function", "all prewarm timer callback")
+  assert_contains(cancelled, "AppleTV_crypto_prewarm_base", "legacy base timer cancelled before scheduling")
+  assert_contains(cancelled, "AppleTV_crypto_prewarm_controller", "legacy controller timer cancelled before scheduling")
+  assert_contains(cancelled, "AppleTV_crypto_prewarm_atv", "legacy atv timer cancelled before scheduling")
+  assert_contains(cancelled, "AppleTV_crypto_prewarm_x25519", "legacy x25519 timer cancelled before scheduling")
+
+  C4 = old_c4
+  SetTimer = old_set_timer
+  CancelTimer = old_cancel_timer
+  Driver.state = old_state
+  Driver.Companion.credentials = old_credentials
 end
 
 function tests.opack_launch_request_roundtrip()
@@ -1129,6 +1195,10 @@ function tests.opack_requests_match_pyatv_source_vectors()
 end
 
 function tests.mini_app_launch_from_registered_binding()
+  local old_last_launch_id = Driver.C4MiniApps.last_launch_id
+  local old_last_launch_at_ms = Driver.C4MiniApps.last_launch_at_ms
+  Driver.C4MiniApps.last_launch_id = nil
+  Driver.C4MiniApps.last_launch_at_ms = nil
   Driver.Companion.sent_messages = {}
   Driver.C4MiniApps.register_binding(3101, {
     name = "Netflix",
@@ -1140,6 +1210,73 @@ function tests.mini_app_launch_from_registered_binding()
   local last = Driver.Companion.sent_messages[#Driver.Companion.sent_messages]
   assert_table_has(last, "_i", "_launchApp")
   assert_table_has(last._c, "_bundleID", "com.netflix.Netflix")
+  Driver.C4MiniApps.last_launch_id = old_last_launch_id
+  Driver.C4MiniApps.last_launch_at_ms = old_last_launch_at_ms
+end
+
+function tests.mini_app_launch_debounces_duplicate_switcher_burst()
+  local old_c4 = C4
+  local old_now_ms = Driver.C4MiniApps.now_ms
+  local old_last_launch_id = Driver.C4MiniApps.last_launch_id
+  local old_last_launch_at_ms = Driver.C4MiniApps.last_launch_at_ms
+  local old_app_list = Driver.Companion.app_list
+  local old_app_rows = Driver.Companion.app_list_rows
+  Driver.C4MiniApps.last_launch_id = nil
+  Driver.C4MiniApps.last_launch_at_ms = nil
+  Driver.C4MiniApps.now_ms = function() return 100000 end
+  C4 = {
+    GetDeviceID = function()
+      return 42
+    end,
+    GetBoundConsumerDevices = function(_, device_id, binding_id)
+      assert_eq(device_id, 42, "device id")
+      assert_eq(binding_id, 5002, "switcher binding")
+      return { [9001] = "App Switcher" }
+    end,
+    GetBoundProviderDevice = function(_, device_id, binding_id)
+      if device_id == 9001 and binding_id == 3103 then
+        return 9103
+      end
+      if device_id == 9103 and binding_id == 5001 then
+        return 9203
+      end
+      return nil
+    end,
+    GetDeviceVariables = function(_, device_id)
+      assert_eq(device_id, 9203, "app device id")
+      return {
+        { name = "APP_NAME", value = "YouTube" },
+        { name = "UM_APPLETV", value = "YouTube" },
+      }
+    end,
+  }
+  Driver.Companion.app_list = {
+    ["com.google.ios.youtube"] = "YouTube",
+  }
+  Driver.Companion.app_list_rows = {
+    { name = "YouTube", identifier = "com.google.ios.youtube" },
+  }
+  Driver.Companion.sent_messages = {}
+
+  ReceivedFromProxy(5002, "SET_INPUT", { INPUT = "3103" })
+  ReceivedFromProxy(5002, "SET_INPUT", { INPUT = "3103" })
+
+  assert_eq(#Driver.Companion.sent_messages, 1, "duplicate SET_INPUT sends one launch")
+  assert_eq(Driver.Companion.sent_messages[1]._c._bundleID, "com.google.ios.youtube", "launched YouTube")
+
+  C4 = old_c4
+  Driver.C4MiniApps.now_ms = old_now_ms
+  Driver.C4MiniApps.last_launch_id = old_last_launch_id
+  Driver.C4MiniApps.last_launch_at_ms = old_last_launch_at_ms
+  Driver.Companion.app_list = old_app_list
+  Driver.Companion.app_list_rows = old_app_rows
+end
+
+function tests.mini_app_ignores_composer_routing_chatter()
+  Driver.Companion.sent_messages = {}
+  ReceivedFromProxy(5002, "BINDING_CHANGE_ACTION", { BINDING_ID = "3103", IS_BOUND = "True" })
+  ReceivedFromProxy(5002, "CONNECT_OUTPUT", { OUTPUT = "2110", AUDIO = "True", VIDEO = "False" })
+  assert_eq(#Driver.Companion.sent_messages, 0, "routing chatter does not send Companion commands")
 end
 
 function tests.mini_app_launch_resolves_friendly_name_from_dynamic_app_list()
@@ -1515,6 +1652,50 @@ function tests.remote_passthrough_supports_doubletap_and_hold_actions()
   assert_eq(#Driver.Companion.sent_messages, 2, "start/stop sends press and release")
   assert_eq(Driver.Companion.sent_messages[1]._c._hBtS, 1, "start press")
   assert_eq(Driver.Companion.sent_messages[2]._c._hBtS, 2, "stop release")
+end
+
+function tests.remote_passthrough_uses_configurable_button_mapping()
+  local old_properties = Properties
+  Properties = {
+    ["CANCEL Button"] = "Menu",
+    ["PVR Button"] = "Back",
+    ["RECORD Button"] = "Play/Pause",
+    ["STAR Button"] = "Do Nothing",
+    ["INFO Button"] = "Dashboard (Hold TV Button)",
+  }
+
+  Driver.Companion.sent_messages = {}
+  ReceivedFromProxy(5002, "PASSTHROUGH", {
+    PASSTHROUGH_COMMAND = "CANCEL",
+    BEGIN = "1",
+  })
+  ReceivedFromProxy(5002, "PASSTHROUGH", {
+    PASSTHROUGH_COMMAND = "END_CANCEL",
+    DURATION = "11",
+  })
+  assert_eq(#Driver.Companion.sent_messages, 2, "cancel maps to menu press/release")
+  assert_eq(Driver.Companion.sent_messages[1]._c._hidC, 5, "cancel menu hid")
+  assert_eq(Driver.Companion.sent_messages[1]._c._hBtS, 1, "cancel menu press")
+  assert_eq(Driver.Companion.sent_messages[2]._c._hBtS, 2, "cancel menu release")
+
+  Driver.Companion.sent_messages = {}
+  ReceivedFromProxy(5001, "PVR", {})
+  assert_eq(#Driver.Companion.sent_messages, 2, "pvr maps to back/menu tap")
+  assert_eq(Driver.Companion.sent_messages[1]._c._hidC, 5, "pvr back hid")
+
+  Driver.Companion.sent_messages = {}
+  ReceivedFromProxy(5001, "RECORD", {})
+  assert_eq(Driver.Companion.sent_messages[1]._c._hidC, 14, "record play/pause hid")
+
+  Driver.Companion.sent_messages = {}
+  ReceivedFromProxy(5001, "STAR", {})
+  assert_eq(#Driver.Companion.sent_messages, 0, "star do nothing")
+
+  Driver.Companion.sent_messages = {}
+  ReceivedFromProxy(5001, "INFO", {})
+  assert_eq(Driver.Companion.sent_messages[1]._c._hidC, 7, "info dashboard home hid")
+
+  Properties = old_properties
 end
 
 function tests.app_list_current_app_and_now_playing_are_published()

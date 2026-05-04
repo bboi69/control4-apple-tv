@@ -483,6 +483,7 @@
         </connection>
     </connections>
     <config>
+        <documentation file="www/documentation.rtf" />
         <script file="driver.lua" />
         <properties>
             <property>
@@ -547,6 +548,143 @@
                 </items>
                 <default>On</default>
                 <readonly>false</readonly>
+                <tooltip>When On, MiniApp launches return selection to the main Apple TV device so remote commands keep controlling Apple TV.</tooltip>
+            </property>
+            <property>
+                <name>MENU Button</name>
+                <type>LIST</type>
+                <items>
+                    <item>Home</item>
+                    <item>Menu</item>
+                    <item>Back</item>
+                    <item>Guide</item>
+                    <item>Select</item>
+                    <item>Play/Pause</item>
+                    <item>Dashboard (Hold TV Button)</item>
+                    <item>Do Nothing</item>
+                </items>
+                <default>Home</default>
+                <readonly>false</readonly>
+            </property>
+            <property>
+                <name>GUIDE Button</name>
+                <type>LIST</type>
+                <items>
+                    <item>Home</item>
+                    <item>Menu</item>
+                    <item>Back</item>
+                    <item>Guide</item>
+                    <item>Select</item>
+                    <item>Play/Pause</item>
+                    <item>Dashboard (Hold TV Button)</item>
+                    <item>Do Nothing</item>
+                </items>
+                <default>Menu</default>
+                <readonly>false</readonly>
+            </property>
+            <property>
+                <name>INFO Button</name>
+                <type>LIST</type>
+                <items>
+                    <item>Home</item>
+                    <item>Menu</item>
+                    <item>Back</item>
+                    <item>Guide</item>
+                    <item>Select</item>
+                    <item>Play/Pause</item>
+                    <item>Dashboard (Hold TV Button)</item>
+                    <item>Do Nothing</item>
+                </items>
+                <default>Dashboard (Hold TV Button)</default>
+                <readonly>false</readonly>
+            </property>
+            <property>
+                <name>CANCEL Button</name>
+                <type>LIST</type>
+                <items>
+                    <item>Home</item>
+                    <item>Menu</item>
+                    <item>Back</item>
+                    <item>Guide</item>
+                    <item>Select</item>
+                    <item>Play/Pause</item>
+                    <item>Dashboard (Hold TV Button)</item>
+                    <item>Do Nothing</item>
+                </items>
+                <default>Menu</default>
+                <readonly>false</readonly>
+            </property>
+            <property>
+                <name>PVR Button</name>
+                <type>LIST</type>
+                <items>
+                    <item>Home</item>
+                    <item>Menu</item>
+                    <item>Back</item>
+                    <item>Guide</item>
+                    <item>Select</item>
+                    <item>Play/Pause</item>
+                    <item>Dashboard (Hold TV Button)</item>
+                    <item>Do Nothing</item>
+                </items>
+                <default>Back</default>
+                <readonly>false</readonly>
+            </property>
+            <property>
+                <name>STAR Button</name>
+                <type>LIST</type>
+                <items>
+                    <item>Home</item>
+                    <item>Menu</item>
+                    <item>Back</item>
+                    <item>Guide</item>
+                    <item>Select</item>
+                    <item>Play/Pause</item>
+                    <item>Dashboard (Hold TV Button)</item>
+                    <item>Do Nothing</item>
+                </items>
+                <default>Do Nothing</default>
+                <readonly>false</readonly>
+            </property>
+            <property>
+                <name>POUND Button</name>
+                <type>LIST</type>
+                <items>
+                    <item>Home</item>
+                    <item>Menu</item>
+                    <item>Back</item>
+                    <item>Guide</item>
+                    <item>Select</item>
+                    <item>Play/Pause</item>
+                    <item>Dashboard (Hold TV Button)</item>
+                    <item>Do Nothing</item>
+                </items>
+                <default>Do Nothing</default>
+                <readonly>false</readonly>
+            </property>
+            <property>
+                <name>RECORD Button</name>
+                <type>LIST</type>
+                <items>
+                    <item>Home</item>
+                    <item>Menu</item>
+                    <item>Back</item>
+                    <item>Guide</item>
+                    <item>Select</item>
+                    <item>Play/Pause</item>
+                    <item>Dashboard (Hold TV Button)</item>
+                    <item>Do Nothing</item>
+                </items>
+                <default>Play/Pause</default>
+                <readonly>false</readonly>
+            </property>
+            <property>
+                <name>Button Hold Threshold</name>
+                <type>RANGED_INTEGER</type>
+                <default>400</default>
+                <minimum>100</minimum>
+                <maximum>2000</maximum>
+                <readonly>false</readonly>
             </property>
             <property>
                 <name>Debug Mode</name>
@@ -579,6 +717,10 @@
             <action>
                 <name>Check Crypto Provider</name>
                 <command>CHECK_CRYPTO_PROVIDER</command>
+            </action>
+            <action>
+                <name>Prewarm Crypto</name>
+                <command>PREWARM_CRYPTO</command>
             </action>
             <action>
                 <name>Pair Apple TV</name>
