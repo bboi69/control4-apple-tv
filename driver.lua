@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.7-dev",
+  VERSION = "0.1.8-dev",
 }
 
 local function has_c4()
@@ -781,7 +781,7 @@ end
 
 local Bit32 = {}
 do
-  local ok, native = pcall(load([[
+  local native_loader = load([[
     return {
       band = function(a, b) return (a & b) & 0xffffffff end,
       bor  = function(a, b) return (a | b) & 0xffffffff end,
@@ -789,7 +789,11 @@ do
       lshift = function(a, n) return (a << n) & 0xffffffff end,
       rshift = function(a, n) return (a >> n) & 0xffffffff end,
     }
-  ]]))
+  ]])
+  local ok, native = false, nil
+  if native_loader then
+    ok, native = pcall(native_loader)
+  end
   if ok and native then
     Bit32 = native
   elseif bit32 then
@@ -798,6 +802,12 @@ do
     Bit32.bxor = bit32.bxor
     Bit32.lshift = bit32.lshift
     Bit32.rshift = bit32.rshift
+  elseif bit then
+    Bit32.band = bit.band
+    Bit32.bor = bit.bor
+    Bit32.bxor = bit.bxor
+    Bit32.lshift = bit.lshift
+    Bit32.rshift = bit.rshift
   else
     local function bitop(a, b, op)
       local result, bit = 0, 1
