@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.5-dev",
+  VERSION = "0.1.6-dev",
 }
 
 local function has_c4()
@@ -1641,6 +1641,7 @@ local OpenSSLCrypto = {
 OpenSSLCrypto.EVP_CTRL_AEAD_GET_TAG = 0x10
 OpenSSLCrypto.EVP_CTRL_AEAD_SET_TAG = 0x11
 OpenSSLCrypto.EVP_CTRL_AEAD_SET_IVLEN = 0x09
+OpenSSLCrypto.chacha_variant = nil
 
 function OpenSSLCrypto.load_openssl()
   if OpenSSLCrypto.openssl then
@@ -1752,29 +1753,65 @@ function OpenSSLCrypto._cipher_ctrl(name, fallback)
   return cipher[name] or fallback
 end
 
-function OpenSSLCrypto._cipher_ctx(encrypting, key, nonce)
+function OpenSSLCrypto._chacha_algorithm()
   local cipher = OpenSSLCrypto._cipher()
   local algorithm, algorithm_err = cipher.get("chacha20-poly1305")
-  algorithm = openssl_assert(algorithm, algorithm_err, "get ChaCha20-Poly1305 cipher")
+  return openssl_assert(algorithm, algorithm_err, "get ChaCha20-Poly1305 cipher")
+end
+
+function OpenSSLCrypto._cipher_ctx(encrypting, key, nonce, variant)
+  local cipher = OpenSSLCrypto._cipher()
+  local algorithm = OpenSSLCrypto._chacha_algorithm()
   local ctx, err
-  if encrypting then
-    ctx, err = algorithm:encrypt_new()
-    ctx = openssl_assert(ctx, err, "create ChaCha20-Poly1305 encrypt context")
-  else
-    ctx, err = algorithm:decrypt_new()
-    ctx = openssl_assert(ctx, err, "create ChaCha20-Poly1305 decrypt context")
+  variant = variant or OpenSSLCrypto.chacha_variant or "method_init_ctrl"
+
+  if variant == "method_args" then
+    if encrypting then
+      ctx, err = algorithm:encrypt_new(key, nonce)
+    else
+      ctx, err = algorithm:decrypt_new(key, nonce)
+    end
+    return openssl_assert(ctx, err, "create ChaCha20-Poly1305 " .. (encrypting and "encrypt" or "decrypt") .. " context")
   end
+
+  if variant == "method_args_pad_false" then
+    if encrypting then
+      ctx, err = algorithm:encrypt_new(key, nonce, false)
+    else
+      ctx, err = algorithm:decrypt_new(key, nonce, false)
+    end
+    return openssl_assert(ctx, err, "create ChaCha20-Poly1305 " .. (encrypting and "encrypt" or "decrypt") .. " context")
+  end
+
+  if variant == "module_new_ctrl" or variant == "module_new_no_ctrl" then
+    assert(cipher.new, "lua-openssl cipher.new is required for " .. variant)
+    ctx, err = cipher.new(algorithm, encrypting)
+    ctx = openssl_assert(ctx, err, "create ChaCha20-Poly1305 context")
+  elseif variant == "module_new_named_ctrl" or variant == "module_new_named_no_ctrl" then
+    assert(cipher.new, "lua-openssl cipher.new is required for " .. variant)
+    ctx, err = cipher.new("chacha20-poly1305", encrypting)
+    ctx = openssl_assert(ctx, err, "create ChaCha20-Poly1305 context")
+  else
+    if encrypting then
+      ctx, err = algorithm:encrypt_new()
+      ctx = openssl_assert(ctx, err, "create ChaCha20-Poly1305 encrypt context")
+    else
+      ctx, err = algorithm:decrypt_new()
+      ctx = openssl_assert(ctx, err, "create ChaCha20-Poly1305 decrypt context")
+    end
+  end
+
   assert(ctx.init, "lua-openssl cipher context init is required for ChaCha20-Poly1305 AEAD")
-  openssl_assert(ctx:ctrl(OpenSSLCrypto._cipher_ctrl("EVP_CTRL_GCM_SET_IVLEN", OpenSSLCrypto.EVP_CTRL_AEAD_SET_IVLEN), #nonce),
-    nil, "set ChaCha20-Poly1305 IV length")
+  if variant ~= "method_init_no_ctrl" and variant ~= "module_new_no_ctrl" and variant ~= "module_new_named_no_ctrl" then
+    openssl_assert(ctx:ctrl(OpenSSLCrypto._cipher_ctrl("EVP_CTRL_GCM_SET_IVLEN", OpenSSLCrypto.EVP_CTRL_AEAD_SET_IVLEN), #nonce),
+      nil, "set ChaCha20-Poly1305 IV length")
+  end
   openssl_assert(ctx:init(key, nonce), nil, "initialize ChaCha20-Poly1305 context")
   return ctx
 end
 
-function OpenSSLCrypto._chacha20_poly1305_encrypt(key, nonce, plaintext, aad)
-  assert(#key == 32, "ChaCha20-Poly1305 key must be 32 bytes")
-  assert(#nonce == 12, "ChaCha20-Poly1305 nonce must be 12 bytes")
-  local ctx = OpenSSLCrypto._cipher_ctx(true, key, nonce)
+function OpenSSLCrypto._chacha20_poly1305_encrypt_variant(variant, key, nonce, plaintext, aad)
+  local ctx = OpenSSLCrypto._cipher_ctx(true, key, nonce, variant)
   if aad and aad ~= "" then
     ctx:update(aad, true)
   end
@@ -1784,19 +1821,65 @@ function OpenSSLCrypto._chacha20_poly1305_encrypt(key, nonce, plaintext, aad)
   return ciphertext .. tag
 end
 
-function OpenSSLCrypto._chacha20_poly1305_decrypt(key, nonce, ciphertext_and_tag, aad)
-  assert(#key == 32, "ChaCha20-Poly1305 key must be 32 bytes")
-  assert(#nonce == 12, "ChaCha20-Poly1305 nonce must be 12 bytes")
+function OpenSSLCrypto._chacha20_poly1305_decrypt_variant(variant, key, nonce, ciphertext_and_tag, aad)
   assert(#ciphertext_and_tag >= 16, "ChaCha20-Poly1305 ciphertext is missing auth tag")
   local ciphertext = ciphertext_and_tag:sub(1, #ciphertext_and_tag - 16)
   local tag = ciphertext_and_tag:sub(#ciphertext_and_tag - 15)
-  local ctx = OpenSSLCrypto._cipher_ctx(false, key, nonce)
+  local ctx = OpenSSLCrypto._cipher_ctx(false, key, nonce, variant)
+  assert(ctx:ctrl(OpenSSLCrypto._cipher_ctrl("EVP_CTRL_GCM_SET_TAG", OpenSSLCrypto.EVP_CTRL_AEAD_SET_TAG), tag),
+    "failed to set ChaCha20-Poly1305 auth tag")
   if aad and aad ~= "" then
     ctx:update(aad, true)
   end
-  assert(ctx:ctrl(OpenSSLCrypto._cipher_ctrl("EVP_CTRL_GCM_SET_TAG", OpenSSLCrypto.EVP_CTRL_AEAD_SET_TAG), tag),
-    "failed to set ChaCha20-Poly1305 auth tag")
   return (ctx:update(ciphertext) or "") .. (ctx:final() or "")
+end
+
+function OpenSSLCrypto._select_chacha_variant()
+  if OpenSSLCrypto.chacha_variant then
+    return OpenSSLCrypto.chacha_variant
+  end
+  local variants = {
+    "method_init_ctrl",
+    "method_init_no_ctrl",
+    "method_args",
+    "method_args_pad_false",
+    "module_new_ctrl",
+    "module_new_no_ctrl",
+    "module_new_named_ctrl",
+    "module_new_named_no_ctrl",
+  }
+  local key = Bytes.from_hex(
+    "000102030405060708090a0b0c0d0e0f" ..
+    "101112131415161718191a1b1c1d1e1f"
+  )
+  local nonce = Bytes.from_hex("000102030405060708090a0b")
+  local expected = Bytes.from_hex("f99769694763c038c388540d8367db9102148f2c2034e779d0")
+  local diagnostics = {}
+  for _, variant in ipairs(variants) do
+    local ok, result = pcall(OpenSSLCrypto._chacha20_poly1305_encrypt_variant,
+      variant, key, nonce, "plaintext", "aad")
+    if ok and result == expected then
+      OpenSSLCrypto.chacha_variant = variant
+      Log.debug("crypto self-test: ChaCha20-Poly1305 using variant " .. variant)
+      return variant
+    end
+    diagnostics[#diagnostics + 1] = variant .. "=" .. (ok and Bytes.hex(result) or tostring(result))
+  end
+  error("no usable ChaCha20-Poly1305 lua-openssl call shape: " .. table.concat(diagnostics, "; "))
+end
+
+function OpenSSLCrypto._chacha20_poly1305_encrypt(key, nonce, plaintext, aad)
+  assert(#key == 32, "ChaCha20-Poly1305 key must be 32 bytes")
+  assert(#nonce == 12, "ChaCha20-Poly1305 nonce must be 12 bytes")
+  return OpenSSLCrypto._chacha20_poly1305_encrypt_variant(
+    OpenSSLCrypto._select_chacha_variant(), key, nonce, plaintext, aad)
+end
+
+function OpenSSLCrypto._chacha20_poly1305_decrypt(key, nonce, ciphertext_and_tag, aad)
+  assert(#key == 32, "ChaCha20-Poly1305 key must be 32 bytes")
+  assert(#nonce == 12, "ChaCha20-Poly1305 nonce must be 12 bytes")
+  return OpenSSLCrypto._chacha20_poly1305_decrypt_variant(
+    OpenSSLCrypto._select_chacha_variant(), key, nonce, ciphertext_and_tag, aad)
 end
 
 function OpenSSLCrypto.encrypt(output_key, plaintext, aad, nonce)
