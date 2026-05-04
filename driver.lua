@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.17-dev",
+  VERSION = "0.1.18-dev",
 }
 
 local function has_c4()
@@ -410,8 +410,39 @@ local function opack_decode_at(data, index, object_list)
   if marker == 0x02 then
     return false, index + 1
   end
+  if marker == 0x04 then
+    return nil, index + 1
+  end
+  if marker == 0x05 then
+    local value = data:sub(index + 1, index + 16)
+    assert(#value == 16, "truncated OPACK UUID")
+    local hex = Bytes.hex(value)
+    local uuid = hex:sub(1, 8) .. "-" ..
+      hex:sub(9, 12) .. "-" ..
+      hex:sub(13, 16) .. "-" ..
+      hex:sub(17, 20) .. "-" ..
+      hex:sub(21, 32)
+    object_list[#object_list + 1] = uuid
+    return uuid, index + 17
+  end
+  if marker == 0x06 then
+    local value = 0
+    for i = 0, 7 do
+      local byte = data:byte(index + 1 + i)
+      assert(byte, "truncated OPACK absolute time")
+      value = value + byte * (0x100 ^ i)
+    end
+    object_list[#object_list + 1] = value
+    return value, index + 9
+  end
   if marker >= 0x08 and marker <= 0x2F then
     return marker - 0x08, index + 1
+  end
+  if marker == 0x35 then
+    error("unsupported OPACK float32")
+  end
+  if marker == 0x36 then
+    error("unsupported OPACK float64")
   end
   if marker >= 0x30 and marker <= 0x33 then
     local length = 2 ^ (marker - 0x30)
@@ -492,12 +523,23 @@ local function opack_decode_at(data, index, object_list)
     local count = marker - 0xE0
     local result = {}
     index = index + 1
-    for _ = 1, count do
-      local key
-      key, index = opack_decode_at(data, index, object_list)
-      local value
-      value, index = opack_decode_at(data, index, object_list)
-      result[key] = value
+    if count == 0x0F then  -- endless dictionary terminated by 0x03
+      while data:byte(index) ~= 0x03 do
+        local key
+        key, index = opack_decode_at(data, index, object_list)
+        local value
+        value, index = opack_decode_at(data, index, object_list)
+        result[key] = value
+      end
+      index = index + 1
+    else
+      for _ = 1, count do
+        local key
+        key, index = opack_decode_at(data, index, object_list)
+        local value
+        value, index = opack_decode_at(data, index, object_list)
+        result[key] = value
+      end
     end
     return result, index
   end

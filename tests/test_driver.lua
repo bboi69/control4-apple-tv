@@ -1460,6 +1460,20 @@ function tests.opack_object_references_decode()
   assert_eq(decoded.copy, "_pd", "second object reference")
 end
 
+function tests.opack_uuid_nil_and_endless_dict_decode()
+  local uuid_bytes = Driver.Bytes.from_hex("00112233445566778899aabbccddeeff")
+  local encoded_uuid = "\x05" .. uuid_bytes
+  assert_eq(Driver.OPACK.decode(encoded_uuid), "00112233-4455-6677-8899-aabbccddeeff", "uuid marker")
+
+  local encoded = "\xef" ..
+    "\x44" .. "none" .. "\x04" ..
+    "\x44" .. "uuid" .. encoded_uuid ..
+    "\x03"
+  local decoded = Driver.OPACK.decode(encoded)
+  assert_eq(decoded.none, nil, "nil marker")
+  assert_eq(decoded.uuid, "00112233-4455-6677-8899-aabbccddeeff", "uuid in endless dict")
+end
+
 function tests.pair_setup_m1_to_m6_with_mock_crypto()
   -- Full M1→M6 flow with injected crypto.
   -- The SRP computation is bypassed: mock returns pre-cooked A, K, M1 values.
