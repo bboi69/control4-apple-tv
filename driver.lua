@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.10-dev",
+  VERSION = "0.1.11-dev",
 }
 
 local function has_c4()
@@ -2180,6 +2180,10 @@ function OpenSSLCrypto.pair_verify_response(credentials, private_key, public_key
     " session_sha=" .. fp(session_key) ..
     " nonce=" .. Bytes.hex(nonce) ..
     " tag=" .. Bytes.hex(encrypted_data:sub(#encrypted_data - 15)))
+  Log.debug("Pair-Verify M2 repro: client_private=" .. Bytes.hex(private_key) ..
+    " client_public=" .. Bytes.hex(public_key) ..
+    " server_public=" .. Bytes.hex(server_public_key) ..
+    " encrypted=" .. Bytes.hex(encrypted_data))
   local decrypted = OpenSSLCrypto._chacha20_poly1305_decrypt(
     session_key,
     nonce,
