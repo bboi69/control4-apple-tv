@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.0-dev",
+  VERSION = "0.1.1-dev",
 }
 
 local function has_c4()
