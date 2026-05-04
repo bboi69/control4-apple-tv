@@ -1538,6 +1538,19 @@ function tests.opack_uuid_nil_and_endless_dict_decode()
   assert_eq(decoded.uuid, "00112233-4455-6677-8899-aabbccddeeff", "uuid in endless dict")
 end
 
+function tests.opack_float_decode()
+  local decoded32 = Driver.OPACK.decode("\x35\x00\x00\xc0\x3f")
+  assert(math.abs(decoded32 - 1.5) < 0.000001, "float32 marker")
+
+  local decoded64 = Driver.OPACK.decode("\x36\x00\x00\x00\x00\x00\x00\x02\xc0")
+  assert(math.abs(decoded64 + 2.25) < 0.000001, "float64 marker")
+
+  local encoded = "\xd2" .. "\x35\x00\x00\x20\x40" .. "\xa0"
+  local decoded = Driver.OPACK.decode(encoded)
+  assert(math.abs(decoded[1] - 2.5) < 0.000001, "float32 in array")
+  assert_eq(decoded[2], decoded[1], "float object reference")
+end
+
 function tests.pair_setup_m1_to_m6_with_mock_crypto()
   -- Full M1→M6 flow with injected crypto.
   -- The SRP computation is bypassed: mock returns pre-cooked A, K, M1 values.

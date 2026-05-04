@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.19-dev",
+  VERSION = "0.1.20-dev",
 }
 
 local function has_c4()
@@ -399,6 +399,46 @@ function OPACK.encode(value)
   return OPACK._encode(value, {})
 end
 
+local function decode_ieee754(sign, exponent, fraction, exponent_bits, fraction_bits, bias)
+  local sign_multiplier = sign == 1 and -1 or 1
+  local max_exponent = (2 ^ exponent_bits) - 1
+  if exponent == max_exponent then
+    if fraction == 0 then
+      return sign_multiplier * math.huge
+    end
+    return 0 / 0
+  end
+  if exponent == 0 then
+    if fraction == 0 then
+      return sign_multiplier * 0
+    end
+    return sign_multiplier * (fraction / (2 ^ fraction_bits)) * (2 ^ (1 - bias))
+  end
+  return sign_multiplier * (1 + fraction / (2 ^ fraction_bits)) * (2 ^ (exponent - bias))
+end
+
+local function decode_float32_le(data, index)
+  local b1, b2, b3, b4 = data:byte(index, index + 3)
+  assert(b1 and b2 and b3 and b4, "truncated OPACK float32")
+  local raw = b1 + b2 * 0x100 + b3 * 0x10000 + b4 * 0x1000000
+  local sign = math.floor(raw / 0x80000000)
+  local exponent = math.floor(raw / 0x800000) % 0x100
+  local fraction = raw % 0x800000
+  return decode_ieee754(sign, exponent, fraction, 8, 23, 127)
+end
+
+local function decode_float64_le(data, index)
+  local b = { data:byte(index, index + 7) }
+  assert(#b == 8, "truncated OPACK float64")
+  local low32 = b[1] + b[2] * 0x100 + b[3] * 0x10000 + b[4] * 0x1000000
+  local high32 = b[5] + b[6] * 0x100 + b[7] * 0x10000 + b[8] * 0x1000000
+  local sign = math.floor(high32 / 0x80000000)
+  local exponent = math.floor(high32 / 0x100000) % 0x800
+  local high_fraction = high32 % 0x100000
+  local fraction = high_fraction * 0x100000000 + low32
+  return decode_ieee754(sign, exponent, fraction, 11, 52, 1023)
+end
+
 local function opack_decode_at(data, index, object_list)
   object_list = object_list or {}
   local marker = data:byte(index)
@@ -439,10 +479,14 @@ local function opack_decode_at(data, index, object_list)
     return marker - 0x08, index + 1
   end
   if marker == 0x35 then
-    error("unsupported OPACK float32")
+    local value = decode_float32_le(data, index + 1)
+    object_list[#object_list + 1] = value
+    return value, index + 5
   end
   if marker == 0x36 then
-    error("unsupported OPACK float64")
+    local value = decode_float64_le(data, index + 1)
+    object_list[#object_list + 1] = value
+    return value, index + 9
   end
   if marker >= 0x30 and marker <= 0x33 then
     local length = 2 ^ (marker - 0x30)
