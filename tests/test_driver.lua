@@ -1279,6 +1279,13 @@ function tests.opack_array_encode_decode()
   assert_eq(dec2.apps[1], "com.netflix.Netflix", "apps[1]")
 end
 
+function tests.opack_object_references_decode()
+  local encoded = "\xe2" .. "\x43" .. "_pd" .. "\xa0" .. "\x44" .. "copy" .. "\xa0"
+  local decoded = Driver.OPACK.decode(encoded)
+  assert_eq(decoded._pd, "_pd", "short object reference")
+  assert_eq(decoded.copy, "_pd", "second object reference")
+end
+
 function tests.pair_setup_m1_to_m6_with_mock_crypto()
   -- Full M1→M6 flow with injected crypto.
   -- The SRP computation is bypassed: mock returns pre-cooked A, K, M1 values.

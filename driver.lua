@@ -399,7 +399,8 @@ function OPACK.encode(value)
   return OPACK._encode(value, {})
 end
 
-local function opack_decode_at(data, index)
+local function opack_decode_at(data, index, object_list)
+  object_list = object_list or {}
   local marker = data:byte(index)
   assert(marker, "truncated OPACK")
 
@@ -426,6 +427,7 @@ local function opack_decode_at(data, index)
     local length = marker - 0x40
     local value = data:sub(index + 1, index + length)
     assert(#value == length, "truncated OPACK string")
+    if value ~= "" then object_list[#object_list + 1] = value end
     return value, index + 1 + length
   end
   if marker > 0x60 and marker <= 0x64 then
@@ -439,13 +441,16 @@ local function opack_decode_at(data, index)
     local value_start = index + 1 + length_bytes
     local value = data:sub(value_start, value_start + length - 1)
     assert(#value == length, "truncated OPACK string")
+    if value ~= "" then object_list[#object_list + 1] = value end
     return value, value_start + length
   end
   if marker >= 0x70 and marker <= 0x90 then
     local length = marker - 0x70
     local value = data:sub(index + 1, index + length)
     assert(#value == length, "truncated OPACK bytes")
-    return OPACK.bytes(value), index + 1 + length
+    local wrapped = OPACK.bytes(value)
+    if #value > 0 then object_list[#object_list + 1] = wrapped end
+    return wrapped, index + 1 + length
   end
   if marker >= 0x91 and marker <= 0x94 then
     local length_bytes = 2 ^ (marker - 0x91)
@@ -458,7 +463,9 @@ local function opack_decode_at(data, index)
     local value_start = index + 1 + length_bytes
     local value = data:sub(value_start, value_start + length - 1)
     assert(#value == length, "truncated OPACK bytes")
-    return OPACK.bytes(value), value_start + length
+    local wrapped = OPACK.bytes(value)
+    object_list[#object_list + 1] = wrapped
+    return wrapped, value_start + length
   end
   if marker >= 0xD0 and marker <= 0xDF then
     local count = marker - 0xD0
@@ -467,14 +474,14 @@ local function opack_decode_at(data, index)
     if count == 0x0F then  -- endless array terminated by 0x03
       while data:byte(index) ~= 0x03 do
         local elem
-        elem, index = opack_decode_at(data, index)
+        elem, index = opack_decode_at(data, index, object_list)
         result[#result + 1] = elem
       end
       index = index + 1
     else
       for _ = 1, count do
         local elem
-        elem, index = opack_decode_at(data, index)
+        elem, index = opack_decode_at(data, index, object_list)
         result[#result + 1] = elem
       end
     end
@@ -487,19 +494,39 @@ local function opack_decode_at(data, index)
     index = index + 1
     for _ = 1, count do
       local key
-      key, index = opack_decode_at(data, index)
+      key, index = opack_decode_at(data, index, object_list)
       local value
-      value, index = opack_decode_at(data, index)
+      value, index = opack_decode_at(data, index, object_list)
       result[key] = value
     end
     return result, index
+  end
+
+  if marker >= 0xA0 and marker <= 0xC0 then
+    local object_index = marker - 0xA0 + 1
+    local value = object_list[object_index]
+    assert(value ~= nil, "invalid OPACK object reference")
+    return value, index + 1
+  end
+
+  if marker >= 0xC1 and marker <= 0xC4 then
+    local length_bytes = marker - 0xC0
+    local object_index = 0
+    for i = 0, length_bytes - 1 do
+      local byte = data:byte(index + 1 + i)
+      assert(byte, "truncated OPACK object reference")
+      object_index = object_index + byte * (0x100 ^ i)
+    end
+    local value = object_list[object_index + 1]
+    assert(value ~= nil, "invalid OPACK object reference")
+    return value, index + 1 + length_bytes
   end
 
   error(string.format("unsupported OPACK marker 0x%02x", marker))
 end
 
 function OPACK.decode(data)
-  local value, index = opack_decode_at(data, 1)
+  local value, index = opack_decode_at(data, 1, {})
   assert(index == #data + 1, "trailing OPACK bytes")
   return value
 end
@@ -1984,7 +2011,14 @@ end
 function PairVerify.decode_pairing_data(payload)
   local message = OPACK.decode(payload)
   assert(type(message) == "table" and message._pd and message._pd.__opack_type == "bytes", "no pairing data in Companion auth message")
-  local tlv = TLV8.decode(message._pd.data)
+  local ok, tlv_or_err = pcall(TLV8.decode, message._pd.data)
+  if not ok then
+    Log.error("Pair-Verify pairing data TLV decode failed: len=" .. tostring(#message._pd.data) ..
+      " head=" .. Bytes.hex(message._pd.data:sub(1, 32)) ..
+      " tail=" .. Bytes.hex(message._pd.data:sub(math.max(1, #message._pd.data - 31))))
+    error(tlv_or_err, 2)
+  end
+  local tlv = tlv_or_err
   assert(not tlv[7], "Apple TV returned pairing error")
   return tlv, message
 end
