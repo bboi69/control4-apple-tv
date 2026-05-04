@@ -1127,6 +1127,118 @@ function tests.airplay_pair_verify_probe_posts_hap_tlv_steps()
   Driver.AirPlay.control_keys = old_control_keys
 end
 
+function tests.hap_session_encrypts_with_length_aad_and_padded_counter_nonce()
+  local calls = {}
+  local fake_crypto = {
+    encrypt = function(key, plaintext, aad, nonce)
+      calls[#calls + 1] = {
+        op = "encrypt",
+        key = key,
+        plaintext = plaintext,
+        aad = aad,
+        nonce = nonce,
+      }
+      return plaintext .. string.rep("T", 16)
+    end,
+    decrypt = function(key, ciphertext, aad, nonce)
+      calls[#calls + 1] = {
+        op = "decrypt",
+        key = key,
+        ciphertext = ciphertext,
+        aad = aad,
+        nonce = nonce,
+      }
+      return ciphertext:sub(1, #ciphertext - 16)
+    end,
+  }
+
+  local session = Driver.HAPSession.new("write-key", "read-key", fake_crypto)
+  local encrypted = session:encrypt("hello")
+  assert_eq(encrypted:sub(1, 2), Driver.Bytes.uint_le(5, 2), "HAP frame length")
+  assert_eq(calls[1].key, "write-key", "HAP encrypt key")
+  assert_eq(calls[1].aad, Driver.Bytes.uint_le(5, 2), "HAP length aad")
+  assert_eq(Driver.Bytes.hex(calls[1].nonce), "000000000000000000000000", "HAP first nonce")
+
+  local plaintext = session:decrypt(Driver.Bytes.uint_le(5, 2) .. "world" .. string.rep("T", 16))
+  assert_eq(plaintext, "world", "HAP decrypted plaintext")
+  assert_eq(calls[2].key, "read-key", "HAP decrypt key")
+  assert_eq(calls[2].aad, Driver.Bytes.uint_le(5, 2), "HAP decrypt aad")
+  assert_eq(Driver.Bytes.hex(calls[2].nonce), "000000000000000000000000", "HAP first decrypt nonce")
+end
+
+function tests.airplay_control_client_pair_verifies_then_gets_encrypted_info()
+  local credentials = Driver.Credentials.parse(table.concat({
+    Driver.Bytes.hex(bytes_range(0, 31)),
+    Driver.Bytes.hex(bytes_range(32, 63)),
+    Driver.Bytes.hex("ATV-ID"),
+    Driver.Bytes.hex("CLIENT-ID"),
+  }, ":"))
+  local fake_crypto = {
+    generate_x25519_keypair = function()
+      return { private_key = "private-key", public_key = bytes_range(64, 95) }
+    end,
+    pair_verify_response = function(_, _, _, _, _)
+      return "encrypted-response", "shared-secret"
+    end,
+    hkdf_sha512 = function(_, info, _)
+      if info == "Control-Write-Encryption-Key" then return "write-key" end
+      if info == "Control-Read-Encryption-Key" then return "read-key" end
+      error("unexpected hkdf info")
+    end,
+    encrypt = function(_, plaintext)
+      return plaintext .. string.rep("T", 16)
+    end,
+    decrypt = function(_, ciphertext)
+      return ciphertext:sub(1, #ciphertext - 16)
+    end,
+  }
+  local writes = {}
+  local transport = {
+    Write = function(_, data)
+      writes[#writes + 1] = data
+      return true
+    end,
+  }
+  local received_info
+  local client = Driver.AirPlayControlClient.new({
+    host = "192.0.2.55",
+    port = 7000,
+    credentials = credentials,
+    crypto = fake_crypto,
+    transport = transport,
+    on_info = function(response)
+      received_info = response
+    end,
+  })
+
+  local function http_response(body, content_type)
+    return table.concat({
+      "HTTP/1.1 200 OK",
+      "Content-Type: " .. (content_type or "application/octet-stream"),
+      "Content-Length: " .. tostring(#(body or "")),
+      "",
+      "",
+    }, "\r\n") .. (body or "")
+  end
+
+  client:connect()
+  assert(writes[1]:find("POST /pair%-verify HTTP/1.1"), "pair verify m1 request")
+  client:receive(http_response(Driver.TLV8.encode_ordered({
+    { 3, bytes_range(96, 127) },
+    { 5, "encrypted-challenge" },
+  })))
+  assert(writes[2]:find("POST /pair%-verify HTTP/1.1"), "pair verify m3 request")
+  client:receive(http_response(Driver.TLV8.encode_ordered({ { 6, string.char(0x04) } })))
+  assert_eq(client.state, "ENCRYPTED_INFO", "encrypted info state")
+  assert_eq(writes[3]:sub(1, 2), Driver.Bytes.uint_le(#"GET /info HTTP/1.1\r\nHost: 192.0.2.55:7000\r\nUser-Agent: AirPlay/550.10\r\nConnection: keep-alive\r\nAccept: application/x-apple-binary-plist\r\n\r\n", 2), "encrypted GET length")
+
+  local encrypted_response = http_response("bplist-body", "application/x-apple-binary-plist")
+  client:receive(Driver.Bytes.uint_le(#encrypted_response, 2) .. encrypted_response .. string.rep("T", 16))
+  assert(received_info ~= nil, "encrypted info callback")
+  assert_eq(received_info.status, 200, "encrypted info status")
+  assert_eq(received_info.body, "bplist-body", "encrypted info body")
+end
+
 function tests.airplay_pairing_flow_saves_credentials()
   local old_c4 = C4
   local old_properties = Properties

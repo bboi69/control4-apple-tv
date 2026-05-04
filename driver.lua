@@ -422,6 +422,13 @@ function Bytes.uint_le(value, length)
   return table.concat(out)
 end
 
+function Bytes.read_u16le(data, offset)
+  offset = offset or 1
+  local b1, b2 = data:byte(offset, offset + 1)
+  assert(b1 and b2, "not enough bytes for u16le")
+  return b1 + b2 * 0x100
+end
+
 local TLV8 = {}
 
 function TLV8.encode_ordered(entries)
@@ -3560,6 +3567,63 @@ function CompanionSession:try_decode(buffer)
   }, buffer:sub(frame_end + 1)
 end
 
+local HAPSession = {}
+HAPSession.FRAME_LENGTH = 1024
+HAPSession.AUTH_TAG_LENGTH = 16
+
+function HAPSession.new(output_key, input_key, crypto)
+  return setmetatable({
+    output_key = output_key,
+    input_key = input_key,
+    crypto = crypto or Crypto,
+    out_counter = 0,
+    in_counter = 0,
+    encrypted_buffer = "",
+  }, { __index = HAPSession })
+end
+
+function HAPSession:nonce(counter)
+  return string.rep("\0", 4) .. Bytes.uint_le(counter, 8)
+end
+
+function HAPSession:encrypt(data)
+  assert(type(data) == "string", "HAP plaintext must be a string")
+  local out = {}
+  local index = 1
+  while index <= #data do
+    local frame = data:sub(index, index + HAPSession.FRAME_LENGTH - 1)
+    index = index + HAPSession.FRAME_LENGTH
+    local length = Bytes.uint_le(#frame, 2)
+    local nonce = self:nonce(self.out_counter)
+    self.out_counter = self.out_counter + 1
+    out[#out + 1] = length .. crypto_method(self.crypto, "encrypt")(self.output_key, frame, length, nonce)
+  end
+  return table.concat(out)
+end
+
+function HAPSession:decrypt(data)
+  assert(type(data) == "string", "HAP ciphertext must be a string")
+  self.encrypted_buffer = self.encrypted_buffer .. data
+  local out = {}
+
+  while #self.encrypted_buffer >= 2 do
+    local length = Bytes.read_u16le(self.encrypted_buffer, 1)
+    local frame_end = 2 + length + HAPSession.AUTH_TAG_LENGTH
+    if #self.encrypted_buffer < frame_end then
+      break
+    end
+
+    local aad = self.encrypted_buffer:sub(1, 2)
+    local encrypted = self.encrypted_buffer:sub(3, frame_end)
+    local nonce = self:nonce(self.in_counter)
+    self.in_counter = self.in_counter + 1
+    out[#out + 1] = crypto_method(self.crypto, "decrypt")(self.input_key, encrypted, aad, nonce)
+    self.encrypted_buffer = self.encrypted_buffer:sub(frame_end + 1)
+  end
+
+  return table.concat(out)
+end
+
 local Companion = {
   state = "DISCONNECTED",
   port = 49153,
@@ -3584,6 +3648,78 @@ local AirPlay = {
   pair_setup = nil,
   pairing_active = false,
 }
+
+local AirPlayHTTP = {}
+
+function AirPlayHTTP.format_request(method, path, host, port, headers, body, protocol)
+  method = method or "GET"
+  path = path or "/"
+  protocol = protocol or "HTTP/1.1"
+  body = body or ""
+  headers = headers or {}
+
+  local ordered = {
+    { "Host", tostring(host) .. ":" .. tostring(port) },
+    { "User-Agent", headers["User-Agent"] or "AirPlay/550.10" },
+    { "Connection", headers["Connection"] or "keep-alive" },
+  }
+  local seen = { Host = true, ["User-Agent"] = true, Connection = true }
+  if body ~= "" or method == "POST" or method == "PUT" then
+    ordered[#ordered + 1] = { "Content-Length", tostring(#body) }
+    seen["Content-Length"] = true
+  end
+  for key, value in pairs(headers) do
+    if not seen[key] then
+      ordered[#ordered + 1] = { key, tostring(value) }
+    end
+  end
+
+  local lines = { method .. " " .. path .. " " .. protocol }
+  for _, header in ipairs(ordered) do
+    lines[#lines + 1] = header[1] .. ": " .. header[2]
+  end
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = ""
+  return table.concat(lines, "\r\n") .. body
+end
+
+function AirPlayHTTP.try_parse_response(buffer)
+  local header_end = buffer:find("\r\n\r\n", 1, true)
+  if not header_end then
+    return nil, buffer
+  end
+
+  local header_block = buffer:sub(1, header_end - 1)
+  local body_start = header_end + 4
+  local first_line, rest = header_block:match("^([^\r\n]+)\r\n?(.*)$")
+  if not first_line then
+    error("malformed AirPlay HTTP response")
+  end
+  local protocol, status_text = first_line:match("^(%S+)%s+(.+)$")
+  local status = tonumber((status_text or ""):match("^(%d+)")) or 0
+  local headers = {}
+  for line in tostring(rest):gmatch("([^\r\n]+)") do
+    local key, value = line:match("^([^:]+):%s*(.*)$")
+    if key then
+      headers[key:lower()] = value
+      headers[key] = value
+    end
+  end
+  local content_length = tonumber(headers["content-length"] or headers["Content-Length"] or "0") or 0
+  local response_end = body_start + content_length - 1
+  if #buffer < response_end then
+    return nil, buffer
+  end
+
+  return {
+    protocol = protocol,
+    status = status,
+    status_text = status_text,
+    headers = headers,
+    body = buffer:sub(body_start, response_end),
+    raw_headers = header_block,
+  }, buffer:sub(response_end + 1)
+end
 
 function Companion.next_x()
   Companion.tx = Companion.tx + 1
@@ -5036,6 +5172,190 @@ function C4MiniApps.handle_proxy_command(binding_id, command, params)
   return nil
 end
 
+local AirPlayControlClient = {}
+
+function AirPlayControlClient.new(options)
+  options = options or {}
+  return setmetatable({
+    host = options.host,
+    port = options.port or 7000,
+    credentials = options.credentials,
+    crypto = options.crypto or Crypto,
+    transport = options.transport,
+    verifier = nil,
+    session = nil,
+    raw_buffer = "",
+    http_buffer = "",
+    state = "DISCONNECTED",
+    on_info = options.on_info,
+    on_error = options.on_error,
+    on_state = options.on_state,
+  }, { __index = AirPlayControlClient })
+end
+
+function AirPlayControlClient:set_state(state)
+  if self.state ~= state then
+    Log.debug("AirPlay control state: " .. tostring(self.state) .. " -> " .. tostring(state))
+  else
+    Log.debug("AirPlay control state: " .. tostring(state))
+  end
+  self.state = state
+  if self.on_state then
+    self.on_state(state)
+  end
+end
+
+function AirPlayControlClient:send_plain(method, path, body, headers)
+  local request = AirPlayHTTP.format_request(method, path, self.host, self.port, headers, body, "HTTP/1.1")
+  Log.debug("AirPlay control send plain: " .. tostring(method) .. " " .. tostring(path) ..
+    " body_len=" .. tostring(#(body or "")))
+  return self.transport:Write(request)
+end
+
+function AirPlayControlClient:send_encrypted(method, path, body, headers)
+  assert(self.session, "AirPlay encrypted session is not ready")
+  local request = AirPlayHTTP.format_request(method, path, self.host, self.port, headers, body, "HTTP/1.1")
+  Log.debug("AirPlay control send encrypted: " .. tostring(method) .. " " .. tostring(path) ..
+    " plain_len=" .. tostring(#request))
+  return self.transport:Write(self.session:encrypt(request))
+end
+
+function AirPlayControlClient:connect(host, port)
+  self.host = host or self.host
+  self.port = port or self.port or 7000
+  assert(type(self.host) == "string" and self.host ~= "", "Apple TV address is required")
+  assert(self.credentials and self.credentials.type == "HAP", "AirPlay HAP credentials are required")
+
+  if self.transport then
+    self:on_connected(self.transport)
+    return self
+  end
+
+  assert(has_c4() and C4.CreateTCPClient, "Control4 TCP client is not available")
+  Log.debug("AirPlay control TCP connect requested: host=" .. tostring(self.host) ..
+    " port=" .. tostring(self.port))
+  local client
+  client = C4:CreateTCPClient()
+    :OnConnect(function(tcp_client)
+      Log.debug("AirPlay control TCP connected")
+      self:on_connected(tcp_client)
+      tcp_client:ReadUpTo(4096)
+    end)
+    :OnRead(function(tcp_client, data)
+      Log.debug("AirPlay control TCP read: bytes=" .. tostring(#(data or "")))
+      local ok, err = pcall(function() self:receive(data or "") end)
+      if not ok then
+        Log.error("AirPlay control receive failed: " .. tostring(err))
+        self:set_state("ERROR: " .. tostring(err))
+        if self.on_error then self.on_error(err) end
+      end
+      tcp_client:ReadUpTo(4096)
+    end)
+    :OnDisconnect(function(_, err_code, err_msg)
+      Log.debug("AirPlay control TCP disconnected: code=" .. tostring(err_code) ..
+        " message=" .. tostring(err_msg))
+      self.transport = nil
+      self:set_state("DISCONNECTED")
+    end)
+    :OnError(function(_, err_code, err_msg)
+      Log.error("AirPlay control TCP error: code=" .. tostring(err_code) ..
+        " message=" .. tostring(err_msg))
+      self.transport = nil
+      self:set_state("ERROR: " .. tostring(err_code) .. " " .. tostring(err_msg))
+      if self.on_error then self.on_error(err_msg or err_code) end
+    end)
+    :Connect(self.host, self.port)
+  self.transport = client
+  return self
+end
+
+function AirPlayControlClient:on_connected(transport)
+  self.transport = transport
+  self:set_state("PAIR_VERIFY_M1")
+  self.verifier = PairVerify.new(self.credentials, self.crypto)
+  self:send_plain("POST", "/pair-verify", self.verifier:start_hap(), {
+    ["User-Agent"] = "AirPlay/550.10",
+    ["X-Apple-HKP"] = "3",
+    ["Content-Type"] = "application/octet-stream",
+  })
+end
+
+function AirPlayControlClient:receive(data)
+  if self.session then
+    local plaintext = self.session:decrypt(data)
+    if plaintext ~= "" then
+      self.http_buffer = self.http_buffer .. plaintext
+      self:process_http_buffer(true)
+    end
+    return
+  end
+
+  self.raw_buffer = self.raw_buffer .. data
+  self:process_http_buffer(false)
+end
+
+function AirPlayControlClient:process_http_buffer(encrypted)
+  local buffer_name = encrypted and "http_buffer" or "raw_buffer"
+  while true do
+    local response, rest = AirPlayHTTP.try_parse_response(self[buffer_name])
+    if not response then
+      self[buffer_name] = rest
+      return
+    end
+    self[buffer_name] = rest
+    if encrypted then
+      self:handle_encrypted_response(response)
+    else
+      self:handle_plain_response(response)
+    end
+  end
+end
+
+function AirPlayControlClient:handle_plain_response(response)
+  if self.state == "PAIR_VERIFY_M1" then
+    Log.debug("AirPlay control Pair-Verify M2 response: code=" .. tostring(response.status) ..
+      " body_len=" .. tostring(#response.body) ..
+      " body_head=" .. Bytes.hex(response.body:sub(1, 32)))
+    assert(response.status >= 200 and response.status < 300, "AirPlay Pair-Verify M2 HTTP " .. tostring(response.status))
+    local next_body, keys = self.verifier:finish_hap(response.body)
+    self.pending_control_keys = keys
+    self:set_state("PAIR_VERIFY_M3")
+    self:send_plain("POST", "/pair-verify", next_body, {
+      ["User-Agent"] = "AirPlay/550.10",
+      ["X-Apple-HKP"] = "3",
+      ["Content-Type"] = "application/octet-stream",
+    })
+    return
+  end
+
+  if self.state == "PAIR_VERIFY_M3" then
+    Log.debug("AirPlay control Pair-Verify M4 response: code=" .. tostring(response.status) ..
+      " body_len=" .. tostring(#response.body) ..
+      " body_head=" .. Bytes.hex(response.body:sub(1, 32)))
+    assert(response.status >= 200 and response.status < 300, "AirPlay Pair-Verify M4 HTTP " .. tostring(response.status))
+    self.session = HAPSession.new(self.pending_control_keys.output_key, self.pending_control_keys.input_key, self.crypto)
+    self:set_state("ENCRYPTED_INFO")
+    self:send_encrypted("GET", "/info", "", {
+      ["User-Agent"] = "AirPlay/550.10",
+      ["Accept"] = "application/x-apple-binary-plist",
+    })
+    return
+  end
+
+  Log.debug("AirPlay control unexpected plain response: code=" .. tostring(response.status))
+end
+
+function AirPlayControlClient:handle_encrypted_response(response)
+  Log.debug("AirPlay encrypted /info response: code=" .. tostring(response.status) ..
+    " content_type=" .. tostring(response.headers["content-type"] or response.headers["Content-Type"] or "") ..
+    " body_len=" .. tostring(#response.body) ..
+    " body_head=" .. Bytes.hex(response.body:sub(1, 32)))
+  self:set_state("ENCRYPTED_INFO_COMPLETE")
+  if self.on_info then
+    self.on_info(response)
+  end
+end
+
 C4Driver = {}
 
 function C4Driver.ensure_crypto_provider()
@@ -5350,6 +5670,60 @@ function C4Driver.probe_airplay_pair_verify()
       start_pair_verify(info.port)
     else
       Log.debug("AirPlay Pair-Verify skipped: AirPlay service not discovered")
+      C4Driver.update_property("Connection State", "AirPlay Not Found")
+    end
+  end)
+end
+
+function C4Driver.probe_airplay_control_info()
+  C4Driver.ensure_crypto_provider()
+  local host = Properties and Properties["Apple TV Address"]
+  if not host or host == "" then
+    Log.error("Apple TV Address is required")
+    return nil, "Apple TV Address is required"
+  end
+
+  local credentials = AirPlay.credentials or (Driver.state and Driver.state.airplay_credentials and Credentials.parse(Driver.state.airplay_credentials))
+  if not credentials or credentials.type ~= "HAP" then
+    Log.error("AirPlay HAP credentials are required for encrypted info probe")
+    C4Driver.update_property("Connection State", "AirPlay Credentials Required")
+    return nil, "AirPlay HAP credentials are required"
+  end
+
+  local function start_probe(port)
+    AirPlay.port = port or AirPlay.port or 7000
+    AirPlay.control_client = AirPlayControlClient.new({
+      host = host,
+      port = AirPlay.port,
+      credentials = credentials,
+      crypto = Crypto,
+      on_info = function(response)
+        local status = tonumber(response.status) or 0
+        if status >= 200 and status < 300 then
+          C4Driver.update_property("Connection State", "AirPlay Encrypted Info " .. tostring(response.status))
+        else
+          C4Driver.update_property("Connection State", "AirPlay Encrypted Info Failed")
+        end
+      end,
+      on_error = function()
+        C4Driver.update_property("Connection State", "AirPlay Control Failed")
+      end,
+    })
+    return AirPlay.control_client:connect(host, AirPlay.port)
+  end
+
+  if AirPlay.port then
+    return start_probe(AirPlay.port)
+  end
+
+  Log.debug("AirPlay encrypted /info probe waiting for AirPlay port discovery")
+  return MDNS.discover_airplay_info(host, function(info)
+    if info and info.port then
+      AirPlay.port = info.port
+      AirPlay.txt = info.txt or {}
+      start_probe(info.port)
+    else
+      Log.debug("AirPlay encrypted /info probe skipped: AirPlay service not discovered")
       C4Driver.update_property("Connection State", "AirPlay Not Found")
     end
   end)
@@ -5920,6 +6294,9 @@ end
 EC.PROBE_AIRPLAY_PAIR_VERIFY = function()
   return C4Driver.probe_airplay_pair_verify()
 end
+EC.PROBE_AIRPLAY_CONTROL_INFO = function()
+  return C4Driver.probe_airplay_control_info()
+end
 EC.PAIR_AIRPLAY = function()
   return C4Driver.pair_airplay()
 end
@@ -6048,9 +6425,12 @@ Driver.BigInt = BigInt
 Driver.SRP = SRP
 Driver.CompanionFrame = CompanionFrame
 Driver.CompanionSession = CompanionSession
+Driver.HAPSession = HAPSession
 Driver.CompanionClient = CompanionClient
 Driver.Companion = Companion
 Driver.AirPlay = AirPlay
+Driver.AirPlayHTTP = AirPlayHTTP
+Driver.AirPlayControlClient = AirPlayControlClient
 Driver.PairVerify = PairVerify
 Driver.PairSetup = PairSetup
 Driver.Crypto = Crypto
