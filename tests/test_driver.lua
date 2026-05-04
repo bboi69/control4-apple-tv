@@ -763,6 +763,10 @@ function tests.companion_client_pair_verify_enables_encrypted_session()
     decrypt = function(_, ciphertext)
       return ciphertext:sub(1, #ciphertext - 16)
     end,
+    random_bytes = function(n)
+      assert_eq(n, 4, "session sid random length")
+      return "\x78\x56\x34\x12"
+    end,
   }
 
   local client = Driver.CompanionClient.new({
@@ -796,7 +800,7 @@ function tests.companion_client_pair_verify_enables_encrypted_session()
   assert(client.session ~= nil, "session enabled")
   assert_eq(Driver.Companion.session, client.session, "global session")
   assert_eq(Driver.Companion.socket, client, "global socket")
-  assert(type(client.session_local_sid) == "number", "local sid set")
+  assert_eq(client.session_local_sid, 0x12345678, "local sid from crypto random")
 
   local second = Driver.CompanionFrame.try_decode(writes[2])
   local tlv = Driver.PairVerify.decode_pairing_data(second.payload)
@@ -1025,6 +1029,10 @@ function tests.session_start_response_advances_to_session_active()
     end,
     encrypt = function(_, plaintext) return plaintext .. string.rep("\0", 16) end,
     decrypt = function(_, ciphertext) return ciphertext:sub(1, #ciphertext - 16) end,
+    random_bytes = function(n)
+      assert_eq(n, 4, "session sid random length")
+      return "\x78\x56\x34\x12"
+    end,
   }
   local client = Driver.CompanionClient.new({
     credentials = credentials,
@@ -1082,6 +1090,10 @@ function tests.session_stop_sent_on_close()
     end,
     encrypt = function(_, plaintext) return plaintext .. string.rep("\0", 16) end,
     decrypt = function(_, ciphertext) return ciphertext:sub(1, #ciphertext - 16) end,
+    random_bytes = function(n)
+      assert_eq(n, 4, "session sid random length")
+      return "\x78\x56\x34\x12"
+    end,
   }
   local client = Driver.CompanionClient.new({
     credentials = credentials,

@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.13-dev",
+  VERSION = "0.1.14-dev",
 }
 
 local function has_c4()
@@ -3097,7 +3097,13 @@ function CompanionClient:enable_session(keys)
 end
 
 function CompanionClient:start_session()
-  self.session_local_sid = math.random(0, 0xFFFFFFFF)
+  local random_bytes = optional_crypto_method(self.crypto, "random_bytes") or Crypto.random_bytes
+  local sid_bytes = random_bytes(4)
+  assert(type(sid_bytes) == "string" and #sid_bytes == 4, "session SID random source returned wrong length")
+  self.session_local_sid = sid_bytes:byte(1) +
+    sid_bytes:byte(2) * 0x100 +
+    sid_bytes:byte(3) * 0x10000 +
+    sid_bytes:byte(4) * 0x1000000
   self:send_opack("_sessionStart", {
     _srvT = "com.apple.tvremoteservices",
     _sid = self.session_local_sid,
