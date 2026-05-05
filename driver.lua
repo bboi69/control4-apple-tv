@@ -1466,7 +1466,7 @@ local function _fe_from_number(n)
   return out
 end
 
-local _A24 = _fe_from_number(121665) -- (486662-2)/4 for Curve25519 ladder
+local _A24 = 121665 -- (486662-2)/4 for Curve25519 ladder
 
 local floor = math.floor  -- localize for hot-loop performance
 local _POW2 = {}
@@ -1563,6 +1563,14 @@ local function _fp_mul(a, b)
         out[i + j - 1] = out[i + j - 1] + ai * (b[j] or 0)
       end
     end
+  end
+  return _fe_reduce(out)
+end
+
+local function _fp_mul_small(a, n)
+  local out = {}
+  for i = 1, _FE_LIMBS do
+    out[i] = (a[i] or 0) * n
   end
   return _fe_reduce(out)
 end
@@ -1716,7 +1724,7 @@ function X25519Pure.mul(k_bytes, u_bytes)
     x3 = _fp_sq(_fp_add(DA, CB))
     z3 = _fp_mul(u, _fp_sq(_fp_sub(DA, CB)))
     x2 = _fp_mul(AA, BB)
-    z2 = _fp_mul(E, _fp_add(AA, _fp_mul(_A24, E)))
+    z2 = _fp_mul(E, _fp_add(AA, _fp_mul_small(E, _A24)))
   end
   if swap == 1 then x2, x3 = x3, x2; z2, z3 = z3, z2 end
   return _fe_to_le32(_fp_mul(x2, _fp_inv(z2)))
@@ -1966,7 +1974,7 @@ local function _ed_scalar_mult(point, scalar)
   return result
 end
 
-local _ED_BASE_WINDOW = 4
+local _ED_BASE_WINDOW = 5
 local _ED_BASE_WINDOW_SIZE = 2 ^ _ED_BASE_WINDOW
 local _ED_FIXED_TABLE_WINDOWS = math.ceil(256 / _ED_BASE_WINDOW)
 local _ED_FIXED_TABLE_HEX_LEN = _ED_FIXED_TABLE_WINDOWS * _ED_BASE_WINDOW_SIZE * 4 * _FE_LIMBS * 4
@@ -2580,7 +2588,7 @@ local OpenSSLCrypto = {
   ed25519_private_key_cache = {},
 }
 
-OpenSSLCrypto.ED25519_TABLE_CACHE_VERSION = "ed25519-fixed-v1-window4-limb15"
+OpenSSLCrypto.ED25519_TABLE_CACHE_VERSION = "ed25519-fixed-v2-window5-limb15"
 OpenSSLCrypto.EVP_CTRL_AEAD_GET_TAG = 0x10
 OpenSSLCrypto.EVP_CTRL_AEAD_SET_TAG = 0x11
 OpenSSLCrypto.EVP_CTRL_AEAD_SET_IVLEN = 0x09
