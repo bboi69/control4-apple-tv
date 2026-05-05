@@ -1017,7 +1017,7 @@ end
 
 function tests.driver_imports_and_resets_companion_credentials()
   local old_properties = Properties
-  Properties = { ["App List"] = "", ["App Count"] = "0", ["Selected App"] = "", ["Current App"] = "", ["AirPlay Credentials"] = "" }
+  Properties = { ["Launch App"] = "", ["Current App"] = "", ["AirPlay Credentials"] = "", ["Pairing PIN"] = "1234" }
   Driver._test_storage = {}
 
   local credentials = table.concat({
@@ -1348,7 +1348,12 @@ function tests.airplay_pairing_flow_saves_credentials()
     verify_M2 = Driver.SRP.verify_M2,
   }
 
-  Properties = { ["Apple TV Address"] = "192.0.2.55", ["Connection State"] = "", ["AirPlay Credentials"] = "" }
+  Properties = {
+    ["Apple TV Address"] = "192.0.2.55",
+    ["Connection State"] = "",
+    ["AirPlay Credentials"] = "",
+    ["Pairing PIN"] = "1234",
+  }
   Driver._test_storage = {}
   Driver.state = Driver._test_storage
   Driver.AirPlay.port = 7000
@@ -1442,7 +1447,7 @@ function tests.crypto_provider_failure_logs_without_last_error_property()
   local old_properties = Properties
   local old_provider = Driver.Crypto.provider
   local old_openssl = Driver.OpenSSLCrypto.openssl
-  Properties = { ["App List"] = "", ["App Count"] = "0", ["Selected App"] = "", ["Current App"] = "" }
+  Properties = { ["Launch App"] = "", ["Current App"] = "" }
   Driver.Crypto.provider = nil
   Driver.OpenSSLCrypto.openssl = {}
 
@@ -1459,7 +1464,7 @@ end
 
 function tests.execute_command_routes_driver_commands()
   local old_properties = Properties
-  Properties = { ["App List"] = "", ["App Count"] = "0", ["Selected App"] = "", ["Current App"] = "" }
+  Properties = { ["Launch App"] = "", ["Current App"] = "" }
   Driver.Companion.sent_messages = {}
   ExecuteCommand("LAUNCH_APP", { BUNDLE_ID_OR_URL = "com.netflix.Netflix" })
   local launch = Driver.Companion.sent_messages[#Driver.Companion.sent_messages]
@@ -1475,7 +1480,7 @@ end
 
 function tests.refresh_app_list_uses_existing_client()
   local old_properties = Properties
-  Properties = {}
+  Properties = { ["Current App"] = "" }
   local writes = {}
   local client = Driver.CompanionClient.new({
     credentials = Driver.Credentials.parse(table.concat({
@@ -2286,8 +2291,6 @@ function tests.app_list_current_app_and_now_playing_are_published()
     },
   })
   assert_eq(Driver.Companion.app_list["com.netflix.Netflix"], "Netflix", "stored app list bundle")
-  assert(Properties["App List"]:match("Apple TV | com.apple.TVWatchList"), "app list contains Apple TV")
-  assert(Properties["App List"]:match("Netflix | com.netflix.Netflix"), "app list contains Netflix")
   assert_eq(Driver._test_storage.app_list["com.netflix.Netflix"], "Netflix", "persisted app list")
 
   Driver.C4Driver.launch_app("com.netflix.Netflix")
@@ -2356,7 +2359,7 @@ function tests.app_list_current_app_and_now_playing_are_published()
   Properties = old_properties
 end
 
-function tests.app_list_populates_selected_app_dynamic_list_and_launches_selection()
+function tests.app_list_populates_launch_app_dynamic_list_and_launches_selection()
   local old_properties = Properties
   local old_c4 = C4
   local property_lists = {}
@@ -2379,11 +2382,10 @@ function tests.app_list_populates_selected_app_dynamic_list_and_launches_selecti
     },
   })
 
-  assert_eq(Properties["App Count"], "2", "app count property")
-  assert(property_lists["Selected App"]:match("Netflix | com.netflix.Netflix"), "selected app list contains Netflix")
-  assert(property_lists["Selected App"]:match("YouTube | com.google.ios.youtube"), "selected app list contains YouTube")
+  assert(property_lists["Launch App"]:match("Netflix | com.netflix.Netflix"), "launch app list contains Netflix")
+  assert(property_lists["Launch App"]:match("YouTube | com.google.ios.youtube"), "launch app list contains YouTube")
 
-  Properties["Selected App"] = "Netflix | com.netflix.Netflix"
+  Properties["Launch App"] = "Netflix | com.netflix.Netflix"
   Driver.C4Driver.launch_selected_app()
   local launch = Driver.Companion.sent_messages[#Driver.Companion.sent_messages]
   assert_eq(launch._i, "_launchApp", "selected app launches")

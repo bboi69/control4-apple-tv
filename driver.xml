@@ -509,12 +509,14 @@
                 <default>Disconnected</default>
                 <type>STRING</type>
                 <readonly>true</readonly>
+                <hidden>True</hidden>
             </property>
             <property>
                 <name>AirPlay Monitor State</name>
                 <default>Stopped</default>
                 <type>STRING</type>
                 <readonly>true</readonly>
+                <hidden>True</hidden>
             </property>
             <property>
                 <name>Current App</name>
@@ -529,19 +531,7 @@
                 <readonly>true</readonly>
             </property>
             <property>
-                <name>App List</name>
-                <default />
-                <type>STRING</type>
-                <readonly>true</readonly>
-            </property>
-            <property>
-                <name>App Count</name>
-                <default>0</default>
-                <type>STRING</type>
-                <readonly>true</readonly>
-            </property>
-            <property>
-                <name>Selected App</name>
+                <name>Launch App</name>
                 <type>DYNAMIC_LIST</type>
                 <readonly>false</readonly>
             </property>
@@ -556,6 +546,7 @@
                 <default />
                 <type>STRING</type>
                 <readonly>false</readonly>
+                <hidden>True</hidden>
             </property>
             <property>
                 <name>Passthrough Mode</name>
@@ -719,7 +710,11 @@
                 <command>REFRESH_APP_LIST</command>
             </action>
             <action>
-                <name>Launch Selected App</name>
+                <name>Print App List</name>
+                <command>PRINT_APP_LIST</command>
+            </action>
+            <action>
+                <name>Launch App</name>
                 <command>LAUNCH_SELECTED_APP</command>
             </action>
             <action>

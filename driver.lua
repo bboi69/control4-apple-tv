@@ -52,6 +52,14 @@ function Log.error(message)
   end
 end
 
+function Log.output(message)
+  local line = "[AppleTV] " .. tostring(message)
+  print(line)
+  if has_c4() and C4.DebugLog then
+    C4:DebugLog(line)
+  end
+end
+
 local Bytes = {}
 
 function Bytes.byte(value)
@@ -7347,9 +7355,21 @@ end
 
 function C4Driver.publish_app_list()
   local rows = Companion.app_list_rows or {}
-  C4Driver.update_property("App List", Companion.render_app_list(rows))
-  C4Driver.update_property("App Count", tostring(#rows))
-  C4Driver.update_property_list("Selected App", Companion.app_selector_items(rows))
+  C4Driver.update_property_list("Launch App", Companion.app_selector_items(rows))
+end
+
+function C4Driver.print_app_list()
+  local rows = Companion.app_list_rows or {}
+  if #rows == 0 then
+    Log.output("App List: empty. Run Refresh App List first.")
+    return false, "app list is empty"
+  end
+  Log.output("App List (" .. tostring(#rows) .. " apps)")
+  for _, row in ipairs(rows) do
+    Log.output("  " .. tostring(row.name or row.bundle_id or "") ..
+      " | " .. tostring(row.bundle_id or ""))
+  end
+  return true
 end
 
 function C4Driver.handle_companion_message(message)
@@ -7786,6 +7806,7 @@ function C4Driver.airplay_pairing_submit_pin(pin)
       OpenSSLCrypto.prune_ed25519_public_table_cache(credentials_or_err.ltpk)
       Storage.save(Driver.state)
       C4Driver.update_property("AirPlay Credentials", canonical)
+      C4Driver.update_property("Pairing PIN", "")
       C4Driver.update_property("Connection State", "AirPlay Pairing Complete")
       Log.debug("AirPlay Pair-Setup complete, credentials saved")
     end)
@@ -7826,11 +7847,11 @@ function C4Driver.load_persisted_airplay_credentials()
 end
 
 function C4Driver.launch_selected_app()
-  local selection = Properties and Properties["Selected App"] or ""
+  local selection = Properties and (Properties["Launch App"] or Properties["Selected App"]) or ""
   local app_id, err = Companion.resolve_app_selection(selection)
   if not app_id then
     err = err or "select an app after refreshing the app list"
-    Log.error("Launch Selected App failed: " .. tostring(err))
+    Log.error("Launch App failed: " .. tostring(err))
     error(err)
   end
   return C4Driver.launch_app(app_id)
@@ -7850,6 +7871,7 @@ function C4Driver.import_credentials(detail_string)
   OpenSSLCrypto.prune_ed25519_private_key_cache(credentials.ltsk)
   Storage.save(Driver.state)
   C4Driver.set_connection_state("Credentials Imported")
+  C4Driver.update_property("Pairing PIN", "")
   C4Driver.schedule_crypto_prewarm()
   return credentials
 end
@@ -7902,13 +7924,12 @@ function C4Driver.reset_pairing()
   Companion.current_app = nil
   Companion.now_playing = {}
   Storage.save(Driver.state)
-  C4Driver.update_property("App List", "")
-  C4Driver.update_property("App Count", "0")
-  C4Driver.update_property("Selected App", "")
-  C4Driver.update_property_list("Selected App", { "" })
+  C4Driver.update_property("Launch App", "")
+  C4Driver.update_property_list("Launch App", { "" })
   C4Driver.update_property("Current App", "")
   C4Driver.update_property("Now Playing", "")
   C4Driver.update_property("AirPlay Credentials", "")
+  C4Driver.update_property("Pairing PIN", "")
   C4Driver.set_connection_state("Disconnected")
 end
 
@@ -8196,6 +8217,9 @@ EC.LAUNCH_APP = function(params)
 end
 EC.REFRESH_APP_LIST = function()
   return C4Driver.refresh_app_list()
+end
+EC.PRINT_APP_LIST = function()
+  return C4Driver.print_app_list()
 end
 EC.LAUNCH_SELECTED_APP = function()
   return C4Driver.launch_selected_app()

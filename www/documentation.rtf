@@ -33,11 +33,9 @@ This driver lets Control4 pair with Apple TV, send remote-control commands, laun
 {\pntext\f0 -\tab}Connection State: current driver state. SESSION_ACTIVE means the encrypted Companion session is ready.\par
 {\pntext\f0 -\tab}Current App: app currently reported by Apple TV, when available.\par
 {\pntext\f0 -\tab}Now Playing: currently reported media title/status, when available.\par
-{\pntext\f0 -\tab}App List and App Count: latest launchable-app data returned by Refresh App List.\par
-{\pntext\f0 -\tab}Selected App: dynamic list populated from the Apple TV app list. Use Launch Selected App to launch the selected row.\par
-{\pntext\f0 -\tab}Pairing PIN: enter the Apple TV PIN here after running Pair Apple TV.\par
+{\pntext\f0 -\tab}Launch App: dynamic list populated by Refresh App List. Use the Launch App action to launch the selected row.\par
+{\pntext\f0 -\tab}Pairing PIN: enter the Apple TV PIN here after running Pair Apple TV. The driver clears this field after pairing completes.\par
 {\pntext\f0 -\tab}Crypto Prewarm Status: progress/result for the Prewarm Crypto action.\par
-{\pntext\f0 -\tab}AirPlay Credentials: metadata monitor pairing data. This is normally filled by Pair AirPlay.\par
 {\pntext\f0 -\tab}Passthrough Mode: when On, MiniApp launches return selection to the main Apple TV device so remote commands keep controlling Apple TV.\par
 {\pntext\f0 -\tab}Debug Mode: when On, driver diagnostic messages are printed to the Lua output tab.\par
 \pard\par
@@ -47,8 +45,9 @@ The MENU, GUIDE, INFO, CANCEL, PVR, STAR, POUND, and RECORD Button properties le
 Back and Menu both use the Apple TV menu/back HID command. Dashboard uses the Apple TV Home command.\par
 \par
 \b Actions\b0\par
-\pard{\pntext\f0 -\tab}{\*\pn\pnlvlblt\pnf0\pnindent360}\fi-360\li720 Refresh App List: requests launchable apps from the Apple TV and updates App List, App Count, and Selected App.\par
-{\pntext\f0 -\tab}Launch Selected App: launches the app selected in the Selected App property.\par
+\pard{\pntext\f0 -\tab}{\*\pn\pnlvlblt\pnf0\pnindent360}\fi-360\li720 Refresh App List: requests launchable apps from the Apple TV and updates the Launch App list.\par
+{\pntext\f0 -\tab}Print App List: prints the full app list to the Lua output tab.\par
+{\pntext\f0 -\tab}Launch App: launches the app selected in the Launch App property.\par
 {\pntext\f0 -\tab}Connect Apple TV: opens the TCP connection, performs Pair-Verify, starts the Companion session, and subscribes to status events.\par
 {\pntext\f0 -\tab}Disconnect Apple TV: sends cleanup commands and closes the connection.\par
 {\pntext\f0 -\tab}Prewarm Crypto: prepares cached crypto data after pairing. The action ignores repeated clicks while a prewarm is already running.\par
