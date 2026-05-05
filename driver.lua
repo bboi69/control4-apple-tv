@@ -1854,8 +1854,8 @@ local function _x16_sub(out, a, b)
   for i = 0, 15 do out[i] = a[i] - b[i] end
 end
 
-local function _x16_mul(out, a, b)
-  local prod = {}
+local function _x16_mul(out, a, b, prod)
+  prod = prod or {}
   for i = 0, 31 do prod[i] = 0 end
   for i = 0, 15 do
     local ai = a[i]
@@ -1871,20 +1871,54 @@ local function _x16_mul(out, a, b)
 end
 
 local function _x16_inv(out, a)
-  local c = {}
-  for i = 0, 15 do c[i] = a[i] end
-  for i = 253, 0, -1 do
-    _x16_mul(c, c, c)
-    if i ~= 2 and i ~= 4 then
-      _x16_mul(c, c, a)
-    end
-  end
-  for i = 0, 15 do out[i] = c[i] end
+  local prod = {}
+  local a2, a4, a8, a9, a11, a22, a31 = {}, {}, {}, {}, {}, {}, {}
+  local a10, a20, a40, a50, a100, a200, t = {}, {}, {}, {}, {}, {}, {}
+
+  _x16_mul(a2, a, a, prod)
+  _x16_mul(a4, a2, a2, prod)
+  _x16_mul(a8, a4, a4, prod)
+  _x16_mul(a9, a8, a, prod)
+  _x16_mul(a11, a9, a2, prod)
+  _x16_mul(a22, a11, a11, prod)
+  _x16_mul(a31, a22, a9, prod)
+
+  _x16_mul(t, a31, a31, prod)
+  for _ = 1, 4 do _x16_mul(t, t, t, prod) end
+  _x16_mul(a10, t, a31, prod)
+
+  _x16_mul(t, a10, a10, prod)
+  for _ = 1, 9 do _x16_mul(t, t, t, prod) end
+  _x16_mul(a20, t, a10, prod)
+
+  _x16_mul(t, a20, a20, prod)
+  for _ = 1, 19 do _x16_mul(t, t, t, prod) end
+  _x16_mul(a40, t, a20, prod)
+
+  _x16_mul(t, a40, a40, prod)
+  for _ = 1, 9 do _x16_mul(t, t, t, prod) end
+  _x16_mul(a50, t, a10, prod)
+
+  _x16_mul(t, a50, a50, prod)
+  for _ = 1, 49 do _x16_mul(t, t, t, prod) end
+  _x16_mul(a100, t, a50, prod)
+
+  _x16_mul(t, a100, a100, prod)
+  for _ = 1, 99 do _x16_mul(t, t, t, prod) end
+  _x16_mul(a200, t, a100, prod)
+
+  _x16_mul(t, a200, a200, prod)
+  for _ = 1, 49 do _x16_mul(t, t, t, prod) end
+  _x16_mul(t, t, a50, prod)
+
+  for _ = 1, 5 do _x16_mul(t, t, t, prod) end
+  _x16_mul(out, t, a11, prod)
 end
 
 -- Experimental 16-limb TweetNaCl-style X25519 backend.
 function X25519Pure.mul(k_bytes, u_bytes)
   local x, a, b, c, d, e, f, scalar = {}, {}, {}, {}, {}, {}, {}, {}
+  local prod = {}
   _x16_unpack(x, u_bytes)
   for i = 0, 15 do
     a[i], b[i], c[i], d[i] = 0, x[i], 0, 0
@@ -1904,26 +1938,26 @@ function X25519Pure.mul(k_bytes, u_bytes)
     _x16_sub(a, a, c)
     _x16_add(c, b, d)
     _x16_sub(b, b, d)
-    _x16_mul(d, e, e)
-    _x16_mul(f, a, a)
-    _x16_mul(a, c, a)
-    _x16_mul(c, b, e)
+    _x16_mul(d, e, e, prod)
+    _x16_mul(f, a, a, prod)
+    _x16_mul(a, c, a, prod)
+    _x16_mul(c, b, e, prod)
     _x16_add(e, a, c)
     _x16_sub(a, a, c)
-    _x16_mul(b, a, a)
+    _x16_mul(b, a, a, prod)
     _x16_sub(c, d, f)
-    _x16_mul(a, c, _X16_CURVE_CONST)
+    _x16_mul(a, c, _X16_CURVE_CONST, prod)
     _x16_add(a, a, d)
-    _x16_mul(c, c, a)
-    _x16_mul(a, d, f)
-    _x16_mul(d, b, x)
-    _x16_mul(b, e, e)
+    _x16_mul(c, c, a, prod)
+    _x16_mul(a, d, f, prod)
+    _x16_mul(d, b, x, prod)
+    _x16_mul(b, e, e, prod)
     _x16_swap(a, b, bit)
     _x16_swap(c, d, bit)
   end
 
   _x16_inv(c, c)
-  _x16_mul(a, a, c)
+  _x16_mul(a, a, c, prod)
   return _x16_pack(a)
 end
 
@@ -2518,6 +2552,28 @@ local function _ed_elapsed_ms(start_time)
   return math.floor((os.clock() - start_time) * 1000 + 0.5)
 end
 
+function Ed25519Pure.sign_expanded_profile(expanded, message)
+  assert(type(expanded) == "table", "expanded Ed25519 private key is required")
+  assert(type(expanded.public_key) == "string" and #expanded.public_key == 32, "expanded Ed25519 public key is invalid")
+  assert(type(expanded.prefix) == "string" and #expanded.prefix == 32, "expanded Ed25519 prefix is invalid")
+  assert(type(expanded.scalar) == "table", "expanded Ed25519 scalar is invalid")
+  local profile = {}
+  local step_start = os.clock()
+  local r = _scalar_from_le_bytes_mod(_sha512_bytes(expanded.prefix .. message))
+  profile.nonce_hash_ms = _ed_elapsed_ms(step_start)
+  step_start = os.clock()
+  local R = _ed_encode_point(_ed_scalar_mult_base(r))
+  profile.base_mult_ms = _ed_elapsed_ms(step_start)
+  step_start = os.clock()
+  local k = _scalar_from_le_bytes_mod(_sha512_bytes(R .. expanded.public_key .. message))
+  profile.challenge_hash_ms = _ed_elapsed_ms(step_start)
+  step_start = os.clock()
+  local S = _scalar_add(r, _scalar_mul(k, expanded.scalar))
+  local signature = R .. _scalar_to_le32(S)
+  profile.scalar_ms = _ed_elapsed_ms(step_start)
+  return signature, profile
+end
+
 local function _ed_verify_internal(public_key, signature, message, collect_profile, decoded_public_key, fixed_public_table, negative_fixed_public_table)
   local profile = collect_profile and {} or nil
   local step_start = os.clock()
@@ -2995,6 +3051,20 @@ function OpenSSLCrypto._sign_ed25519(private_key_bytes, data, public_key)
     return Ed25519Pure.sign(private_key_bytes, public_key, data)
   end
   return Ed25519Pure.sign_expanded(expanded, data)
+end
+
+function OpenSSLCrypto._sign_ed25519_profile(private_key_bytes, data, public_key)
+  local fallback_start = os.clock()
+  local ok, expanded = pcall(OpenSSLCrypto._expanded_ed25519_private_key, private_key_bytes)
+  if not ok then
+    return OpenSSLCrypto._sign_ed25519(private_key_bytes, data, public_key),
+      { fallback_ms = math.floor((os.clock() - fallback_start) * 1000 + 0.5) }
+  end
+  if public_key and public_key ~= expanded.public_key then
+    return OpenSSLCrypto._sign_ed25519(private_key_bytes, data, public_key),
+      { fallback_ms = math.floor((os.clock() - fallback_start) * 1000 + 0.5) }
+  end
+  return Ed25519Pure.sign_expanded_profile(expanded, data)
 end
 
 function OpenSSLCrypto._crypto_cache_state()
@@ -3505,7 +3575,15 @@ function OpenSSLCrypto.pair_verify_response(credentials, private_key, public_key
       credentials.controller_ltpk = expanded.public_key
     end
   end
-  local controller_signature = OpenSSLCrypto._sign_ed25519(credentials.ltsk, controller_info, credentials.controller_ltpk)
+  local controller_signature, sign_profile =
+    OpenSSLCrypto._sign_ed25519_profile(credentials.ltsk, controller_info, credentials.controller_ltpk)
+  if sign_profile then
+    Log.debug("Pair-Verify M2 Ed25519 sign profile: nonce_hash_ms=" .. tostring(sign_profile.nonce_hash_ms or 0) ..
+      " base_mult_ms=" .. tostring(sign_profile.base_mult_ms or 0) ..
+      " challenge_hash_ms=" .. tostring(sign_profile.challenge_hash_ms or 0) ..
+      " scalar_ms=" .. tostring(sign_profile.scalar_ms or 0) ..
+      " fallback_ms=" .. tostring(sign_profile.fallback_ms or 0))
+  end
   Log.debug("Pair-Verify M2 timing: controller_signature_ms=" .. tostring(elapsed_ms(step_start)))
   local response_tlv = TLV8.encode_ordered({
     { 1, credentials.client_id },
