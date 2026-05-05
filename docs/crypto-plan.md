@@ -73,10 +73,8 @@ For Companion, pyatv uses HAP credentials and HAP pairing:
   generated locally from pyatv, not live-device observations.
 - SRP tests compare `x`, `A`, `u`, `K`, M1, and M2 verification against
   deterministic `srptools` vectors.
-- The Composer `Check Crypto Provider` action is a hardware self-test for the
-  documented Control4 crypto surface: X25519 keygen/public export/derive,
-  Ed25519 sign/verify, HMAC-SHA512/HKDF, and ChaCha20-Poly1305 with AAD/tag
-  handling. A failure there is a specific API or capability mismatch to fix,
-  not a reason to probe random alternatives.
+- Composer exposes a single `Prewarm Crypto` action for installer use after
+  pairing. Lower-level crypto diagnostics should stay in tests or debug builds,
+  not in the normal commissioning flow.
 - A real Apple TV test is reserved for final compatibility: verify credentials,
   start the Companion session, fetch apps, and launch one known bundle id.

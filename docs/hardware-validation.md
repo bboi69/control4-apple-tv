@@ -11,19 +11,7 @@ runtime mismatch with enough detail to fix it.
 - Confirm `Connection State` is either `Disconnected` or `Credentials Loaded`.
 - Turn `Debug Mode` on before running diagnostic actions when detailed logs are needed.
 
-## 2. Crypto Provider
-
-Run the `Check Crypto Provider` action.
-
-Expected result:
-
-- `Connection State`: `Crypto Provider OK`
-
-If it fails, copy the Composer `Connection State` value and the driver log line.
-The error is expected to name the exact primitive, such as `hmac`,
-`sign Ed25519`, `verify Ed25519`, or `create ChaCha20-Poly1305 encrypt context`.
-
-## 3. Native Pairing
+## 2. Native Pairing
 
 Set `Apple TV Address`, then run the `Pair Apple TV` action. When the Apple TV
 shows a PIN, enter it in the `Pairing PIN` property.
@@ -31,6 +19,11 @@ shows a PIN, enter it in the `Pairing PIN` property.
 Expected result:
 
 - `Connection State`: `PAIR_SETUP_COMPLETE`
+
+## 3. Crypto Prewarm
+
+Run `Prewarm Crypto` after pairing. Wait for `Crypto Prewarm Status` to show
+`Complete`.
 
 ## 4. Pair-Verify And Session
 

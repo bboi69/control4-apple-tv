@@ -8215,18 +8215,6 @@ end
 EC.PREWARM_CRYPTO = function()
   return C4Driver.prewarm_crypto()
 end
-EC.PREWARM_CRYPTO_BASE_TABLE = function()
-  return C4Driver.prewarm_crypto_stage("base")
-end
-EC.PREWARM_CRYPTO_CONTROLLER_KEY = function()
-  return C4Driver.prewarm_crypto_stage("controller")
-end
-EC.PREWARM_CRYPTO_ATV_VERIFY_TABLE = function()
-  return C4Driver.prewarm_crypto_stage("atv")
-end
-EC.PREWARM_CRYPTO_X25519_KEYPAIR = function()
-  return C4Driver.prewarm_crypto_stage("x25519")
-end
 EC.START_AIRPLAY_MONITOR = function()
   return C4Driver.start_airplay_monitor("manual")
 end

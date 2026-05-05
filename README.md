@@ -44,19 +44,12 @@ Out of scope:
 
 ## Current Status
 
-The scaffold has real Apple TV frame and TLV8 helpers, a pyatv-vector-tested
-OPACK subset, native Pair-Setup credential persistence, Pair-Verify frame
-plumbing, encrypted protocol frame wrapping, driver command dispatch, app-list
-state publishing, and Control4 mini-app routing. It also has a protocol client
-state machine tested both with injected transports and a real LuaSocket
-localhost TCP loopback for Pair-Verify, encrypted-session enablement, and
-encrypted app launch. The remaining blocker for a live encrypted session is the
-real Control4 crypto provider behind the adapter being validated on hardware.
-The driver now contains an `OpenSSLCrypto` provider for X25519, Ed25519,
-HKDF-SHA512, and ChaCha20-Poly1305, plus a Composer action to check those
-primitives and log specific failures. Native Pair-Setup has an
-experimental pure-Lua SRP-3072/SHA512 path with srptools-derived vectors and is
-the intended user-facing onboarding path.
+The driver has real Apple TV frame and TLV8 helpers, a pyatv-vector-tested
+OPACK subset, native Pair-Setup credential persistence, Pair-Verify, encrypted
+protocol frame wrapping, driver command dispatch, app-list state publishing,
+now-playing metadata, AirPlay monitor support, and Control4 mini-app routing.
+It also has manual Composer crypto prewarm so commissioning can pair first and
+then prepare cached crypto data before handoff.
 
 Covered pyatv-derived fixtures:
 

@@ -731,28 +731,8 @@
                 <command>DISCONNECT_COMPANION</command>
             </action>
             <action>
-                <name>Check Crypto Provider</name>
-                <command>CHECK_CRYPTO_PROVIDER</command>
-            </action>
-            <action>
-                <name>Prewarm Crypto All</name>
+                <name>Prewarm Crypto</name>
                 <command>PREWARM_CRYPTO</command>
-            </action>
-            <action>
-                <name>Prewarm Ed25519 Base Table</name>
-                <command>PREWARM_CRYPTO_BASE_TABLE</command>
-            </action>
-            <action>
-                <name>Prewarm Controller Signing Key</name>
-                <command>PREWARM_CRYPTO_CONTROLLER_KEY</command>
-            </action>
-            <action>
-                <name>Prewarm Apple TV Verify Table</name>
-                <command>PREWARM_CRYPTO_ATV_VERIFY_TABLE</command>
-            </action>
-            <action>
-                <name>Prewarm X25519 Keypair</name>
-                <command>PREWARM_CRYPTO_X25519_KEYPAIR</command>
             </action>
             <action>
                 <name>Start AirPlay Monitor</name>
