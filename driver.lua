@@ -2969,7 +2969,6 @@ function OpenSSLCrypto._pregen_x25519()
     private_key = scalar,
     public_key  = X25519Pure.mul(scalar, X25519Pure.BASE_POINT),
   }
-  Log.debug("X25519 keypair pregenerated")
 end
 
 function OpenSSLCrypto.ensure_x25519_keypair()
@@ -2988,7 +2987,6 @@ function OpenSSLCrypto.generate_x25519_keypair()
     if has_c4() and type(SetTimer) == "function" then
       SetTimer("AppleTV_crypto_prewarm_x25519", 100, OpenSSLCrypto._pregen_x25519)
     end
-    Log.debug("X25519 keypair source=pregenerated")
     return cached
   end
   -- Fallback: generate synchronously
@@ -2997,7 +2995,6 @@ function OpenSSLCrypto.generate_x25519_keypair()
     private_key = scalar,
     public_key  = X25519Pure.mul(scalar, X25519Pure.BASE_POINT),
   }
-  Log.debug("X25519 keypair source=synchronous")
   return keypair
 end
 
@@ -3079,7 +3076,6 @@ function OpenSSLCrypto.restore_ed25519_base_table_cache()
     OpenSSLCrypto._save_crypto_cache()
     return false, err
   end
-  Log.debug("crypto cache restored: Ed25519 fixed-base table")
   return true, "restored"
 end
 
@@ -3121,7 +3117,6 @@ function OpenSSLCrypto._restore_ed25519_public_table_from_cache(public_key_bytes
     return nil
   end
 
-  Log.debug("crypto cache restored: Apple TV public key fixed table")
   return {
     point = point,
     fixed_table = fixed_table,
@@ -3177,7 +3172,6 @@ function OpenSSLCrypto._expanded_ed25519_private_key(private_key_bytes)
       end)
       if ok then
         expanded = restored_or_err
-        Log.debug("crypto cache restored: controller Ed25519 signing key")
       else
         Log.debug("crypto cache ignored: controller Ed25519 signing key " .. tostring(restored_or_err))
         cache.ed25519_private_keys[key] = nil
@@ -3473,14 +3467,11 @@ function OpenSSLCrypto.pair_verify_response(credentials, private_key, public_key
   local shared_secret = OpenSSLCrypto._derive_x25519(private_key, server_public_key)
   local session_key = OpenSSLCrypto.hkdf_sha512("Pair-Verify-Encrypt-Salt", "Pair-Verify-Encrypt-Info", shared_secret)
   local nonce = OpenSSLCrypto._hap_nonce("PV-Msg02")
-  Log.debug("Pair-Verify M2 decrypt: server_public_len=" .. tostring(#server_public_key) ..
-    " encrypted_len=" .. tostring(#encrypted_data))
   local decrypted = OpenSSLCrypto._chacha20_poly1305_decrypt(
     session_key,
     nonce,
     encrypted_data
   )
-  Log.debug("Pair-Verify M2 decrypt: decrypted_len=" .. tostring(#(decrypted or "")))
   local ok, decrypted_tlv_or_err = pcall(TLV8.decode, decrypted)
   if not ok then
     Log.error("Pair-Verify decrypted TLV decode failed: len=" .. tostring(#(decrypted or "")) ..
@@ -8113,8 +8104,6 @@ function C4Driver.prewarm_crypto_stage(stage)
     if running then
       local running_label = CRYPTO_PREWARM_STAGE_LABELS[running_stage] or tostring(running_stage)
       local status = "Skipped: " .. running_label .. " already running"
-      Log.debug("crypto prewarm " .. tostring(stage_key) ..
-        " skipped: " .. tostring(running_stage) .. " already in progress")
       C4Driver.set_crypto_prewarm_status(status)
       return false, "already running"
     end
@@ -8123,7 +8112,6 @@ function C4Driver.prewarm_crypto_stage(stage)
   local credentials = Companion.credentials or C4Driver.load_persisted_credentials()
   if not credentials then
     local status = "Skipped: no pairing credentials"
-    Log.debug("crypto prewarm " .. tostring(stage_key) .. " skipped: no pairing credentials")
     C4Driver.set_crypto_prewarm_status(status)
     return false, "no pairing credentials"
   end
@@ -8132,29 +8120,24 @@ function C4Driver.prewarm_crypto_stage(stage)
   local results = {}
   local ok, err = pcall(function()
     if stage == nil or stage == "base" then
-      Log.debug("crypto prewarm started: Ed25519 fixed-base table")
       local status = OpenSSLCrypto.ensure_ed25519_base_table()
       results[#results + 1] = "base=" .. tostring(status)
-      Log.debug("crypto prewarm " .. tostring(status) .. ": Ed25519 fixed-base table")
     end
 
     if stage == nil or stage == "controller" then
       local status, expanded = OpenSSLCrypto.ensure_ed25519_private_key(credentials.ltsk)
       credentials.controller_ltpk = expanded.public_key
       results[#results + 1] = "controller=" .. tostring(status)
-      Log.debug("crypto prewarm " .. tostring(status) .. ": controller signing key")
     end
 
     if stage == nil or stage == "atv" then
       local status = OpenSSLCrypto.ensure_ed25519_public_table(credentials.ltpk)
       results[#results + 1] = "atv=" .. tostring(status)
-      Log.debug("crypto prewarm " .. tostring(status) .. ": Apple TV public key fixed table")
     end
 
     if stage == nil or stage == "x25519" then
       local status = OpenSSLCrypto.ensure_x25519_keypair()
       results[#results + 1] = "x25519=" .. tostring(status)
-      Log.debug("crypto prewarm " .. tostring(status) .. ": X25519 ephemeral keypair")
     end
   end)
   Driver.crypto_prewarm_in_progress[stage_key] = nil
@@ -8170,11 +8153,7 @@ function C4Driver.prewarm_crypto_stage(stage)
 end
 
 function C4Driver.prewarm_crypto()
-  Log.debug("crypto prewarm all started")
   local ok, err = C4Driver.prewarm_crypto_stage(nil)
-  if ok then
-    Log.debug("crypto prewarm all passed")
-  end
   return ok, err
 end
 
@@ -8186,7 +8165,6 @@ function C4Driver.schedule_crypto_prewarm()
   C4Driver.cancel_timer("AppleTV_crypto_prewarm_controller")
   C4Driver.cancel_timer("AppleTV_crypto_prewarm_atv")
   C4Driver.cancel_timer("AppleTV_crypto_prewarm_x25519")
-  Log.debug("crypto prewarm auto-schedule skipped: use Composer prewarm actions")
 end
 
 function C4Driver.cancel_timer(name)
