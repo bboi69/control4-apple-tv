@@ -1666,7 +1666,7 @@ function tests.driver_destroy_closes_client_and_cancels_timers()
   Driver.OpenSSLCrypto._pregenerated_x25519_keypair = old_pregen
 end
 
-function tests.crypto_prewarm_schedules_single_all_timer()
+function tests.crypto_prewarm_schedule_is_manual_only()
   local old_c4 = C4
   local old_set_timer = SetTimer
   local old_cancel_timer = CancelTimer
@@ -1688,14 +1688,12 @@ function tests.crypto_prewarm_schedules_single_all_timer()
 
   Driver.C4Driver.schedule_crypto_prewarm()
 
-  assert_eq(#scheduled, 1, "one prewarm timer scheduled")
-  assert_eq(scheduled[1].name, "AppleTV_crypto_prewarm_all", "all prewarm timer name")
-  assert_eq(scheduled[1].delay, 1000, "all prewarm timer delay")
-  assert(type(scheduled[1].fn) == "function", "all prewarm timer callback")
-  assert_contains(cancelled, "AppleTV_crypto_prewarm_base", "legacy base timer cancelled before scheduling")
-  assert_contains(cancelled, "AppleTV_crypto_prewarm_controller", "legacy controller timer cancelled before scheduling")
-  assert_contains(cancelled, "AppleTV_crypto_prewarm_atv", "legacy atv timer cancelled before scheduling")
-  assert_contains(cancelled, "AppleTV_crypto_prewarm_x25519", "legacy x25519 timer cancelled before scheduling")
+  assert_eq(#scheduled, 0, "no automatic prewarm timer scheduled")
+  assert_contains(cancelled, "AppleTV_crypto_prewarm_all", "all prewarm timer cancelled")
+  assert_contains(cancelled, "AppleTV_crypto_prewarm_base", "legacy base timer cancelled")
+  assert_contains(cancelled, "AppleTV_crypto_prewarm_controller", "legacy controller timer cancelled")
+  assert_contains(cancelled, "AppleTV_crypto_prewarm_atv", "legacy atv timer cancelled")
+  assert_contains(cancelled, "AppleTV_crypto_prewarm_x25519", "legacy x25519 timer cancelled")
 
   C4 = old_c4
   SetTimer = old_set_timer

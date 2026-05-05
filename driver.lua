@@ -8225,21 +8225,14 @@ function C4Driver.prewarm_crypto()
 end
 
 function C4Driver.schedule_crypto_prewarm()
-  if not (has_c4() and type(SetTimer) == "function") then
-    return
-  end
-  if not (Companion.credentials or (Driver.state and Driver.state.companion_credentials)) then
-    Log.debug("crypto prewarm schedule skipped: no pairing credentials")
-    return
-  end
+  -- Crypto prewarm is intentionally installer-driven from Composer actions.
+  -- The slow Ed25519 table builds can otherwise make driver upload/pairing feel hung.
+  C4Driver.cancel_timer("AppleTV_crypto_prewarm_all")
   C4Driver.cancel_timer("AppleTV_crypto_prewarm_base")
   C4Driver.cancel_timer("AppleTV_crypto_prewarm_controller")
   C4Driver.cancel_timer("AppleTV_crypto_prewarm_atv")
   C4Driver.cancel_timer("AppleTV_crypto_prewarm_x25519")
-  SetTimer("AppleTV_crypto_prewarm_all", 1000, function()
-    C4Driver.prewarm_crypto()
-  end)
-  Log.debug("crypto prewarm scheduled: all=1s")
+  Log.debug("crypto prewarm auto-schedule skipped: use Composer prewarm actions")
 end
 
 function C4Driver.cancel_timer(name)
@@ -8289,6 +8282,18 @@ EC.CHECK_CRYPTO_PROVIDER = function()
 end
 EC.PREWARM_CRYPTO = function()
   return C4Driver.prewarm_crypto()
+end
+EC.PREWARM_CRYPTO_BASE_TABLE = function()
+  return C4Driver.prewarm_crypto_stage("base")
+end
+EC.PREWARM_CRYPTO_CONTROLLER_KEY = function()
+  return C4Driver.prewarm_crypto_stage("controller")
+end
+EC.PREWARM_CRYPTO_ATV_VERIFY_TABLE = function()
+  return C4Driver.prewarm_crypto_stage("atv")
+end
+EC.PREWARM_CRYPTO_X25519_KEYPAIR = function()
+  return C4Driver.prewarm_crypto_stage("x25519")
 end
 EC.START_AIRPLAY_MONITOR = function()
   return C4Driver.start_airplay_monitor("manual")
