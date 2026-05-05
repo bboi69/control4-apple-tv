@@ -2462,6 +2462,69 @@ function tests.airplay_monitor_watchdog_sends_heartbeat()
   Driver.C4Driver.now_ms = old_now
 end
 
+function tests.room_power_scopes_airplay_monitor()
+  local old_c4 = C4
+  local old_set_timer = SetTimer
+  local old_cancel_timer = CancelTimer
+  local old_properties = Properties
+  local old_airplay_credentials = Driver.AirPlay.credentials
+  local old_state = Driver.state
+  local old_monitor_enabled = Driver.AirPlay.monitor_enabled
+  local old_client = Driver.AirPlay.control_client
+  local old_companion_client = Driver.Companion.client
+  local scheduled = {}
+  local cancelled = {}
+  local closed = false
+
+  C4 = { GetDeviceID = function() return 42 end }
+  SetTimer = function(name, delay, fn)
+    scheduled[#scheduled + 1] = { name = name, delay = delay, fn = fn }
+    return name
+  end
+  CancelTimer = function(name)
+    cancelled[#cancelled + 1] = name
+  end
+  Properties = { ["AirPlay Monitor State"] = "" }
+  Driver.state = {}
+  Driver.AirPlay.credentials = { type = "HAP" }
+  Driver.AirPlay.monitor_enabled = false
+  Driver.AirPlay.control_client = nil
+  Driver.Companion.client = { state = "SESSION_ACTIVE" }
+
+  ReceivedFromProxy(5002, "ON", {})
+
+  assert_eq(#scheduled, 1, "room on schedules monitor start")
+  assert_eq(scheduled[1].name, "AppleTV_airplay_monitor_start", "monitor start timer")
+  assert_eq(Properties["AirPlay Monitor State"], "SCHEDULED", "monitor scheduled state")
+
+  Driver.AirPlay.monitor_enabled = true
+  Driver.AirPlay.control_client = {
+    close = function()
+      closed = true
+    end,
+  }
+
+  ReceivedFromProxy(5002, "OFF", {})
+
+  assert_eq(closed, true, "room off closes monitor client")
+  assert_eq(Driver.AirPlay.monitor_enabled, false, "room off disables monitor")
+  assert_eq(Driver.AirPlay.control_client, nil, "room off clears monitor client")
+  assert_eq(Properties["AirPlay Monitor State"], "STOPPED", "monitor stopped state")
+  assert_contains(cancelled, "AppleTV_airplay_monitor_start", "room off cancels scheduled start")
+  assert_contains(cancelled, "AppleTV_airplay_monitor_retry", "room off cancels retry")
+  assert_contains(cancelled, "AppleTV_airplay_monitor_watchdog", "room off cancels watchdog")
+
+  C4 = old_c4
+  SetTimer = old_set_timer
+  CancelTimer = old_cancel_timer
+  Properties = old_properties
+  Driver.AirPlay.credentials = old_airplay_credentials
+  Driver.state = old_state
+  Driver.AirPlay.monitor_enabled = old_monitor_enabled
+  Driver.AirPlay.control_client = old_client
+  Driver.Companion.client = old_companion_client
+end
+
 function tests.airplay_monitor_watchdog_restarts_stale_channel()
   local old_properties = Properties
   local old_client = Driver.AirPlay.control_client

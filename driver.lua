@@ -5533,14 +5533,18 @@ function C4MiniApps.handle_proxy_command(binding_id, command, params)
     return nil
   end
 
-  -- Power: ON triggers a connect attempt if not already connected.
+  -- Power: ON scopes the metadata monitor to active room use.
   if command == "ON" then
     if not Companion.client or Companion.client.state == "DISCONNECTED" then
       C4Driver.connect_companion()
     end
+    C4Driver.ensure_airplay_monitor_for_room("room on")
     return
   end
-  if command == "OFF" then return end  -- stay connected; Apple TV handles its own sleep
+  if command == "OFF" then
+    C4Driver.stop_airplay_monitor("room off")
+    return
+  end
 
   local remote_command = {
     UP = "UP",
@@ -5569,6 +5573,7 @@ function C4MiniApps.handle_proxy_command(binding_id, command, params)
       if Companion.credentials or (Driver.state and Driver.state.companion_credentials) then
         C4Driver.ensure_companion_client()
       end
+      C4Driver.ensure_airplay_monitor_for_room("remote command")
       return Companion.button_action(mapped_hid, mapped_action)
     end
     return nil
@@ -5579,6 +5584,7 @@ function C4MiniApps.handle_proxy_command(binding_id, command, params)
     if Companion.credentials or (Driver.state and Driver.state.companion_credentials) then
       C4Driver.ensure_companion_client()
     end
+    C4Driver.ensure_airplay_monitor_for_room("remote command")
     return Companion.button_action(hid, action)
   end
 
@@ -6872,6 +6878,7 @@ function C4Driver.launch_app(bundle_id_or_url)
   if Companion.credentials or (Driver.state and Driver.state.companion_credentials) then
     C4Driver.ensure_companion_client()
   end
+  C4Driver.ensure_airplay_monitor_for_room("launch app")
   local request, frame = Companion.launch_app(bundle_id_or_url)
   C4Driver.publish_current_app()
   return request, frame
@@ -6881,6 +6888,7 @@ function C4Driver.refresh_app_list()
   if Companion.credentials or (Driver.state and Driver.state.companion_credentials) then
     C4Driver.ensure_companion_client()
   end
+  C4Driver.ensure_airplay_monitor_for_room("refresh app list")
   return Companion.fetch_apps()
 end
 
@@ -6916,6 +6924,16 @@ function C4Driver.schedule_airplay_monitor_retry(reason)
   if not ok then
     Log.debug("AirPlay monitor retry timer unavailable: " .. tostring(err))
   end
+end
+
+function C4Driver.ensure_airplay_monitor_for_room(reason)
+  if AirPlay.monitor_enabled then
+    return
+  end
+  if not (AirPlay.credentials or (Driver.state and Driver.state.airplay_credentials)) then
+    return
+  end
+  C4Driver.schedule_airplay_monitor_start(reason or "room active")
 end
 
 function C4Driver.mark_airplay_monitor_activity(reason)
@@ -7047,13 +7065,14 @@ end
 
 function C4Driver.stop_airplay_monitor(reason)
   AirPlay.monitor_enabled = false
+  C4Driver.cancel_timer("AppleTV_airplay_monitor_start")
   C4Driver.cancel_timer("AppleTV_airplay_monitor_retry")
   C4Driver.cancel_timer("AppleTV_airplay_monitor_watchdog")
   C4Driver.close_airplay_control_client(reason or "stopping AirPlay monitor")
   C4Driver.set_airplay_monitor_state("STOPPED")
 end
 
-function C4Driver.schedule_airplay_monitor_start()
+function C4Driver.schedule_airplay_monitor_start(reason)
   if not (AirPlay.credentials or (Driver.state and Driver.state.airplay_credentials)) then
     Log.debug("AirPlay monitor auto-start skipped: no AirPlay credentials")
     return
@@ -7065,7 +7084,7 @@ function C4Driver.schedule_airplay_monitor_start()
     C4Driver.cancel_timer("AppleTV_airplay_monitor_start")
     C4Driver.set_airplay_monitor_state("SCHEDULED")
     local ok, err = pcall(SetTimer, "AppleTV_airplay_monitor_start", 2000, function()
-      C4Driver.start_airplay_monitor("auto-start")
+      C4Driver.start_airplay_monitor(reason or "room active")
     end)
     if not ok then
       Log.debug("AirPlay monitor auto-start timer unavailable: " .. tostring(err))
@@ -7073,7 +7092,7 @@ function C4Driver.schedule_airplay_monitor_start()
     end
     Log.debug("AirPlay monitor auto-start scheduled")
   else
-    C4Driver.start_airplay_monitor("auto-start")
+    C4Driver.start_airplay_monitor(reason or "room active")
   end
 end
 
@@ -7242,7 +7261,6 @@ function C4Driver.airplay_pairing_submit_pin(pin)
       C4Driver.update_property("AirPlay Credentials", canonical)
       C4Driver.update_property("Connection State", "AirPlay Pairing Complete")
       Log.debug("AirPlay Pair-Setup complete, credentials saved")
-      C4Driver.schedule_airplay_monitor_start()
     end)
   end)
 end
@@ -7258,7 +7276,6 @@ function C4Driver.import_airplay_credentials(detail_string)
   Storage.save(Driver.state)
   C4Driver.update_property("AirPlay Credentials", canonical)
   C4Driver.set_connection_state("AirPlay Credentials Imported")
-  C4Driver.schedule_airplay_monitor_start()
   return credentials
 end
 
@@ -7694,7 +7711,6 @@ function C4Driver.late_init()
   end
   C4MiniApps.register_rooms()
   C4Driver.schedule_crypto_prewarm()
-  C4Driver.schedule_airplay_monitor_start()
   Log.debug("driver late init")
 end
 
