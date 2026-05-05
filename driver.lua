@@ -1540,6 +1540,11 @@ local function _fp_add(a, b)
   return _fe_reduce(out)
 end
 
+local function _fp_add_into(out, a, b)
+  for i = 1, _FE_LIMBS do out[i] = (a[i] or 0) + (b[i] or 0) end
+  return out
+end
+
 local function _fp_sub(a, b)
   local out
   if _fe_compare(a, b) >= 0 then
@@ -1551,6 +1556,21 @@ local function _fp_sub(a, b)
     out = _fe_sub_raw(with_p, b)
   end
   return _fe_reduce(out)
+end
+
+local function _fp_sub_into(out, a, b)
+  local borrow = 0
+  for i = 1, _FE_LIMBS do
+    local value = (a[i] or 0) + _FE_P[i] - (b[i] or 0) - borrow
+    if value < 0 then
+      value = value + _FE_BASE
+      borrow = 1
+    else
+      borrow = 0
+    end
+    out[i] = value
+  end
+  return out
 end
 
 local function _fp_mul(a, b)
@@ -1582,8 +1602,12 @@ local function _fp_sq(a)
     local ai = a[i]
     if ai ~= 0 then
       out[2 * i - 1] = out[2 * i - 1] + ai * ai
+      local twice_ai = ai + ai
       for j = i + 1, _FE_LIMBS do
-        out[i + j - 1] = out[i + j - 1] + 2 * ai * (a[j] or 0)
+        local aj = a[j]
+        if aj ~= 0 then
+          out[i + j - 1] = out[i + j - 1] + twice_ai * aj
+        end
       end
     end
   end
@@ -1707,24 +1731,29 @@ function X25519Pure.mul(k_bytes, u_bytes)
   local z3 = _fe_from_number(1)
   local swap = 0
   local kb = {k_bytes:byte(1, 32)}
+  local A, B, C, D, E, T1, T2 = {}, {}, {}, {}, {}, {}, {}
   for t = 254, 0, -1 do
     local k_t = floor(kb[floor(t / 8) + 1] / _POW2[t % 8]) % 2
     swap = (swap + k_t) % 2
     if swap == 1 then x2, x3 = x3, x2; z2, z3 = z3, z2 end
     swap = k_t
-    local A  = _fp_add(x2, z2)
+    _fp_add_into(A, x2, z2)
     local AA = _fp_sq(A)
-    local B  = _fp_sub(x2, z2)
+    _fp_sub_into(B, x2, z2)
     local BB = _fp_sq(B)
-    local E  = _fp_sub(AA, BB)
-    local C  = _fp_add(x3, z3)
-    local D  = _fp_sub(x3, z3)
+    _fp_sub_into(E, AA, BB)
+    _fp_add_into(C, x3, z3)
+    _fp_sub_into(D, x3, z3)
     local DA = _fp_mul(D, A)
     local CB = _fp_mul(C, B)
-    x3 = _fp_sq(_fp_add(DA, CB))
-    z3 = _fp_mul(u, _fp_sq(_fp_sub(DA, CB)))
+    _fp_add_into(T1, DA, CB)
+    x3 = _fp_sq(T1)
+    _fp_sub_into(T1, DA, CB)
+    z3 = _fp_mul(u, _fp_sq(T1))
     x2 = _fp_mul(AA, BB)
-    z2 = _fp_mul(E, _fp_add(AA, _fp_mul_small(E, _A24)))
+    T2 = _fp_mul_small(E, _A24)
+    _fp_add_into(T1, AA, T2)
+    z2 = _fp_mul(E, T1)
   end
   if swap == 1 then x2, x3 = x3, x2; z2, z3 = z3, z2 end
   return _fe_to_le32(_fp_mul(x2, _fp_inv(z2)))
@@ -1783,6 +1812,7 @@ local _ED_BASE = {
   T = nil,
 }
 _ED_BASE.T = _fp_mul(_ED_BASE.X, _ED_BASE.Y)
+local _ED_ZERO_FE = _fe_from_number(0)
 
 local function _limb_copy(v, n)
   local out = {}
@@ -1942,15 +1972,34 @@ local function _ed_identity()
 end
 
 local function _ed_point_add(P, Q)
-  local A = _fp_mul(_fp_sub(P.Y, P.X), _fp_sub(Q.Y, Q.X))
-  local B = _fp_mul(_fp_add(P.Y, P.X), _fp_add(Q.Y, Q.X))
+  local T1, T2 = {}, {}
+  local A = _fp_mul(_fp_sub_into(T1, P.Y, P.X), _fp_sub_into(T2, Q.Y, Q.X))
+  local B = _fp_mul(_fp_add_into(T1, P.Y, P.X), _fp_add_into(T2, Q.Y, Q.X))
   local C = _fp_mul(_fp_mul(P.T, Q.T), _ED_2D)
   local ZZ = _fp_mul(P.Z, Q.Z)
-  local D = _fp_add(ZZ, ZZ)
-  local E = _fp_sub(B, A)
-  local F = _fp_sub(D, C)
-  local G = _fp_add(D, C)
-  local H = _fp_add(B, A)
+  local D = _fp_add_into({}, ZZ, ZZ)
+  local E = _fp_sub_into({}, B, A)
+  local F = _fp_sub_into({}, D, C)
+  local G = _fp_add_into({}, D, C)
+  local H = _fp_add_into({}, B, A)
+  return {
+    X = _fp_mul(E, F),
+    Y = _fp_mul(G, H),
+    Z = _fp_mul(F, G),
+    T = _fp_mul(E, H),
+  }
+end
+
+local function _ed_point_double(P)
+  local A = _fp_sq(P.X)
+  local B = _fp_sq(P.Y)
+  local Z2 = _fp_sq(P.Z)
+  local C = _fp_add(Z2, Z2)
+  local D = _fp_sub(_ED_ZERO_FE, A)
+  local E = _fp_sub(_fp_sub(_fp_sq(_fp_add(P.X, P.Y)), A), B)
+  local G = _fp_add(D, B)
+  local F = _fp_sub(G, C)
+  local H = _fp_sub(D, B)
   return {
     X = _fp_mul(E, F),
     Y = _fp_mul(G, H),
@@ -1966,7 +2015,7 @@ end
 local function _ed_scalar_mult(point, scalar)
   local result = _ed_identity()
   for bit = _scalar_bit_length(scalar) - 1, 0, -1 do
-    result = _ed_point_add(result, result)
+    result = _ed_point_double(result)
     if _ed_scalar_bit(scalar, bit) == 1 then
       result = _ed_point_add(result, point)
     end
@@ -1994,7 +2043,7 @@ local function _ed_build_base_table()
     end
     table_by_window[window] = multiples
     for _ = 1, _ED_BASE_WINDOW do
-      base = _ed_point_add(base, base)
+      base = _ed_point_double(base)
     end
   end
   return table_by_window
@@ -2012,7 +2061,7 @@ local function _ed_build_fixed_point_table(point)
     end
     table_by_window[window] = multiples
     for _ = 1, _ED_BASE_WINDOW do
-      base = _ed_point_add(base, base)
+      base = _ed_point_double(base)
     end
   end
   return table_by_window
@@ -2066,6 +2115,28 @@ local function _ed_deserialize_fixed_point_table(encoded)
   return table_by_window
 end
 
+local function _ed_point_neg(P)
+  return {
+    X = _fp_sub(_ED_ZERO_FE, P.X),
+    Y = P.Y,
+    Z = P.Z,
+    T = _fp_sub(_ED_ZERO_FE, P.T),
+  }
+end
+
+local function _ed_negate_fixed_point_table(fixed_table)
+  local negated = {}
+  for window = 1, #fixed_table do
+    local src = fixed_table[window]
+    local dst = {}
+    for digit = 0, _ED_BASE_WINDOW_SIZE - 1 do
+      dst[digit] = _ed_point_neg(src[digit])
+    end
+    negated[window] = dst
+  end
+  return negated
+end
+
 local function _ed_base_window_digit(scalar, window_index)
   local digit = 0
   local first_bit = (window_index - 1) * _ED_BASE_WINDOW
@@ -2098,6 +2169,26 @@ function _ed_scalar_mult_fixed_table(fixed_table, scalar)
   return result
 end
 
+local function _ed_double_scalar_base_plus_fixed(base_scalar, fixed_table, fixed_scalar)
+  if not _ED_BASE_TABLE then
+    _ED_BASE_TABLE = _ed_build_base_table()
+    _ED_BASE_TABLE_PREWARMED = true
+  end
+  local result = _ed_identity()
+  local window_count = math.max(#_ED_BASE_TABLE, #fixed_table)
+  for window = 1, window_count do
+    local base_digit = _ed_base_window_digit(base_scalar, window)
+    if base_digit ~= 0 then
+      result = _ed_point_add(result, _ED_BASE_TABLE[window][base_digit])
+    end
+    local fixed_digit = _ed_base_window_digit(fixed_scalar, window)
+    if fixed_digit ~= 0 then
+      result = _ed_point_add(result, fixed_table[window][fixed_digit])
+    end
+  end
+  return result
+end
+
 local function _ed_scalar_mult_window(point, scalar)
   local multiples = {}
   multiples[0] = _ed_identity()
@@ -2110,7 +2201,7 @@ local function _ed_scalar_mult_window(point, scalar)
   local window_count = math.ceil(math.max(1, _scalar_bit_length(scalar)) / _ED_BASE_WINDOW)
   for window = window_count, 1, -1 do
     for _ = 1, _ED_BASE_WINDOW do
-      result = _ed_point_add(result, result)
+      result = _ed_point_double(result)
     end
     local digit = _ed_base_window_digit(scalar, window)
     if digit ~= 0 then
@@ -2259,7 +2350,7 @@ local function _ed_elapsed_ms(start_time)
   return math.floor((os.clock() - start_time) * 1000 + 0.5)
 end
 
-local function _ed_verify_internal(public_key, signature, message, collect_profile, decoded_public_key, fixed_public_table)
+local function _ed_verify_internal(public_key, signature, message, collect_profile, decoded_public_key, fixed_public_table, negative_fixed_public_table)
   local profile = collect_profile and {} or nil
   local step_start = os.clock()
   if type(signature) ~= "string" or #signature ~= 64 then
@@ -2280,22 +2371,35 @@ local function _ed_verify_internal(public_key, signature, message, collect_profi
   local k = _scalar_from_le_bytes_mod(_sha512_bytes(signature:sub(1, 32) .. public_key .. message))
   if profile then profile.scalar_ms = _ed_elapsed_ms(step_start) end
 
-  step_start = os.clock()
-  local left = _ed_scalar_mult_base(S)
-  if profile then profile.base_mult_ms = _ed_elapsed_ms(step_start) end
+  local ok
+  if negative_fixed_public_table then
+    step_start = os.clock()
+    local combined = _ed_double_scalar_base_plus_fixed(S, negative_fixed_public_table, k)
+    if profile then
+      profile.base_mult_ms = _ed_elapsed_ms(step_start)
+      profile.variable_mult_ms = 0
+    end
 
-  step_start = os.clock()
-  local kA
-  if fixed_public_table then
-    kA = _ed_scalar_mult_fixed_table(fixed_public_table, k)
+    step_start = os.clock()
+    ok = _ed_point_equal(combined, R)
   else
-    kA = _ed_scalar_mult_window(A, k)
-  end
-  local right = _ed_point_add(R, kA)
-  if profile then profile.variable_mult_ms = _ed_elapsed_ms(step_start) end
+    step_start = os.clock()
+    local left = _ed_scalar_mult_base(S)
+    if profile then profile.base_mult_ms = _ed_elapsed_ms(step_start) end
 
-  step_start = os.clock()
-  local ok = _ed_point_equal(left, right)
+    step_start = os.clock()
+    local kA
+    if fixed_public_table then
+      kA = _ed_scalar_mult_fixed_table(fixed_public_table, k)
+    else
+      kA = _ed_scalar_mult_window(A, k)
+    end
+    local right = _ed_point_add(R, kA)
+    if profile then profile.variable_mult_ms = _ed_elapsed_ms(step_start) end
+
+    step_start = os.clock()
+    ok = _ed_point_equal(left, right)
+  end
   if profile then profile.equal_ms = _ed_elapsed_ms(step_start) end
   return ok, profile
 end
@@ -2305,8 +2409,8 @@ function Ed25519Pure.verify(public_key, signature, message)
   return ok
 end
 
-function Ed25519Pure.verify_profile(public_key, signature, message, decoded_public_key, fixed_public_table)
-  return _ed_verify_internal(public_key, signature, message, true, decoded_public_key, fixed_public_table)
+function Ed25519Pure.verify_profile(public_key, signature, message, decoded_public_key, fixed_public_table, negative_fixed_public_table)
+  return _ed_verify_internal(public_key, signature, message, true, decoded_public_key, fixed_public_table, negative_fixed_public_table)
 end
 
 function Ed25519Pure.decode_public_key(public_key)
@@ -2323,6 +2427,10 @@ end
 
 function Ed25519Pure.restore_fixed_point_table(encoded)
   return _ed_deserialize_fixed_point_table(encoded)
+end
+
+function Ed25519Pure.negate_fixed_point_table(fixed_table)
+  return _ed_negate_fixed_point_table(fixed_table)
 end
 
 function SRP.sha512(data)
@@ -2822,6 +2930,7 @@ function OpenSSLCrypto._restore_ed25519_public_table_from_cache(public_key_bytes
   return {
     point = point,
     fixed_table = fixed_table,
+    negative_fixed_table = Ed25519Pure.negate_fixed_point_table(fixed_table),
     restored_from_cache = true,
   }
 end
@@ -2879,6 +2988,7 @@ function OpenSSLCrypto._ed25519_public_key_cache_entry(public_key_bytes)
       entry = {
         point = point,
         fixed_table = fixed_table,
+        negative_fixed_table = Ed25519Pure.negate_fixed_point_table(fixed_table),
       }
       local cache = OpenSSLCrypto._crypto_cache_state()
       cache.ed25519_public_tables[key] = Ed25519Pure.serialize_fixed_point_table(fixed_table)
@@ -2896,7 +3006,7 @@ end
 function OpenSSLCrypto._default_verify_ed25519(public_key_bytes, signature, data)
   local entry = OpenSSLCrypto._ed25519_public_key_cache_entry(public_key_bytes)
   return Ed25519Pure.verify_profile(public_key_bytes, signature, data,
-    entry.point, entry.fixed_table)
+    entry.point, entry.fixed_table, entry.negative_fixed_table)
 end
 
 OpenSSLCrypto._verify_ed25519 = OpenSSLCrypto._default_verify_ed25519
@@ -2907,7 +3017,7 @@ function OpenSSLCrypto._verify_ed25519_profile(public_key_bytes, signature, data
   end
   local entry = OpenSSLCrypto._ed25519_public_key_cache_entry(public_key_bytes)
   return Ed25519Pure.verify_profile(public_key_bytes, signature, data,
-    entry.point, entry.fixed_table)
+    entry.point, entry.fixed_table, entry.negative_fixed_table)
 end
 
 function OpenSSLCrypto._cipher()
