@@ -1666,6 +1666,49 @@ local function _fp_inv(a)
   return _fp_mul(t, a11)            -- a^(2^255-32+11) = a^(2^255-21) = a^(p-2)
 end
 
+local function _fp_pow22523(z)
+  -- z^(2^252-3), used by Ed25519 sqrt_ratio.
+  local t0 = _fp_sq(z)
+  local t1 = _fp_sq(t0)
+  t1 = _fp_sq(t1)
+  t1 = _fp_mul(z, t1)
+  t0 = _fp_mul(t0, t1)
+  t0 = _fp_sq(t0)
+  t0 = _fp_mul(t1, t0)
+
+  t1 = _fp_sq(t0)
+  for _ = 1, 4 do t1 = _fp_sq(t1) end
+  t0 = _fp_mul(t1, t0)
+
+  t1 = _fp_sq(t0)
+  for _ = 1, 9 do t1 = _fp_sq(t1) end
+  t1 = _fp_mul(t1, t0)
+
+  local t2 = _fp_sq(t1)
+  for _ = 1, 19 do t2 = _fp_sq(t2) end
+  t1 = _fp_mul(t2, t1)
+
+  t1 = _fp_sq(t1)
+  for _ = 1, 9 do t1 = _fp_sq(t1) end
+  t0 = _fp_mul(t1, t0)
+
+  t1 = _fp_sq(t0)
+  for _ = 1, 49 do t1 = _fp_sq(t1) end
+  t1 = _fp_mul(t1, t0)
+
+  t2 = _fp_sq(t1)
+  for _ = 1, 99 do t2 = _fp_sq(t2) end
+  t1 = _fp_mul(t2, t1)
+
+  t1 = _fp_sq(t1)
+  for _ = 1, 49 do t1 = _fp_sq(t1) end
+  t0 = _fp_mul(t1, t0)
+
+  t0 = _fp_sq(t0)
+  t0 = _fp_sq(t0)
+  return _fp_mul(t0, z)
+end
+
 local function _le32_to_fe(s)
   local b = {s:byte(1, 32)}
   local out, acc, acc_bits, bi = {}, 0, 0, 1
@@ -2216,6 +2259,22 @@ local function _ed_point_equal(P, Q)
     _fe_compare(_fp_mul(P.Y, Q.Z), _fp_mul(Q.Y, P.Z)) == 0
 end
 
+local function _ed_sqrt_ratio(u, v)
+  local v2 = _fp_sq(v)
+  local v3 = _fp_mul(v2, v)
+  local v7 = _fp_mul(_fp_sq(v2), v3)
+  local x = _fp_mul(_fp_mul(u, v3), _fp_pow22523(_fp_mul(u, v7)))
+  local check = _fp_mul(v, _fp_sq(x))
+  if _fe_compare(check, u) ~= 0 then
+    x = _fp_mul(x, _ED_SQRT_M1)
+    check = _fp_mul(v, _fp_sq(x))
+  end
+  if _fe_compare(check, u) ~= 0 then
+    return nil
+  end
+  return x
+end
+
 local function _ed_encode_point(P)
   local iz = _fp_inv(P.Z)
   local x = _fp_mul(P.X, iz)
@@ -2238,24 +2297,8 @@ local function _ed_decode_point(s)
   local y2 = _fp_sq(y)
   local u = _fp_sub(y2, _fe_from_number(1))
   local v = _fp_add(_fp_mul(_ED_D, y2), _fe_from_number(1))
-  local x = _fp_mul(u, _fp_inv(v))
-  x = _fp_pow_p38 and x or x
-  -- x = sqrt(u/v) = (u/v)^((p+3)/8)
-  local candidate = _fe_from_number(1)
-  local exp = {
-    32766, 32767, 32767, 32767, 32767, 32767, 32767, 32767, 32767,
-    32767, 32767, 32767, 32767, 32767, 32767, 32767, 4095,
-  }
-  local uv = x
-  for bit = 252, 0, -1 do
-    candidate = _fp_sq(candidate)
-    if _fe_bit(exp, bit) == 1 then candidate = _fp_mul(candidate, uv) end
-  end
-  x = candidate
-  if _fe_compare(_fp_sq(x), uv) ~= 0 then
-    x = _fp_mul(x, _ED_SQRT_M1)
-  end
-  if _fe_compare(_fp_sq(x), uv) ~= 0 then return nil end
+  local x = _ed_sqrt_ratio(u, v)
+  if not x then return nil end
   if _fe_bit(x, 0) ~= sign then
     x = _fp_sub(_fe_from_number(0), x)
   end
@@ -2781,14 +2824,18 @@ end
 OpenSSLCrypto._pregenerated_x25519_keypair = nil
 
 function OpenSSLCrypto._pregen_x25519()
+  local start_time = os.clock()
   local scalar = OpenSSLCrypto.random_bytes(32)
   OpenSSLCrypto._pregenerated_x25519_keypair = {
     private_key = scalar,
     public_key  = X25519Pure.mul(scalar, X25519Pure.BASE_POINT),
   }
+  Log.debug("X25519 keypair pregen timing: ms=" ..
+    tostring(math.floor(((os.clock() - start_time) * 1000) + 0.5)))
 end
 
 function OpenSSLCrypto.generate_x25519_keypair()
+  local start_time = os.clock()
   local cached = OpenSSLCrypto._pregenerated_x25519_keypair
   if cached then
     OpenSSLCrypto._pregenerated_x25519_keypair = nil
@@ -2796,14 +2843,19 @@ function OpenSSLCrypto.generate_x25519_keypair()
     if has_c4() and type(SetTimer) == "function" then
       SetTimer("AppleTV_crypto_prewarm_x25519", 100, OpenSSLCrypto._pregen_x25519)
     end
+    Log.debug("X25519 keypair timing: source=pregenerated ms=" ..
+      tostring(math.floor(((os.clock() - start_time) * 1000) + 0.5)))
     return cached
   end
   -- Fallback: generate synchronously
   local scalar = OpenSSLCrypto.random_bytes(32)
-  return {
+  local keypair = {
     private_key = scalar,
     public_key  = X25519Pure.mul(scalar, X25519Pure.BASE_POINT),
   }
+  Log.debug("X25519 keypair timing: source=synchronous ms=" ..
+    tostring(math.floor(((os.clock() - start_time) * 1000) + 0.5)))
+  return keypair
 end
 
 function OpenSSLCrypto._derive_x25519(private_key, server_public_key)
@@ -3263,8 +3315,12 @@ end
 
 function OpenSSLCrypto.pair_verify_response(credentials, private_key, public_key, server_public_key, encrypted_data)
   local total_start = os.clock()
+  local step_start = os.clock()
   local shared_secret = OpenSSLCrypto._derive_x25519(private_key, server_public_key)
+  Log.debug("Pair-Verify M2 timing: x25519_shared_secret_ms=" .. tostring(elapsed_ms(step_start)))
+  step_start = os.clock()
   local session_key = OpenSSLCrypto.hkdf_sha512("Pair-Verify-Encrypt-Salt", "Pair-Verify-Encrypt-Info", shared_secret)
+  Log.debug("Pair-Verify M2 timing: hkdf_session_key_ms=" .. tostring(elapsed_ms(step_start)))
   local nonce = OpenSSLCrypto._hap_nonce("PV-Msg02")
   local function fp(value)
     local ok, digest = pcall(_sha512_bytes, value)
@@ -3278,13 +3334,15 @@ function OpenSSLCrypto.pair_verify_response(credentials, private_key, public_key
     " session_sha=" .. fp(session_key) ..
     " nonce=" .. Bytes.hex(nonce) ..
     " tag=" .. Bytes.hex(encrypted_data:sub(#encrypted_data - 15)))
+  step_start = os.clock()
   local decrypted = OpenSSLCrypto._chacha20_poly1305_decrypt(
     session_key,
     nonce,
     encrypted_data
   )
+  Log.debug("Pair-Verify M2 timing: decrypt_ms=" .. tostring(elapsed_ms(step_start)))
   Log.debug("Pair-Verify M2 decrypt: decrypted_len=" .. tostring(#(decrypted or "")))
-  local step_start = os.clock()
+  step_start = os.clock()
   local ok, decrypted_tlv_or_err = pcall(TLV8.decode, decrypted)
   if not ok then
     Log.error("Pair-Verify decrypted TLV decode failed: len=" .. tostring(#(decrypted or "")) ..
