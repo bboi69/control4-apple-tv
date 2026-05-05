@@ -1513,6 +1513,21 @@ local function _fe_sub_raw(a, b)
   return out, borrow
 end
 
+local function _fe_sub_p_in_place(c)
+  local borrow = 0
+  for i = 1, _FE_LIMBS do
+    local value = (c[i] or 0) - _FE_P[i] - borrow
+    if value < 0 then
+      value = value + _FE_BASE
+      borrow = 1
+    else
+      borrow = 0
+    end
+    c[i] = value
+  end
+  return c
+end
+
 local function _fe_reduce(c)
   for _ = 1, 4 do
     _fe_carry(c)
@@ -1528,7 +1543,7 @@ local function _fe_reduce(c)
   _fe_carry(c)
   for i = #c, _FE_LIMBS + 1, -1 do c[i] = nil end
   while _fe_compare(c, _FE_P) >= 0 do
-    c = _fe_sub_raw(c, _FE_P)
+    _fe_sub_p_in_place(c)
   end
   for i = 1, _FE_LIMBS do c[i] = c[i] or 0 end
   return c
@@ -1573,8 +1588,13 @@ local function _fp_sub_into(out, a, b)
   return out
 end
 
+local _fp_mul_into
 local function _fp_mul(a, b)
   local out = {}
+  return _fp_mul_into(out, a, b)
+end
+
+function _fp_mul_into(out, a, b)
   for i = 1, _FE_LIMBS * 2 do out[i] = 0 end
   for i = 1, _FE_LIMBS do
     local ai = a[i]
@@ -1587,16 +1607,27 @@ local function _fp_mul(a, b)
   return _fe_reduce(out)
 end
 
+local _fp_mul_small_into
 local function _fp_mul_small(a, n)
   local out = {}
+  return _fp_mul_small_into(out, a, n)
+end
+
+function _fp_mul_small_into(out, a, n)
   for i = 1, _FE_LIMBS do
     out[i] = (a[i] or 0) * n
   end
+  for i = _FE_LIMBS + 1, #out do out[i] = nil end
   return _fe_reduce(out)
 end
 
+local _fp_sq_into
 local function _fp_sq(a)
   local out = {}
+  return _fp_sq_into(out, a)
+end
+
+function _fp_sq_into(out, a)
   for i = 1, _FE_LIMBS * 2 do out[i] = 0 end
   for i = 1, _FE_LIMBS do
     local ai = a[i]
@@ -1770,33 +1801,41 @@ function X25519Pure.mul(k_bytes, u_bytes)
   local u  = _le32_to_fe(table.concat(u_str))
   local x2 = _fe_from_number(1)
   local z2 = _fe_from_number(0)
-  local x3 = u
+  local x3 = {}
+  for i = 1, _FE_LIMBS do x3[i] = u[i] end
   local z3 = _fe_from_number(1)
   local swap = 0
   local kb = {k_bytes:byte(1, 32)}
   local A, B, C, D, E, T1, T2 = {}, {}, {}, {}, {}, {}, {}
+  local AA, BB, DA, CB = {}, {}, {}, {}
+  local nx2, nz2, nx3, nz3 = {}, {}, {}, {}
   for t = 254, 0, -1 do
     local k_t = floor(kb[floor(t / 8) + 1] / _POW2[t % 8]) % 2
     swap = (swap + k_t) % 2
     if swap == 1 then x2, x3 = x3, x2; z2, z3 = z3, z2 end
     swap = k_t
     _fp_add_into(A, x2, z2)
-    local AA = _fp_sq(A)
+    _fp_sq_into(AA, A)
     _fp_sub_into(B, x2, z2)
-    local BB = _fp_sq(B)
+    _fp_sq_into(BB, B)
     _fp_sub_into(E, AA, BB)
     _fp_add_into(C, x3, z3)
     _fp_sub_into(D, x3, z3)
-    local DA = _fp_mul(D, A)
-    local CB = _fp_mul(C, B)
+    _fp_mul_into(DA, D, A)
+    _fp_mul_into(CB, C, B)
     _fp_add_into(T1, DA, CB)
-    x3 = _fp_sq(T1)
+    _fp_sq_into(nx3, T1)
     _fp_sub_into(T1, DA, CB)
-    z3 = _fp_mul(u, _fp_sq(T1))
-    x2 = _fp_mul(AA, BB)
-    T2 = _fp_mul_small(E, _A24)
+    _fp_sq_into(T2, T1)
+    _fp_mul_into(nz3, u, T2)
+    _fp_mul_into(nx2, AA, BB)
+    _fp_mul_small_into(T2, E, _A24)
     _fp_add_into(T1, AA, T2)
-    z2 = _fp_mul(E, T1)
+    _fp_mul_into(nz2, E, T1)
+    x2, nx2 = nx2, x2
+    z2, nz2 = nz2, z2
+    x3, nx3 = nx3, x3
+    z3, nz3 = nz3, z3
   end
   if swap == 1 then x2, x3 = x3, x2; z2, z3 = z3, z2 end
   return _fe_to_le32(_fp_mul(x2, _fp_inv(z2)))
