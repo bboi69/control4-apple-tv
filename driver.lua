@@ -8122,6 +8122,7 @@ function C4Driver.prewarm_crypto_stage(stage)
       local running_label = CRYPTO_PREWARM_STAGE_LABELS[running_stage] or tostring(running_stage)
       local status = "Skipped: " .. running_label .. " already running"
       C4Driver.set_crypto_prewarm_status(status)
+      Log.output("Prewarm Crypto skipped: " .. tostring(running_label) .. " already running")
       return false, "already running"
     end
   end
@@ -8130,29 +8131,35 @@ function C4Driver.prewarm_crypto_stage(stage)
   if not credentials then
     local status = "Skipped: no pairing credentials"
     C4Driver.set_crypto_prewarm_status(status)
+    Log.output("Prewarm Crypto skipped: pair Apple TV first")
     return false, "no pairing credentials"
   end
   Driver.crypto_prewarm_in_progress[stage_key] = true
   C4Driver.set_crypto_prewarm_status("Running: " .. label)
+  Log.output("Prewarm Crypto started: " .. tostring(label))
   local results = {}
   local ok, err = pcall(function()
     if stage == nil or stage == "base" then
+      Log.output("Prewarm Crypto: Ed25519 base table")
       local status = OpenSSLCrypto.ensure_ed25519_base_table()
       results[#results + 1] = "base=" .. tostring(status)
     end
 
     if stage == nil or stage == "controller" then
+      Log.output("Prewarm Crypto: controller signing key")
       local status, expanded = OpenSSLCrypto.ensure_ed25519_private_key(credentials.ltsk)
       credentials.controller_ltpk = expanded.public_key
       results[#results + 1] = "controller=" .. tostring(status)
     end
 
     if stage == nil or stage == "atv" then
+      Log.output("Prewarm Crypto: Apple TV verify table")
       local status = OpenSSLCrypto.ensure_ed25519_public_table(credentials.ltpk)
       results[#results + 1] = "atv=" .. tostring(status)
     end
 
     if stage == nil or stage == "x25519" then
+      Log.output("Prewarm Crypto: X25519 keypair")
       local status = OpenSSLCrypto.ensure_x25519_keypair()
       results[#results + 1] = "x25519=" .. tostring(status)
     end
@@ -8161,11 +8168,14 @@ function C4Driver.prewarm_crypto_stage(stage)
   if not ok then
     local status = "Failed: " .. label .. " - " .. tostring(err)
     C4Driver.set_crypto_prewarm_status(status)
+    Log.output("Prewarm Crypto failed: " .. tostring(err))
     Log.error("crypto prewarm " .. tostring(stage_key) .. " failed: " .. tostring(err))
     return false, err
   end
+  local result_text = table.concat(results, ", ")
   C4Driver.set_crypto_prewarm_status("Complete: " .. label ..
-    " (" .. table.concat(results, ", ") .. ")")
+    " (" .. result_text .. ")")
+  Log.output("Prewarm Crypto complete: " .. result_text)
   return true
 end
 
