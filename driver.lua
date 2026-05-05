@@ -1790,55 +1790,141 @@ local function _clamp32(k)
   return table.concat(out)
 end
 
--- Compute k * u (Montgomery ladder on Curve25519).
-function X25519Pure.mul(k_bytes, u_bytes)
-  k_bytes = _clamp32(k_bytes)
-  -- Clear the high bit of u per RFC 7748
-  local ub = {u_bytes:byte(1, 32)}
-  ub[32] = ub[32] % 128
-  local u_str = {}
-  for i = 1, 32 do u_str[i] = string.char(ub[i]) end
-  local u  = _le32_to_fe(table.concat(u_str))
-  local x2 = _fe_from_number(1)
-  local z2 = _fe_from_number(0)
-  local x3 = {}
-  for i = 1, _FE_LIMBS do x3[i] = u[i] end
-  local z3 = _fe_from_number(1)
-  local swap = 0
-  local kb = {k_bytes:byte(1, 32)}
-  local A, B, C, D, E, T1, T2 = {}, {}, {}, {}, {}, {}, {}
-  local AA, BB, DA, CB = {}, {}, {}, {}
-  local nx2, nz2, nx3, nz3 = {}, {}, {}, {}
-  for t = 254, 0, -1 do
-    local k_t = floor(kb[floor(t / 8) + 1] / _POW2[t % 8]) % 2
-    swap = (swap + k_t) % 2
-    if swap == 1 then x2, x3 = x3, x2; z2, z3 = z3, z2 end
-    swap = k_t
-    _fp_add_into(A, x2, z2)
-    _fp_sq_into(AA, A)
-    _fp_sub_into(B, x2, z2)
-    _fp_sq_into(BB, B)
-    _fp_sub_into(E, AA, BB)
-    _fp_add_into(C, x3, z3)
-    _fp_sub_into(D, x3, z3)
-    _fp_mul_into(DA, D, A)
-    _fp_mul_into(CB, C, B)
-    _fp_add_into(T1, DA, CB)
-    _fp_sq_into(nx3, T1)
-    _fp_sub_into(T1, DA, CB)
-    _fp_sq_into(T2, T1)
-    _fp_mul_into(nz3, u, T2)
-    _fp_mul_into(nx2, AA, BB)
-    _fp_mul_small_into(T2, E, _A24)
-    _fp_add_into(T1, AA, T2)
-    _fp_mul_into(nz2, E, T1)
-    x2, nx2 = nx2, x2
-    z2, nz2 = nz2, z2
-    x3, nx3 = nx3, x3
-    z3, nz3 = nz3, z3
+local _X16_PRIME = {
+  [0] = 0xffed, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+  0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0x7fff,
+}
+local _X16_CURVE_CONST = { [0] = 0xdb41, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+
+local function _x16_carry(out)
+  for i = 0, 15 do
+    out[i] = out[i] + 0x10000
+    local c = floor(out[i] / 0x10000)
+    if i < 15 then
+      out[i + 1] = out[i + 1] + c - 1
+    else
+      out[0] = out[0] + 38 * (c - 1)
+    end
+    out[i] = out[i] % 0x10000
   end
-  if swap == 1 then x2, x3 = x3, x2; z2, z3 = z3, z2 end
-  return _fe_to_le32(_fp_mul(x2, _fp_inv(z2)))
+end
+
+local function _x16_swap(a, b, bit)
+  local inv = 1 - bit
+  for i = 0, 15 do
+    local ai, bi = a[i], b[i]
+    a[i] = ai * inv + bi * bit
+    b[i] = bi * inv + ai * bit
+  end
+end
+
+local function _x16_unpack(out, s)
+  local bytes = { s:byte(1, 32) }
+  for i = 0, 15 do
+    out[i] = (bytes[2 * i + 1] or 0) + (bytes[2 * i + 2] or 0) * 0x100
+  end
+  out[15] = out[15] % 0x8000
+end
+
+local function _x16_pack(a)
+  local out, t, m = {}, {}, {}
+  for i = 0, 15 do t[i] = a[i] end
+  _x16_carry(t); _x16_carry(t); _x16_carry(t)
+  for _ = 0, 1 do
+    m[0] = t[0] - _X16_PRIME[0]
+    for i = 1, 15 do
+      m[i] = t[i] - _X16_PRIME[i] - (floor(m[i - 1] / 0x10000) % 2)
+      m[i - 1] = m[i - 1] % 0x10000
+    end
+    local c = floor(m[15] / 0x10000) % 2
+    _x16_swap(t, m, 1 - c)
+  end
+  for i = 0, 15 do
+    out[2 * i + 1] = string.char(t[i] % 0x100)
+    out[2 * i + 2] = string.char(floor(t[i] / 0x100))
+  end
+  return table.concat(out)
+end
+
+local function _x16_add(out, a, b)
+  for i = 0, 15 do out[i] = a[i] + b[i] end
+end
+
+local function _x16_sub(out, a, b)
+  for i = 0, 15 do out[i] = a[i] - b[i] end
+end
+
+local function _x16_mul(out, a, b)
+  local prod = {}
+  for i = 0, 31 do prod[i] = 0 end
+  for i = 0, 15 do
+    local ai = a[i]
+    for j = 0, 15 do
+      prod[i + j] = prod[i + j] + ai * b[j]
+    end
+  end
+  for i = 0, 14 do
+    prod[i] = prod[i] + 38 * prod[i + 16]
+  end
+  for i = 0, 15 do out[i] = prod[i] end
+  _x16_carry(out); _x16_carry(out)
+end
+
+local function _x16_inv(out, a)
+  local c = {}
+  for i = 0, 15 do c[i] = a[i] end
+  for i = 253, 0, -1 do
+    _x16_mul(c, c, c)
+    if i ~= 2 and i ~= 4 then
+      _x16_mul(c, c, a)
+    end
+  end
+  for i = 0, 15 do out[i] = c[i] end
+end
+
+-- Experimental 16-limb TweetNaCl-style X25519 backend.
+function X25519Pure.mul(k_bytes, u_bytes)
+  local x, a, b, c, d, e, f, scalar = {}, {}, {}, {}, {}, {}, {}, {}
+  _x16_unpack(x, u_bytes)
+  for i = 0, 15 do
+    a[i], b[i], c[i], d[i] = 0, x[i], 0, 0
+  end
+  a[0], d[0] = 1, 1
+
+  local kb = { k_bytes:byte(1, 32) }
+  for i = 0, 30 do scalar[i] = kb[i + 1] end
+  scalar[0] = scalar[0] - scalar[0] % 8
+  scalar[31] = (kb[32] or 0) % 64 + 64
+
+  for i = 254, 0, -1 do
+    local bit = floor(scalar[floor(i / 8)] / _POW2[i % 8]) % 2
+    _x16_swap(a, b, bit)
+    _x16_swap(c, d, bit)
+    _x16_add(e, a, c)
+    _x16_sub(a, a, c)
+    _x16_add(c, b, d)
+    _x16_sub(b, b, d)
+    _x16_mul(d, e, e)
+    _x16_mul(f, a, a)
+    _x16_mul(a, c, a)
+    _x16_mul(c, b, e)
+    _x16_add(e, a, c)
+    _x16_sub(a, a, c)
+    _x16_mul(b, a, a)
+    _x16_sub(c, d, f)
+    _x16_mul(a, c, _X16_CURVE_CONST)
+    _x16_add(a, a, d)
+    _x16_mul(c, c, a)
+    _x16_mul(a, d, f)
+    _x16_mul(d, b, x)
+    _x16_mul(b, e, e)
+    _x16_swap(a, b, bit)
+    _x16_swap(c, d, bit)
+  end
+
+  _x16_inv(c, c)
+  _x16_mul(a, a, c)
+  return _x16_pack(a)
 end
 
 -- Base point u=9 in little-endian
