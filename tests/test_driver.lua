@@ -737,6 +737,44 @@ function tests.ed25519_matches_rfc8032_signature_vector()
   end)
 end
 
+function tests.ed25519_public_table_cache_persists_and_restores()
+  with_ed25519_vector_sha512(function()
+    local old_state = Driver.state
+    local old_storage = Driver._test_storage
+    local old_public_cache = Driver.OpenSSLCrypto.ed25519_public_point_cache
+    local old_private_cache = Driver.OpenSSLCrypto.ed25519_private_key_cache
+
+    Driver.state = {}
+    Driver._test_storage = {}
+    Driver.OpenSSLCrypto.ed25519_public_point_cache = {}
+    Driver.OpenSSLCrypto.ed25519_private_key_cache = {}
+
+    local expanded = Driver.OpenSSLCrypto._expanded_ed25519_private_key(ED25519_VECTOR_SEED)
+    local private_key = Driver.Bytes.hex(ED25519_VECTOR_SEED)
+    assert(type(Driver.state.crypto_cache.ed25519_private_keys[private_key]) == "table", "private key expansion persisted")
+    Driver.OpenSSLCrypto.ed25519_private_key_cache = {}
+    local restored_expanded = Driver.OpenSSLCrypto._expanded_ed25519_private_key(ED25519_VECTOR_SEED)
+    assert_eq(restored_expanded.public_key, expanded.public_key, "private key expansion restored")
+
+    local first = Driver.OpenSSLCrypto._ed25519_public_key_cache_entry(ED25519_VECTOR_PUBLIC)
+    local cache = Driver.state.crypto_cache
+    local cache_key = Driver.Bytes.hex(ED25519_VECTOR_PUBLIC)
+    assert(type(first.fixed_table) == "table", "public key table built")
+    assert(type(cache.ed25519_public_tables[cache_key]) == "string", "public key table persisted")
+
+    Driver.OpenSSLCrypto.ed25519_public_point_cache = {}
+    local restored = Driver.OpenSSLCrypto._ed25519_public_key_cache_entry(ED25519_VECTOR_PUBLIC)
+    assert_eq(restored.restored_from_cache, true, "public key table restored from cache")
+    assert_eq(Driver.Ed25519Pure.verify_profile(ED25519_VECTOR_PUBLIC, ED25519_VECTOR_SIGNATURE, "",
+      restored.point, restored.fixed_table), true, "restored table verifies signature")
+
+    Driver.state = old_state
+    Driver._test_storage = old_storage
+    Driver.OpenSSLCrypto.ed25519_public_point_cache = old_public_cache
+    Driver.OpenSSLCrypto.ed25519_private_key_cache = old_private_cache
+  end)
+end
+
 function tests.openssl_crypto_pair_verify_response_uses_pure_x25519_and_ed25519_hooks()
   local private_key = Driver.Bytes.from_hex(
     "77076d0a7318a57d3c16c17251b26645" ..
