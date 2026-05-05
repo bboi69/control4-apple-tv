@@ -2251,24 +2251,6 @@ local function _ed_build_base_table()
   return table_by_window
 end
 
-local function _ed_build_fixed_point_table(point)
-  local table_by_window = {}
-  local base = point
-  for window = 1, _ED_FIXED_TABLE_WINDOWS do
-    local multiples = {}
-    multiples[0] = _ed_identity()
-    multiples[1] = base
-    for digit = 2, _ED_BASE_WINDOW_SIZE - 1 do
-      multiples[digit] = _ed_point_add(multiples[digit - 1], base)
-    end
-    table_by_window[window] = multiples
-    for _ = 1, _ED_BASE_WINDOW do
-      base = _ed_point_double(base)
-    end
-  end
-  return table_by_window
-end
-
 local function _ed_serialize_fixed_point_table(fixed_table)
   assert(type(fixed_table) == "table", "fixed point table is required")
   local out = {}
@@ -2317,28 +2299,6 @@ local function _ed_deserialize_fixed_point_table(encoded)
   return table_by_window
 end
 
-local function _ed_point_neg(P)
-  return {
-    X = _fp_sub(_ED_ZERO_FE, P.X),
-    Y = P.Y,
-    Z = P.Z,
-    T = _fp_sub(_ED_ZERO_FE, P.T),
-  }
-end
-
-local function _ed_negate_fixed_point_table(fixed_table)
-  local negated = {}
-  for window = 1, #fixed_table do
-    local src = fixed_table[window]
-    local dst = {}
-    for digit = 0, _ED_BASE_WINDOW_SIZE - 1 do
-      dst[digit] = _ed_point_neg(src[digit])
-    end
-    negated[window] = dst
-  end
-  return negated
-end
-
 local function _ed_base_window_digit(scalar, window_index)
   local digit = 0
   local first_bit = (window_index - 1) * _ED_BASE_WINDOW
@@ -2366,26 +2326,6 @@ function _ed_scalar_mult_fixed_table(fixed_table, scalar)
     local digit = _ed_base_window_digit(scalar, window)
     if digit ~= 0 then
       result = _ed_point_add(result, fixed_table[window][digit])
-    end
-  end
-  return result
-end
-
-local function _ed_double_scalar_base_plus_fixed(base_scalar, fixed_table, fixed_scalar)
-  if not _ED_BASE_TABLE then
-    _ED_BASE_TABLE = _ed_build_base_table()
-    _ED_BASE_TABLE_PREWARMED = true
-  end
-  local result = _ed_identity()
-  local window_count = math.max(#_ED_BASE_TABLE, #fixed_table)
-  for window = 1, window_count do
-    local base_digit = _ed_base_window_digit(base_scalar, window)
-    if base_digit ~= 0 then
-      result = _ed_point_add(result, _ED_BASE_TABLE[window][base_digit])
-    end
-    local fixed_digit = _ed_base_window_digit(fixed_scalar, window)
-    if fixed_digit ~= 0 then
-      result = _ed_point_add(result, fixed_table[window][fixed_digit])
     end
   end
   return result
@@ -2574,7 +2514,7 @@ function Ed25519Pure.sign_expanded_profile(expanded, message)
   return signature, profile
 end
 
-local function _ed_verify_internal(public_key, signature, message, collect_profile, decoded_public_key, fixed_public_table, negative_fixed_public_table)
+local function _ed_verify_internal(public_key, signature, message, collect_profile, decoded_public_key)
   local profile = collect_profile and {} or nil
   local step_start = os.clock()
   if type(signature) ~= "string" or #signature ~= 64 then
@@ -2595,35 +2535,16 @@ local function _ed_verify_internal(public_key, signature, message, collect_profi
   local k = _scalar_from_le_bytes_mod(_sha512_bytes(signature:sub(1, 32) .. public_key .. message))
   if profile then profile.scalar_ms = _ed_elapsed_ms(step_start) end
 
-  local ok
-  if negative_fixed_public_table then
-    step_start = os.clock()
-    local combined = _ed_double_scalar_base_plus_fixed(S, negative_fixed_public_table, k)
-    if profile then
-      profile.base_mult_ms = _ed_elapsed_ms(step_start)
-      profile.variable_mult_ms = 0
-    end
+  step_start = os.clock()
+  local left = _ed_scalar_mult_base(S)
+  if profile then profile.base_mult_ms = _ed_elapsed_ms(step_start) end
 
-    step_start = os.clock()
-    ok = _ed_point_equal(combined, R)
-  else
-    step_start = os.clock()
-    local left = _ed_scalar_mult_base(S)
-    if profile then profile.base_mult_ms = _ed_elapsed_ms(step_start) end
+  step_start = os.clock()
+  local right = _ed_point_add(R, _ed_scalar_mult_window(A, k))
+  if profile then profile.variable_mult_ms = _ed_elapsed_ms(step_start) end
 
-    step_start = os.clock()
-    local kA
-    if fixed_public_table then
-      kA = _ed_scalar_mult_fixed_table(fixed_public_table, k)
-    else
-      kA = _ed_scalar_mult_window(A, k)
-    end
-    local right = _ed_point_add(R, kA)
-    if profile then profile.variable_mult_ms = _ed_elapsed_ms(step_start) end
-
-    step_start = os.clock()
-    ok = _ed_point_equal(left, right)
-  end
+  step_start = os.clock()
+  local ok = _ed_point_equal(left, right)
   if profile then profile.equal_ms = _ed_elapsed_ms(step_start) end
   return ok, profile
 end
@@ -2633,16 +2554,12 @@ function Ed25519Pure.verify(public_key, signature, message)
   return ok
 end
 
-function Ed25519Pure.verify_profile(public_key, signature, message, decoded_public_key, fixed_public_table, negative_fixed_public_table)
-  return _ed_verify_internal(public_key, signature, message, true, decoded_public_key, fixed_public_table, negative_fixed_public_table)
+function Ed25519Pure.verify_profile(public_key, signature, message, decoded_public_key)
+  return _ed_verify_internal(public_key, signature, message, true, decoded_public_key)
 end
 
 function Ed25519Pure.decode_public_key(public_key)
   return _ed_decode_point(public_key)
-end
-
-function Ed25519Pure.fixed_point_table(point)
-  return _ed_build_fixed_point_table(point)
 end
 
 function Ed25519Pure.serialize_fixed_point_table(fixed_table)
@@ -2651,10 +2568,6 @@ end
 
 function Ed25519Pure.restore_fixed_point_table(encoded)
   return _ed_deserialize_fixed_point_table(encoded)
-end
-
-function Ed25519Pure.negate_fixed_point_table(fixed_table)
-  return _ed_negate_fixed_point_table(fixed_table)
 end
 
 function SRP.sha512(data)
@@ -3073,16 +2986,14 @@ function OpenSSLCrypto._crypto_cache_state()
   if type(cache) ~= "table" or cache.version ~= OpenSSLCrypto.ED25519_TABLE_CACHE_VERSION then
     cache = {
       version = OpenSSLCrypto.ED25519_TABLE_CACHE_VERSION,
-      ed25519_public_tables = {},
       ed25519_private_keys = {},
     }
     Driver.state.crypto_cache = cache
-  elseif type(cache.ed25519_public_tables) ~= "table" then
-    cache.ed25519_public_tables = {}
   end
   if type(cache.ed25519_private_keys) ~= "table" then
     cache.ed25519_private_keys = {}
   end
+  cache.ed25519_public_tables = nil
   return cache
 end
 
@@ -3090,18 +3001,6 @@ function OpenSSLCrypto._save_crypto_cache()
   if Driver.state and Driver.state.crypto_cache then
     Storage.save(Driver.state)
   end
-end
-
-function OpenSSLCrypto.prune_ed25519_public_table_cache(public_key_bytes)
-  local cache = OpenSSLCrypto._crypto_cache_state()
-  local keep_key = public_key_bytes and Bytes.hex(public_key_bytes) or nil
-  local pruned = {}
-  if keep_key and cache.ed25519_public_tables[keep_key] then
-    pruned[keep_key] = cache.ed25519_public_tables[keep_key]
-  end
-  cache.ed25519_public_tables = pruned
-  OpenSSLCrypto.ed25519_public_point_cache = {}
-  OpenSSLCrypto._save_crypto_cache()
 end
 
 function OpenSSLCrypto.prune_ed25519_private_key_cache(private_key_bytes)
@@ -3150,38 +3049,6 @@ function OpenSSLCrypto.ensure_ed25519_base_table()
   return "ready"
 end
 
-function OpenSSLCrypto._restore_ed25519_public_table_from_cache(public_key_bytes, key)
-  local cache = OpenSSLCrypto._crypto_cache_state()
-  local encoded = cache.ed25519_public_tables[key]
-  if type(encoded) ~= "string" then
-    return nil
-  end
-
-  local fixed_table, err = Ed25519Pure.restore_fixed_point_table(encoded)
-  if not fixed_table then
-    Log.debug("crypto cache ignored: Apple TV public key table " .. tostring(err))
-    cache.ed25519_public_tables[key] = nil
-    OpenSSLCrypto._save_crypto_cache()
-    return nil
-  end
-
-  local point = fixed_table[1] and fixed_table[1][1]
-  if not point or _ed_encode_point(point) ~= public_key_bytes then
-    Log.debug("crypto cache ignored: Apple TV public key table key mismatch")
-    cache.ed25519_public_tables[key] = nil
-    OpenSSLCrypto._save_crypto_cache()
-    return nil
-  end
-
-  Log.debug("crypto cache restored: Apple TV public key fixed table")
-  return {
-    point = point,
-    fixed_table = fixed_table,
-    negative_fixed_table = Ed25519Pure.negate_fixed_point_table(fixed_table),
-    restored_from_cache = true,
-  }
-end
-
 function OpenSSLCrypto._expanded_ed25519_private_key(private_key_bytes)
   assert(type(private_key_bytes) == "string" and #private_key_bytes == 32, "Ed25519 private key must be 32 bytes")
   local key = Bytes.hex(private_key_bytes)
@@ -3228,19 +3095,9 @@ function OpenSSLCrypto._ed25519_public_key_cache_entry(public_key_bytes)
   local key = Bytes.hex(public_key_bytes)
   local entry = OpenSSLCrypto.ed25519_public_point_cache[key]
   if not entry then
-    entry = OpenSSLCrypto._restore_ed25519_public_table_from_cache(public_key_bytes, key)
-    if not entry then
-      local point = assert(Ed25519Pure.decode_public_key(public_key_bytes), "invalid Ed25519 public key")
-      local fixed_table = Ed25519Pure.fixed_point_table(point)
-      entry = {
-        point = point,
-        fixed_table = fixed_table,
-        negative_fixed_table = Ed25519Pure.negate_fixed_point_table(fixed_table),
-      }
-      local cache = OpenSSLCrypto._crypto_cache_state()
-      cache.ed25519_public_tables[key] = Ed25519Pure.serialize_fixed_point_table(fixed_table)
-      OpenSSLCrypto._save_crypto_cache()
-    end
+    entry = {
+      point = assert(Ed25519Pure.decode_public_key(public_key_bytes), "invalid Ed25519 public key"),
+    }
     OpenSSLCrypto.ed25519_public_point_cache[key] = entry
   end
   return entry
@@ -3252,8 +3109,7 @@ end
 
 function OpenSSLCrypto._default_verify_ed25519(public_key_bytes, signature, data)
   local entry = OpenSSLCrypto._ed25519_public_key_cache_entry(public_key_bytes)
-  return Ed25519Pure.verify_profile(public_key_bytes, signature, data,
-    entry.point, entry.fixed_table, entry.negative_fixed_table)
+  return Ed25519Pure.verify_profile(public_key_bytes, signature, data, entry.point)
 end
 
 OpenSSLCrypto._verify_ed25519 = OpenSSLCrypto._default_verify_ed25519
@@ -3263,8 +3119,7 @@ function OpenSSLCrypto._verify_ed25519_profile(public_key_bytes, signature, data
     return OpenSSLCrypto._verify_ed25519(public_key_bytes, signature, data), nil
   end
   local entry = OpenSSLCrypto._ed25519_public_key_cache_entry(public_key_bytes)
-  return Ed25519Pure.verify_profile(public_key_bytes, signature, data,
-    entry.point, entry.fixed_table, entry.negative_fixed_table)
+  return Ed25519Pure.verify_profile(public_key_bytes, signature, data, entry.point)
 end
 
 function OpenSSLCrypto._cipher()
@@ -7872,7 +7727,7 @@ function C4Driver.airplay_pairing_submit_pin(pin)
       Driver.state.airplay_credentials = canonical
       AirPlay.credentials = credentials_or_err
       AirPlay.pairing_active = false
-      OpenSSLCrypto.prune_ed25519_public_table_cache(credentials_or_err.ltpk)
+      OpenSSLCrypto.ed25519_public_point_cache = {}
       Storage.save(Driver.state)
       C4Driver.update_property("AirPlay Credentials", canonical)
       C4Driver.update_property("Connection State", "AirPlay Pairing Complete")
@@ -7889,7 +7744,7 @@ function C4Driver.import_airplay_credentials(detail_string)
   Driver.state = Driver.state or {}
   Driver.state.airplay_credentials = canonical
   AirPlay.credentials = credentials
-  OpenSSLCrypto.prune_ed25519_public_table_cache(credentials.ltpk)
+  OpenSSLCrypto.ed25519_public_point_cache = {}
   Storage.save(Driver.state)
   C4Driver.update_property("AirPlay Credentials", canonical)
   C4Driver.set_connection_state("AirPlay Credentials Imported")
@@ -7972,7 +7827,6 @@ function C4Driver.reset_pairing()
   Driver.state.airplay_credentials = nil
   Driver.state.app_list = nil
   if type(Driver.state.crypto_cache) == "table" then
-    Driver.state.crypto_cache.ed25519_public_tables = {}
     Driver.state.crypto_cache.ed25519_private_keys = {}
   end
   OpenSSLCrypto.ed25519_public_point_cache = {}
@@ -8196,9 +8050,7 @@ function C4Driver.prewarm_crypto_stage(stage)
     end
 
     if stage == nil or stage == "atv" then
-      local start_time = os.clock()
-      OpenSSLCrypto._ed25519_public_key_cache_entry(credentials.ltpk)
-      Log.debug("crypto prewarm Apple TV public key fixed table ms=" .. tostring(elapsed_ms(start_time)))
+      Log.debug("crypto prewarm skipped: Apple TV public key fixed table disabled")
     end
 
     if stage == nil or stage == "x25519" then

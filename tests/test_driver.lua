@@ -737,7 +737,7 @@ function tests.ed25519_matches_rfc8032_signature_vector()
   end)
 end
 
-function tests.ed25519_public_table_cache_persists_and_restores()
+function tests.ed25519_key_cache_persists_private_key_and_decodes_public_point()
   with_ed25519_vector_sha512(function()
     local old_state = Driver.state
     local old_storage = Driver._test_storage
@@ -758,15 +758,14 @@ function tests.ed25519_public_table_cache_persists_and_restores()
 
     local first = Driver.OpenSSLCrypto._ed25519_public_key_cache_entry(ED25519_VECTOR_PUBLIC)
     local cache = Driver.state.crypto_cache
-    local cache_key = Driver.Bytes.hex(ED25519_VECTOR_PUBLIC)
-    assert(type(first.fixed_table) == "table", "public key table built")
-    assert(type(cache.ed25519_public_tables[cache_key]) == "string", "public key table persisted")
+    assert(type(first.point) == "table", "public key point decoded")
+    assert_eq(cache.ed25519_public_tables, nil, "public key table not persisted")
 
     Driver.OpenSSLCrypto.ed25519_public_point_cache = {}
     local restored = Driver.OpenSSLCrypto._ed25519_public_key_cache_entry(ED25519_VECTOR_PUBLIC)
-    assert_eq(restored.restored_from_cache, true, "public key table restored from cache")
+    assert(type(restored.point) == "table", "public key point decoded after memory cache reset")
     assert_eq(Driver.Ed25519Pure.verify_profile(ED25519_VECTOR_PUBLIC, ED25519_VECTOR_SIGNATURE, "",
-      restored.point, restored.fixed_table), true, "restored table verifies signature")
+      restored.point), true, "decoded point verifies signature")
 
     Driver.state = old_state
     Driver._test_storage = old_storage
