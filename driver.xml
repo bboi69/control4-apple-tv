@@ -706,6 +706,12 @@
                 <default>Off</default>
                 <readonly>false</readonly>
             </property>
+            <property>
+                <name>Crypto Prewarm Status</name>
+                <type>STRING</type>
+                <default>Idle</default>
+                <readonly>true</readonly>
+            </property>
         </properties>
         <actions>
             <action>
