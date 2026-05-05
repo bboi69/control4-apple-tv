@@ -2225,7 +2225,7 @@ local function _ed_scalar_mult(point, scalar)
   return result
 end
 
-local _ED_BASE_WINDOW = 6
+local _ED_BASE_WINDOW = 5
 local _ED_BASE_WINDOW_SIZE = 2 ^ _ED_BASE_WINDOW
 local _ED_FIXED_TABLE_WINDOWS = math.ceil(256 / _ED_BASE_WINDOW)
 local _ED_FIXED_TABLE_HEX_LEN = _ED_FIXED_TABLE_WINDOWS * _ED_BASE_WINDOW_SIZE * 4 * _FE_LIMBS * 4
@@ -2920,7 +2920,7 @@ local OpenSSLCrypto = {
   ed25519_private_key_cache = {},
 }
 
-OpenSSLCrypto.ED25519_TABLE_CACHE_VERSION = "ed25519-fixed-v3-window6-limb15"
+OpenSSLCrypto.ED25519_TABLE_CACHE_VERSION = "ed25519-fixed-v2-window5-limb15"
 OpenSSLCrypto.EVP_CTRL_AEAD_GET_TAG = 0x10
 OpenSSLCrypto.EVP_CTRL_AEAD_SET_TAG = 0x11
 OpenSSLCrypto.EVP_CTRL_AEAD_SET_IVLEN = 0x09
