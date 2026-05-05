@@ -1017,7 +1017,7 @@ end
 
 function tests.driver_imports_and_resets_companion_credentials()
   local old_properties = Properties
-  Properties = { ["Launch App"] = "", ["Current App"] = "", ["AirPlay Credentials"] = "", ["Pairing PIN"] = "1234" }
+  Properties = { ["Launch App"] = "", ["Current App"] = "", ["Pairing PIN"] = "1234" }
   Driver._test_storage = {}
 
   local credentials = table.concat({
@@ -1044,7 +1044,7 @@ end
 
 function tests.driver_imports_and_loads_airplay_credentials()
   local old_properties = Properties
-  Properties = { ["AirPlay Credentials"] = "", ["Connection State"] = "" }
+  Properties = { ["Connection State"] = "" }
   Driver._test_storage = {}
   Driver.state = Driver._test_storage
 
@@ -1057,7 +1057,6 @@ function tests.driver_imports_and_loads_airplay_credentials()
 
   Driver.C4Driver.import_airplay_credentials(credentials)
   assert_eq(Driver._test_storage.airplay_credentials, credentials, "stored airplay credentials")
-  assert_eq(Properties["AirPlay Credentials"], credentials, "airplay credentials property")
   assert_eq(Properties["Connection State"], "AirPlay Credentials Imported", "airplay import state")
   assert_eq(Driver.AirPlay.credentials.type, "HAP", "airplay credential type")
 
@@ -1351,7 +1350,6 @@ function tests.airplay_pairing_flow_saves_credentials()
   Properties = {
     ["Apple TV Address"] = "192.0.2.55",
     ["Connection State"] = "",
-    ["AirPlay Credentials"] = "",
     ["Pairing PIN"] = "1234",
   }
   Driver._test_storage = {}
@@ -1424,7 +1422,8 @@ function tests.airplay_pairing_flow_saves_credentials()
   assert_eq(#post_paths, 4, "airplay pairing post count")
   assert_eq(Driver.AirPlay.credentials.type, "HAP", "airplay saved hap credentials")
   assert_eq(Driver.Bytes.hex(Driver.AirPlay.credentials.ltpk), Driver.Bytes.hex(string.rep("t", 32)), "airplay saved ltpk")
-  assert_eq(Driver._test_storage.airplay_credentials, Properties["AirPlay Credentials"], "airplay persisted credentials")
+  assert_eq(Driver._test_storage.airplay_credentials, Driver.Credentials.stringify(Driver.AirPlay.credentials), "airplay persisted credentials")
+  assert_eq(Properties["Pairing PIN"], "", "airplay pairing clears pin")
 
   C4 = old_c4
   Properties = old_properties
@@ -2453,8 +2452,8 @@ function tests.disconnect_companion_keeps_credentials()
   assert_eq(Driver.Companion.session, nil, "session cleared")
   assert_eq(Driver.OpenSSLCrypto._pregenerated_x25519_keypair, nil, "disconnect clears pregenerated x25519 keypair")
   assert_eq(Properties["Connection State"], "Disconnected", "disconnect state")
-  assert_eq(Properties["Companion State"], "Disconnected", "disconnect companion state")
-  assert_eq(Properties["AirPlay Monitor State"], "STOPPED", "disconnect stops AirPlay monitor")
+  assert_eq(Driver.Companion.state, "Disconnected", "disconnect companion state")
+  assert_eq(Driver.AirPlay.monitor_state, "STOPPED", "disconnect stops AirPlay monitor")
   Properties = old_properties
   Driver.OpenSSLCrypto._pregenerated_x25519_keypair = old_pregen
 end
@@ -2464,7 +2463,7 @@ function tests.connection_state_also_publishes_companion_state()
   Properties = {}
   Driver.C4Driver.set_connection_state("SESSION_ACTIVE")
   assert_eq(Properties["Connection State"], "SESSION_ACTIVE", "connection state")
-  assert_eq(Properties["Companion State"], "SESSION_ACTIVE", "companion state")
+  assert_eq(Driver.Companion.state, "SESSION_ACTIVE", "companion state")
   Properties = old_properties
 end
 
@@ -2522,7 +2521,7 @@ function tests.room_power_scopes_airplay_monitor()
   CancelTimer = function(name)
     cancelled[#cancelled + 1] = name
   end
-  Properties = { ["AirPlay Monitor State"] = "" }
+  Properties = {}
   Driver.state = {}
   Driver.AirPlay.credentials = { type = "HAP" }
   Driver.AirPlay.monitor_enabled = false
@@ -2533,7 +2532,7 @@ function tests.room_power_scopes_airplay_monitor()
 
   assert_eq(#scheduled, 1, "room on schedules monitor start")
   assert_eq(scheduled[1].name, "AppleTV_airplay_monitor_start", "monitor start timer")
-  assert_eq(Properties["AirPlay Monitor State"], "SCHEDULED", "monitor scheduled state")
+  assert_eq(Driver.AirPlay.monitor_state, "SCHEDULED", "monitor scheduled state")
 
   Driver.AirPlay.monitor_enabled = true
   Driver.AirPlay.control_client = {
@@ -2547,7 +2546,7 @@ function tests.room_power_scopes_airplay_monitor()
   assert_eq(closed, true, "room off closes monitor client")
   assert_eq(Driver.AirPlay.monitor_enabled, false, "room off disables monitor")
   assert_eq(Driver.AirPlay.control_client, nil, "room off clears monitor client")
-  assert_eq(Properties["AirPlay Monitor State"], "STOPPED", "monitor stopped state")
+  assert_eq(Driver.AirPlay.monitor_state, "STOPPED", "monitor stopped state")
   assert_contains(cancelled, "AppleTV_airplay_monitor_start", "room off cancels scheduled start")
   assert_contains(cancelled, "AppleTV_airplay_monitor_retry", "room off cancels retry")
   assert_contains(cancelled, "AppleTV_airplay_monitor_watchdog", "room off cancels watchdog")
@@ -2589,7 +2588,7 @@ function tests.airplay_monitor_watchdog_restarts_stale_channel()
   Driver.C4Driver.check_airplay_monitor_watchdog()
   assert_eq(closed, true, "stale monitor closes old client")
   assert_eq(Driver.AirPlay.control_client, nil, "stale monitor clears old client")
-  assert_eq(Properties["AirPlay Monitor State"], "STALE", "stale monitor state")
+  assert_eq(Driver.AirPlay.monitor_state, "STALE", "stale monitor state")
   assert_eq(Properties["Connection State"], nil, "metadata failure does not alter control state")
 
   Properties = old_properties

@@ -7337,12 +7337,10 @@ end
 function C4Driver.set_companion_state(value)
   Companion.state = value
   C4Driver.update_property("Connection State", value)
-  C4Driver.update_property("Companion State", value)
 end
 
 function C4Driver.set_airplay_monitor_state(value)
   AirPlay.monitor_state = value
-  C4Driver.update_property("AirPlay Monitor State", value)
 end
 
 function C4Driver.publish_current_app()
@@ -7650,6 +7648,7 @@ function C4Driver.pair_airplay()
     return nil, "Apple TV Address is required"
   end
 
+  C4Driver.update_property("Pairing PIN", "")
   local function start_pairing(port)
     AirPlay.port = port or AirPlay.port or 7000
     AirPlay.pair_setup = PairSetup.new(Crypto)
@@ -7805,7 +7804,6 @@ function C4Driver.airplay_pairing_submit_pin(pin)
       AirPlay.pairing_active = false
       OpenSSLCrypto.prune_ed25519_public_table_cache(credentials_or_err.ltpk)
       Storage.save(Driver.state)
-      C4Driver.update_property("AirPlay Credentials", canonical)
       C4Driver.update_property("Pairing PIN", "")
       C4Driver.update_property("Connection State", "AirPlay Pairing Complete")
       Log.debug("AirPlay Pair-Setup complete, credentials saved")
@@ -7823,7 +7821,6 @@ function C4Driver.import_airplay_credentials(detail_string)
   AirPlay.credentials = credentials
   OpenSSLCrypto.prune_ed25519_public_table_cache(credentials.ltpk)
   Storage.save(Driver.state)
-  C4Driver.update_property("AirPlay Credentials", canonical)
   C4Driver.set_connection_state("AirPlay Credentials Imported")
   return credentials
 end
@@ -7841,7 +7838,6 @@ function C4Driver.load_persisted_airplay_credentials()
   end
 
   AirPlay.credentials = credentials_or_err
-  C4Driver.update_property("AirPlay Credentials", raw)
   Log.debug("AirPlay credentials loaded")
   return credentials_or_err
 end
@@ -7928,7 +7924,6 @@ function C4Driver.reset_pairing()
   C4Driver.update_property_list("Launch App", { "" })
   C4Driver.update_property("Current App", "")
   C4Driver.update_property("Now Playing", "")
-  C4Driver.update_property("AirPlay Credentials", "")
   C4Driver.update_property("Pairing PIN", "")
   C4Driver.set_connection_state("Disconnected")
 end
@@ -8050,6 +8045,7 @@ function C4Driver.pair_companion()
     Log.error("set Apple TV Address before pairing")
     error("Apple TV Address is required for pairing")
   end
+  C4Driver.update_property("Pairing PIN", "")
   local client = CompanionClient.new({
     host = host,
     port = MDNS.cached_port(host),
@@ -8266,6 +8262,7 @@ function C4Driver.init()
   local _, rows = Companion.parse_app_list(Companion.app_list)
   Companion.app_list_rows = rows
   C4Driver.update_property("Driver Version", Driver.VERSION)
+  C4Driver.update_property("Pairing PIN", "")
   C4Driver.set_crypto_prewarm_status("Idle")
   C4Driver.publish_app_list()
   C4Driver.load_persisted_credentials()
