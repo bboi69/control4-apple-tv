@@ -240,67 +240,6 @@ local function make_fake_openssl(options)
     }
   end
 
-  local function make_cipher_ctx(mode)
-    local vector_plaintext = false
-    return {
-      init = function(_, key, nonce, pad)
-        record("cipher." .. mode .. ".init")
-        assert_eq(#key, 32, mode .. " key length")
-        assert_eq(#nonce, 12, mode .. " nonce length")
-        assert_eq(pad, nil, mode .. " padding")
-        return true
-      end,
-      update = function(_, data, aad)
-        if aad then
-          record("cipher." .. mode .. ".aad:" .. data)
-          return nil
-        end
-        record("cipher." .. mode .. ".update:" .. data)
-        if mode == "encrypt" then
-          if data == "plaintext" then
-            vector_plaintext = true
-            return Driver.Bytes.from_hex("f99769694763c038c3")
-          end
-          return options.encrypt_ciphertext or "ciphertext"
-        end
-        if data == Driver.Bytes.from_hex("f99769694763c038c3") then
-          return "plaintext"
-        end
-        return options.decrypt_plaintext or "plaintext"
-      end,
-      final = function()
-        record("cipher." .. mode .. ".final")
-        return ""
-      end,
-      ctrl = function(_, control, value)
-        record("cipher." .. mode .. ".ctrl:" .. tostring(control))
-        if control == Driver.OpenSSLCrypto.EVP_CTRL_AEAD_SET_IVLEN then
-          assert_eq(value, 12, "iv length")
-          return true
-        end
-        if mode == "encrypt" then
-          assert_eq(control, Driver.OpenSSLCrypto.EVP_CTRL_AEAD_GET_TAG, "get tag ctrl")
-          assert_eq(value, 16, "tag length")
-          if mode == "encrypt" and options.encrypt_tag then
-            return options.encrypt_tag
-          end
-          if vector_plaintext then
-            return Driver.Bytes.from_hex("88540d8367db9102148f2c2034e779d0")
-          end
-          return string.rep("T", 16)
-        end
-        assert_eq(control, Driver.OpenSSLCrypto.EVP_CTRL_AEAD_SET_TAG, "set tag ctrl")
-        if value == Driver.Bytes.from_hex("88540d8367db9102148f2c2034e779d0") then
-          return true
-        end
-        if value ~= string.rep("T", 16) then
-          return false
-        end
-        return true
-      end,
-    }
-  end
-
   local fake = {
     calls = calls,
     pkey = {
@@ -354,28 +293,6 @@ local function make_fake_openssl(options)
       totext = function(value)
         record("bn.totext")
         return value.bytes
-      end,
-    },
-    cipher = {
-          get = function(algorithm)
-        record("cipher.get:" .. tostring(algorithm))
-        assert_eq(algorithm, "chacha20-poly1305", "cipher algorithm")
-        return {
-          encrypt_new = function(_, key, nonce, pad)
-            record("cipher:encrypt_new")
-            assert_eq(key, nil, "encrypt key deferred until init")
-            assert_eq(nonce, nil, "encrypt nonce deferred until init")
-            assert_eq(pad, nil, "encrypt padding deferred until init")
-            return make_cipher_ctx("encrypt")
-          end,
-          decrypt_new = function(_, key, nonce, pad)
-            record("cipher:decrypt_new")
-            assert_eq(key, nil, "decrypt key deferred until init")
-            assert_eq(nonce, nil, "decrypt nonce deferred until init")
-            assert_eq(pad, nil, "decrypt padding deferred until init")
-            return make_cipher_ctx("decrypt")
-          end,
-        }
       end,
     },
     hmac = {
@@ -517,7 +434,18 @@ function tests.tlv8_roundtrip()
 end
 
 function tests.companion_pair_setup_start_matches_pyatv_docs()
-  local frame = Driver.Companion.encode_pair_setup_start()
+  local pair_setup = Driver.PairSetup.new({
+    generate_ed25519_keypair = function()
+      return {
+        private_key = string.rep("\x01", 32),
+        public_key = string.rep("\x02", 32),
+      }
+    end,
+    random_bytes = function(n)
+      return string.rep("\x03", n)
+    end,
+  })
+  local frame = pair_setup:start()
   assert_eq(
     Driver.Bytes.hex(frame),
     "03000013e2435f706476000100060101455f7077547909",
@@ -656,6 +584,47 @@ function tests.companion_session_encrypts_with_frame_header_aad()
   assert_eq(decrypt_nonces[1], "000000000000000000000000", "first decrypt nonce")
 end
 
+function tests.poly1305_matches_rfc7539_vector()
+  local key = Driver.Bytes.from_hex(
+    "85d6be7857556d337f4452fe42d506a8" ..
+    "0103808afb0db2fd4abff6af4149f51b"
+  )
+  local msg = "Cryptographic Forum Research Group"
+  assert_eq(
+    Driver.Bytes.hex(Driver.ChaCha20Poly1305Pure.poly1305_mac(msg, key)),
+    "a8061dc1305136c6c22b8baf0c0127a9",
+    "RFC7539 Poly1305 MAC"
+  )
+end
+
+function tests.poly1305_handles_varied_block_lengths()
+  local key = Driver.Bytes.from_hex(
+    "000102030405060708090a0b0c0d0e0f" ..
+    "101112131415161718191a1b1c1d1e1f"
+  )
+  local vectors = {
+    { len = 0, tag = "101112131415161718191a1b1c1d1e1f" },
+    { len = 1, tag = "1f11131517191b1d1f21232527292b2d" },
+    { len = 15, tag = "5305236ca07fc93d9ca416b23664fa50" },
+    { len = 16, tag = "a2291a363def0b53845fa4126a6ad364" },
+    { len = 17, tag = "f735c97f7308fd79222447fe76a96872" },
+    { len = 31, tag = "7c57daa799d3d38243034a4af1f6ed2b" },
+    { len = 32, tag = "e4a30dc29abba238e086b49b2916f440" },
+    { len = 63, tag = "61abe275b6d2ccf0911fe932877a6643" },
+    { len = 64, tag = "ec478e3080abb4e797340d66c9cbc65a" },
+    { len = 65, tag = "ded264fe6bf02b57de5b3a7fc23e076a" },
+  }
+
+  for _, vector in ipairs(vectors) do
+    local msg = bytes_range(0, vector.len - 1)
+    assert_eq(
+      Driver.Bytes.hex(Driver.ChaCha20Poly1305Pure.poly1305_mac(msg, key)),
+      vector.tag,
+      "Poly1305 len " .. tostring(vector.len)
+    )
+  end
+end
+
 function tests.openssl_crypto_wraps_raw_hap_keys_as_der()
   local key = bytes_range(0, 31)
   assert_eq(
@@ -725,6 +694,32 @@ function tests.openssl_crypto_hmac_supports_empty_key_without_c4_hmac()
       "9e395f9f250f8b582ebe92d3ff63dd401d3ab2af85790b24ecd92dce7466c16d",
       "empty-key hmac digest")
   end)
+end
+
+function tests.openssl_crypto_hmac_prefers_native_c4_hmac()
+  local old_c4 = C4
+  local calls = {}
+  C4 = {
+    HMAC = function(_, algorithm, key, data, options)
+      calls[#calls + 1] = {
+        algorithm = algorithm,
+        key = key,
+        data = data,
+        options = options,
+      }
+      return "native-hmac"
+    end,
+  }
+
+  local digest = Driver.OpenSSLCrypto.hmac_sha512("key", "data")
+  assert_eq(digest, "native-hmac", "native hmac result")
+  assert_eq(#calls, 1, "native hmac call count")
+  assert_eq(calls[1].algorithm, "SHA512", "native hmac algorithm")
+  assert_eq(calls[1].options.return_encoding, "NONE", "native hmac return encoding")
+  assert_eq(calls[1].options.key_encoding, "NONE", "native hmac key encoding")
+  assert_eq(calls[1].options.data_encoding, "NONE", "native hmac data encoding")
+
+  C4 = old_c4
 end
 
 function tests.ed25519_matches_rfc8032_signature_vector()
@@ -941,8 +936,7 @@ function tests.companion_client_pair_verify_enables_encrypted_session()
 	
 	  assert_eq(states[4], "READY", "ready state")
 	  assert(client.session ~= nil, "session enabled")
-	  assert_eq(Driver.Companion.session, client.session, "global session")
-	  assert_eq(Driver.Companion.socket, client, "global socket")
+	  assert_eq(Driver.Companion.client, nil, "standalone client does not set global client")
 	
 	  local second = Driver.CompanionFrame.try_decode(writes[2])
 	  local tlv = Driver.PairVerify.decode_pairing_data(second.payload)
@@ -1063,6 +1057,31 @@ function tests.driver_imports_and_loads_airplay_credentials()
   Driver.AirPlay.credentials = nil
   Driver.C4Driver.load_persisted_airplay_credentials()
   assert_eq(Driver.Bytes.hex(Driver.AirPlay.credentials.client_id), Driver.Bytes.hex("AIRPLAY-CLIENT"), "loaded airplay client id")
+
+  Properties = old_properties
+end
+
+function tests.airplay_credentials_opc_reimports_after_reset_clears_storage()
+  local old_properties = Properties
+  Properties = { ["Connection State"] = "", ["AirPlay Credentials"] = "" }
+  Driver._test_storage = {}
+  Driver.state = Driver._test_storage
+
+  local credentials = table.concat({
+    Driver.Bytes.hex(bytes_range(0, 31)),
+    Driver.Bytes.hex(bytes_range(32, 63)),
+    Driver.Bytes.hex("AIRPLAY-ID"),
+    Driver.Bytes.hex("AIRPLAY-CLIENT"),
+  }, ":")
+
+  OPC.AirPlay_Credentials(credentials)
+  assert_eq(Driver._test_storage.airplay_credentials, credentials, "initial import stored")
+
+  Driver.state.airplay_credentials = nil
+  Driver.AirPlay.credentials = nil
+  OPC.AirPlay_Credentials(credentials)
+  assert_eq(Driver._test_storage.airplay_credentials, credentials, "re-import stored after reset")
+  assert_eq(Driver.AirPlay.credentials.type, "HAP", "re-import parsed credentials")
 
   Properties = old_properties
 end
@@ -1554,6 +1573,18 @@ function tests.queued_command_reconnects_from_error_state_once()
   assert_eq(#client.pending_commands, 2, "commands queued while reconnecting")
 end
 
+function tests.companion_reconnect_state_code_ignores_detail_suffix()
+  local client = Driver.CompanionClient.new({})
+  client.state = "DISCONNECTED: network down"
+  assert_eq(client:state_code(), "DISCONNECTED", "disconnected state code")
+  assert_eq(client:needs_reconnect(), true, "disconnected detail reconnects")
+  client.state = "ERROR: failed"
+  assert_eq(client:state_code(), "ERROR", "error state code")
+  assert_eq(client:needs_reconnect(), true, "error detail reconnects")
+  client.state = "SESSION_ACTIVE"
+  assert_eq(client:needs_reconnect(), false, "active session does not reconnect")
+end
+
 function tests.queued_hid_commands_are_coalesced_while_connecting()
   local client = Driver.CompanionClient.new({
     credentials = Driver.Credentials.parse(table.concat({
@@ -1579,6 +1610,38 @@ function tests.queued_hid_commands_are_coalesced_while_connecting()
   assert_eq(client.pending_commands[2].content._hidC, 5, "menu release retained")
   assert_eq(client.pending_commands[2].content._hBtS, 2, "menu release retained")
   assert_eq(client.pending_commands[3].content._hidC, 1, "different HID retained")
+end
+
+function tests.companion_pending_responses_expire_by_ttl()
+  local writes = {}
+  local now = 1000
+  local client = Driver.CompanionClient.new({
+    credentials = Driver.Credentials.parse(table.concat({
+      Driver.Bytes.hex(string.rep("\x01", 32)),
+      Driver.Bytes.hex(string.rep("\x02", 32)),
+      Driver.Bytes.hex("ATV-ID"),
+      Driver.Bytes.hex("CLIENT-ID"),
+    }, ":")),
+    crypto = {
+      encrypt = function(_, plaintext) return plaintext .. string.rep("\0", 16) end,
+      decrypt = function(_, ciphertext) return ciphertext:sub(1, #ciphertext - 16) end,
+    },
+    transport = { Write = function(_, data) writes[#writes + 1] = data end },
+    response_timeout_ms = 5000,
+  })
+  client.now_ms = function() return now end
+  client.session = Driver.CompanionSession.new("out", "in", client.crypto)
+  client.state = "SESSION_ACTIVE"
+
+  local request = client:fetch_apps()
+  assert(client.pending_responses[request._x] ~= nil, "pending response stored")
+  now = 5999
+  client:cleanup_pending_responses()
+  assert(client.pending_responses[request._x] ~= nil, "pending response retained before ttl")
+  now = 6001
+  local expired = client:cleanup_pending_responses()
+  assert_eq(expired, 1, "expired response count")
+  assert_eq(client.pending_responses[request._x], nil, "pending response expired")
 end
 
 function tests.active_session_command_reuses_connection()
@@ -1608,12 +1671,28 @@ function tests.active_session_command_reuses_connection()
   assert(client.last_tx_ms ~= nil, "last tx timestamp recorded")
 end
 
+function tests.companion_sent_messages_are_bounded()
+  local old_sent = Driver.Companion.sent_messages
+  local old_max = Driver.Companion.sent_messages_max
+  Driver.Companion.sent_messages = {}
+  Driver.Companion.sent_messages_max = 3
+
+  for i = 1, 5 do
+    Driver.Companion.record_sent_message({ _i = "m" .. tostring(i) })
+  end
+
+  assert_eq(#Driver.Companion.sent_messages, 3, "sent message ring length")
+  assert_eq(Driver.Companion.sent_messages[1]._i, "m3", "oldest retained message")
+  assert_eq(Driver.Companion.sent_messages[3]._i, "m5", "newest retained message")
+
+  Driver.Companion.sent_messages = old_sent
+  Driver.Companion.sent_messages_max = old_max
+end
+
 function tests.driver_destroy_closes_client_and_cancels_timers()
   local old_cancel_timer = CancelTimer
   local old_client = Driver.Companion.client
   local old_airplay_client = Driver.AirPlay.control_client
-  local old_socket = Driver.Companion.socket
-  local old_session = Driver.Companion.session
   local old_monitor_enabled = Driver.AirPlay.monitor_enabled
   local old_pregen = Driver.OpenSSLCrypto._pregenerated_x25519_keypair
   local cancelled = {}
@@ -1628,8 +1707,6 @@ function tests.driver_destroy_closes_client_and_cancels_timers()
       closed = true
     end,
   }
-  Driver.Companion.socket = Driver.Companion.client
-  Driver.Companion.session = {}
   Driver.AirPlay.control_client = {
     close = function()
       airplay_closed = true
@@ -1646,8 +1723,6 @@ function tests.driver_destroy_closes_client_and_cancels_timers()
   assert_eq(closed, true, "destroy closes Companion client")
   assert_eq(airplay_closed, true, "destroy closes AirPlay client")
   assert_eq(Driver.Companion.client, nil, "destroy clears client")
-  assert_eq(Driver.Companion.socket, nil, "destroy clears socket")
-  assert_eq(Driver.Companion.session, nil, "destroy clears session")
   assert_eq(Driver.AirPlay.control_client, nil, "destroy clears AirPlay client")
   assert_eq(Driver.AirPlay.monitor_enabled, false, "destroy disables AirPlay monitor")
   assert_contains(cancelled, "AppleTV_crypto_prewarm_all", "all prewarm timer cancelled")
@@ -1656,6 +1731,7 @@ function tests.driver_destroy_closes_client_and_cancels_timers()
   assert_contains(cancelled, "AppleTV_crypto_prewarm_atv", "atv prewarm timer cancelled")
   assert_contains(cancelled, "AppleTV_crypto_prewarm_x25519", "x25519 prewarm timer cancelled")
   assert_contains(cancelled, "AppleTV_reselect_passthrough", "passthrough timer cancelled")
+  assert_contains(cancelled, "AppleTV_companion_watchdog", "Companion watchdog timer cancelled")
   assert_contains(cancelled, "AppleTV_airplay_monitor_start", "AirPlay monitor start timer cancelled")
   assert_contains(cancelled, "AppleTV_airplay_monitor_retry", "AirPlay monitor retry timer cancelled")
   assert_contains(cancelled, "AppleTV_airplay_monitor_watchdog", "AirPlay monitor watchdog timer cancelled")
@@ -1664,8 +1740,6 @@ function tests.driver_destroy_closes_client_and_cancels_timers()
   CancelTimer = old_cancel_timer
   Driver.Companion.client = old_client
   Driver.AirPlay.control_client = old_airplay_client
-  Driver.Companion.socket = old_socket
-  Driver.Companion.session = old_session
   Driver.AirPlay.monitor_enabled = old_monitor_enabled
   Driver.OpenSSLCrypto._pregenerated_x25519_keypair = old_pregen
 end
@@ -1833,6 +1907,21 @@ function tests.mini_app_launch_debounces_duplicate_switcher_burst()
   Driver.C4MiniApps.last_launch_at_ms = old_last_launch_at_ms
   Driver.Companion.app_list = old_app_list
   Driver.Companion.app_list_rows = old_app_rows
+end
+
+function tests.mini_apps_and_companion_client_use_c4_wall_clock()
+  local old_c4 = C4
+  C4 = {
+    GetTime = function()
+      return 123456
+    end,
+  }
+
+  local client = Driver.CompanionClient.new({})
+  assert_eq(client:now_ms(), 123456, "Companion client wall clock")
+  assert_eq(Driver.C4MiniApps.now_ms(), 123456, "mini app wall clock")
+
+  C4 = old_c4
 end
 
 function tests.mini_app_ignores_composer_routing_chatter()
@@ -2450,6 +2539,24 @@ function tests.app_list_populates_launch_app_dynamic_list_and_launches_selection
   Properties = old_properties
 end
 
+function tests.print_app_list_outputs_row_identifier()
+  local old_print = print
+  local lines = {}
+  print = function(line)
+    lines[#lines + 1] = tostring(line)
+  end
+
+  Driver.Companion.app_list_rows = {
+    { name = "Netflix", identifier = "com.netflix.Netflix" },
+  }
+
+  local ok = Driver.C4Driver.print_app_list()
+  assert_eq(ok, true, "print app list succeeds")
+  assert_eq(lines[2], "[AppleTV]   Netflix | com.netflix.Netflix", "printed identifier")
+
+  print = old_print
+end
+
 function tests.response_matching_adds_identifier_for_app_list()
   local received
   local client = Driver.CompanionClient.new({
@@ -2488,8 +2595,6 @@ function tests.disconnect_companion_keeps_credentials()
   local closed = false
   local credentials = { type = "HAP" }
   Driver.Companion.credentials = credentials
-  Driver.Companion.session = {}
-  Driver.Companion.socket = {}
   Driver.Companion.client = {
     close = function()
       closed = true
@@ -2504,8 +2609,6 @@ function tests.disconnect_companion_keeps_credentials()
   assert_eq(closed, true, "client close called")
   assert_eq(Driver.Companion.credentials, credentials, "credentials retained")
   assert_eq(Driver.Companion.client, nil, "client cleared")
-  assert_eq(Driver.Companion.socket, nil, "socket cleared")
-  assert_eq(Driver.Companion.session, nil, "session cleared")
   assert_eq(Driver.OpenSSLCrypto._pregenerated_x25519_keypair, nil, "disconnect clears pregenerated x25519 keypair")
   assert_eq(Properties["Connection State"], "Disconnected", "disconnect state")
   assert_eq(Driver.Companion.state, "Disconnected", "disconnect companion state")
@@ -2521,6 +2624,52 @@ function tests.connection_state_also_publishes_companion_state()
   assert_eq(Properties["Connection State"], "SESSION_ACTIVE", "connection state")
   assert_eq(Driver.Companion.state, "SESSION_ACTIVE", "companion state")
   Properties = old_properties
+end
+
+function tests.companion_watchdog_reconnects_stale_session()
+  local old_properties = Properties
+  local old_client = Driver.Companion.client
+  local old_now = Driver.C4Driver.now_ms
+  local old_interval = Driver.Companion.watchdog_interval_ms
+  local old_stale = Driver.Companion.watchdog_stale_ms
+  local closed = false
+  local connect_calls = 0
+
+  Properties = {}
+  Driver.Companion.watchdog_interval_ms = 60000
+  Driver.Companion.watchdog_stale_ms = 60000
+  Driver.C4Driver.now_ms = function() return 120000 end
+  Driver.Companion.client = {
+    state = "SESSION_ACTIVE",
+    credentials = { type = "HAP" },
+    session = {},
+    transport = {
+      Close = function()
+        closed = true
+      end,
+    },
+    last_rx_ms = 1000,
+    pending_commands = {
+      { identifier = "_launchApp" },
+    },
+  }
+  setmetatable(Driver.Companion.client, { __index = Driver.CompanionClient })
+  Driver.Companion.client.connect = function(self)
+    connect_calls = connect_calls + 1
+    self.connecting = true
+  end
+
+  Driver.C4Driver.check_companion_watchdog()
+  assert_eq(closed, true, "stale Companion transport closed")
+  assert_eq(connect_calls, 1, "stale Companion reconnect requested")
+  assert_eq(#Driver.Companion.client.pending_commands, 1, "queued commands preserved")
+  assert_eq(Properties["Connection State"], "DISCONNECTED", "watchdog disconnect state")
+
+  Properties = old_properties
+  Driver.Companion.client = old_client
+  Driver.C4Driver.now_ms = old_now
+  Driver.Companion.watchdog_interval_ms = old_interval
+  Driver.Companion.watchdog_stale_ms = old_stale
 end
 
 function tests.airplay_monitor_watchdog_sends_heartbeat()
@@ -2874,6 +3023,46 @@ function tests.opack_float_decode()
   local decoded = Driver.OPACK.decode(encoded)
   assert(math.abs(decoded[1] - 2.5) < 0.000001, "float32 in array")
   assert_eq(decoded[2], decoded[1], "float object reference")
+end
+
+function tests.pair_setup_m5_hap_computes_crypto_once()
+  local calls = {
+    hkdf = 0,
+    sign = 0,
+    encrypt = 0,
+  }
+  local fake_crypto = {
+    hkdf_sha512 = function()
+      calls.hkdf = calls.hkdf + 1
+      return string.rep("\xEE", 32)
+    end,
+    ed25519_sign = function()
+      calls.sign = calls.sign + 1
+      return string.rep("\xDD", 64)
+    end,
+    encrypt = function(_, plaintext, _, nonce)
+      calls.encrypt = calls.encrypt + 1
+      assert_eq(nonce, string.rep("\0", 4) .. "PS-Msg05", "M5 HAP nonce")
+      return plaintext .. string.rep("\0", 16)
+    end,
+  }
+
+  local setup = Driver.PairSetup.new(fake_crypto)
+  setup.state = "M4_VERIFIED"
+  setup.K = string.rep("\xBB", 64)
+  setup.session_key = string.rep("\xCC", 32)
+  setup.pairing_id = "controller-id"
+  setup.auth_public = string.rep("\xCD", 32)
+  setup.auth_private = string.rep("\xAB", 32)
+
+  local payload = setup:compute_m5_hap()
+  local tlv = Driver.TLV8.decode(payload)
+  assert_eq(tlv[6], string.char(0x05), "M5 HAP seq")
+  assert(tlv[5] ~= nil, "M5 HAP encrypted data")
+  assert_eq(setup.state, "M5_SENT", "M5 HAP state")
+  assert_eq(calls.hkdf, 1, "M5 HAP hkdf call count")
+  assert_eq(calls.sign, 1, "M5 HAP sign call count")
+  assert_eq(calls.encrypt, 1, "M5 HAP encrypt call count")
 end
 
 function tests.pair_setup_m1_to_m6_with_mock_crypto()

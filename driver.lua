@@ -424,8 +424,9 @@ end
 function Bytes.uint_le(value, length)
   assert(value >= 0 and value == math.floor(value), "integer required")
   local out = {}
-  for i = 0, length - 1 do
-    out[#out + 1] = string.char(math.floor(value / (0x100 ^ i)) % 0x100)
+  for i = 1, length do
+    out[i] = string.char(value % 0x100)
+    value = math.floor(value / 0x100)
   end
   return table.concat(out)
 end
@@ -455,10 +456,6 @@ function Bytes.uint_be(value, length)
     out[#out + 1] = string.char(math.floor(value / (0x100 ^ i)) % 0x100)
   end
   return table.concat(out)
-end
-
-function Bytes.read_i32be(data, offset)
-  return Bytes.read_uint_be(data, offset, 4)
 end
 
 local TLV8 = {}
@@ -1275,8 +1272,9 @@ end
 
 local ChaCha20Poly1305Pure = {}
 local _CHACHA_CONST = { 0x61707865, 0x3320646e, 0x79622d32, 0x6b206574 }
-local _POLY1305_P = BigInt.from_bytes_be(Bytes.from_hex("03fffffffffffffffffffffffffffffffb"))
-local _POLY1305_2_128 = BigInt.from_bytes_be(Bytes.from_hex("0100000000000000000000000000000000"))
+local _POLY1305_LIMB_BASE = 8192
+local _POLY1305_POW2 = {}
+for _i = 0, 13 do _POLY1305_POW2[_i] = 2 ^ _i end
 
 local function _read_u32_le(s, offset)
   local b1, b2, b3, b4 = s:byte(offset, offset + 3)
@@ -1291,20 +1289,6 @@ local function _write_u32_le(v)
     math.floor(v / 0x10000) % 0x100,
     math.floor(v / 0x1000000) % 0x100
   )
-end
-
-local function _reverse_bytes(s)
-  local out = {}
-  for i = #s, 1, -1 do out[#out + 1] = s:sub(i, i) end
-  return table.concat(out)
-end
-
-local function _bigint_from_le(s)
-  return BigInt.from_bytes_be(_reverse_bytes(s))
-end
-
-local function _bigint_to_le(v, len)
-  return _reverse_bytes(BigInt.to_bytes_be(v, len))
 end
 
 local function _quarter_round(x, a, b, c, d)
@@ -1339,15 +1323,26 @@ function ChaCha20Poly1305Pure.block(key, counter, nonce)
   return table.concat(out)
 end
 
+local function _store_bytes(out, ...)
+  local count = select("#", ...)
+  for i = 1, count do
+    out[i] = select(i, ...)
+  end
+  return count
+end
+
 function ChaCha20Poly1305Pure.chacha20_xor(key, nonce, initial_counter, data)
   local out, pos, counter = {}, 1, initial_counter
+  local chunk, data_bytes, block_bytes = {}, {}, {}
   while pos <= #data do
     local block = ChaCha20Poly1305Pure.block(key, counter, nonce)
     local n = math.min(64, #data - pos + 1)
-    local chunk = {}
+    _store_bytes(data_bytes, data:byte(pos, pos + n - 1))
+    _store_bytes(block_bytes, block:byte(1, n))
     for i = 1, n do
-      chunk[i] = string.char(Bit32.bxor(data:byte(pos + i - 1), block:byte(i)))
+      chunk[i] = string.char(Bit32.bxor(data_bytes[i], block_bytes[i]))
     end
+    for i = n + 1, 64 do chunk[i] = nil end
     out[#out + 1] = table.concat(chunk)
     pos = pos + n
     counter = (counter + 1) % 0x100000000
@@ -1357,15 +1352,125 @@ end
 
 local function _poly1305_clamp(r)
   local b = { r:byte(1, 16) }
-  b[4] = Bit32.band(b[4], 15)
-  b[8] = Bit32.band(b[8], 15)
-  b[12] = Bit32.band(b[12], 15)
-  b[16] = Bit32.band(b[16], 15)
-  b[5] = Bit32.band(b[5], 252)
-  b[9] = Bit32.band(b[9], 252)
-  b[13] = Bit32.band(b[13], 252)
-  local out = {}
-  for i = 1, 16 do out[i] = string.char(b[i]) end
+  return string.char(
+    b[1], b[2], b[3], Bit32.band(b[4], 15),
+    Bit32.band(b[5], 252), b[6], b[7], Bit32.band(b[8], 15),
+    Bit32.band(b[9], 252), b[10], b[11], Bit32.band(b[12], 15),
+    Bit32.band(b[13], 252), b[14], b[15], Bit32.band(b[16], 15)
+  )
+end
+
+local function _poly1305_limbs_from_le_bytes(s)
+  local limbs, acc, bits = {}, 0, 0
+  for i = 1, #s do
+    acc = acc + s:byte(i) * _POLY1305_POW2[bits]
+    bits = bits + 8
+    while bits >= 13 and #limbs < 10 do
+      limbs[#limbs + 1] = acc % _POLY1305_LIMB_BASE
+      acc = math.floor(acc / _POLY1305_LIMB_BASE)
+      bits = bits - 13
+    end
+  end
+  if #limbs < 10 then
+    limbs[#limbs + 1] = acc
+  end
+  while #limbs < 10 do
+    limbs[#limbs + 1] = 0
+  end
+  return limbs
+end
+
+local function _poly1305_block_limbs(block)
+  if #block < 16 then
+    block = block .. "\1" .. string.rep("\0", 16 - #block)
+  else
+    block = block .. "\1"
+  end
+  return _poly1305_limbs_from_le_bytes(block)
+end
+
+local function _poly1305_carry(h)
+  local carry
+  for _ = 1, 2 do
+    for i = 1, 9 do
+      carry = math.floor(h[i] / _POLY1305_LIMB_BASE)
+      h[i] = h[i] % _POLY1305_LIMB_BASE
+      h[i + 1] = h[i + 1] + carry
+    end
+    carry = math.floor(h[10] / _POLY1305_LIMB_BASE)
+    h[10] = h[10] % _POLY1305_LIMB_BASE
+    h[1] = h[1] + carry * 5
+  end
+end
+
+local function _poly1305_ge_p(h)
+  if h[10] ~= _POLY1305_LIMB_BASE - 1 then
+    return h[10] > _POLY1305_LIMB_BASE - 1
+  end
+  for i = 9, 2, -1 do
+    if h[i] ~= _POLY1305_LIMB_BASE - 1 then
+      return h[i] > _POLY1305_LIMB_BASE - 1
+    end
+  end
+  return h[1] >= _POLY1305_LIMB_BASE - 5
+end
+
+local function _poly1305_sub_p(h)
+  h[1] = h[1] + 5
+  local carry = math.floor(h[1] / _POLY1305_LIMB_BASE)
+  h[1] = h[1] % _POLY1305_LIMB_BASE
+  for i = 2, 10 do
+    h[i] = h[i] + carry
+    carry = math.floor(h[i] / _POLY1305_LIMB_BASE)
+    h[i] = h[i] % _POLY1305_LIMB_BASE
+  end
+end
+
+local function _poly1305_mul_mod(h, r)
+  local d = {}
+  for i = 1, 10 do d[i] = 0 end
+  for i = 1, 10 do
+    local hi = 11 - i
+    for j = 1, hi do
+      local k = i + j - 1
+      d[k] = d[k] + h[i] * r[j]
+    end
+    for j = hi + 1, 10 do
+      local k = i + j - 11
+      d[k] = d[k] + h[i] * r[j] * 5
+    end
+  end
+  _poly1305_carry(d)
+  if _poly1305_ge_p(d) then
+    _poly1305_sub_p(d)
+  end
+  return d
+end
+
+local function _poly1305_low128(h)
+  local out, acc, bits = {}, 0, 0
+  for i = 1, 10 do
+    acc = acc + h[i] * _POLY1305_POW2[bits]
+    bits = bits + 13
+    while bits >= 8 and #out < 16 do
+      out[#out + 1] = acc % 256
+      acc = math.floor(acc / 256)
+      bits = bits - 8
+    end
+  end
+  while #out < 16 do
+    out[#out + 1] = 0
+  end
+  return out
+end
+
+local function _poly1305_add_s(h, s)
+  local out, carry = _poly1305_low128(h), 0
+  for i = 1, 16 do
+    local sum = out[i] + s:byte(i) + carry
+    out[i] = string.char(sum % 256)
+    carry = math.floor(sum / 256)
+  end
   return table.concat(out)
 end
 
@@ -1376,17 +1481,21 @@ local function _pad16(s)
 end
 
 function ChaCha20Poly1305Pure.poly1305_mac(msg, one_time_key)
-  local r = _bigint_from_le(_poly1305_clamp(one_time_key:sub(1, 16)))
-  local s = _bigint_from_le(one_time_key:sub(17, 32))
-  local acc = BigInt.from_number(0)
+  assert(type(one_time_key) == "string" and #one_time_key == 32, "Poly1305 one-time key must be 32 bytes")
+  local r = _poly1305_limbs_from_le_bytes(_poly1305_clamp(one_time_key:sub(1, 16)))
+  local h = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
   local pos = 1
   while pos <= #msg do
-    local block = msg:sub(pos, pos + 15)
-    local n = _bigint_from_le(block .. "\1")
-    acc = BigInt.mod(BigInt.mul(BigInt.add(acc, n), r), _POLY1305_P)
+    local n = _poly1305_block_limbs(msg:sub(pos, pos + 15))
+    for i = 1, 10 do h[i] = h[i] + n[i] end
+    h = _poly1305_mul_mod(h, r)
     pos = pos + 16
   end
-  return _bigint_to_le(BigInt.mod(BigInt.add(acc, s), _POLY1305_2_128), 16)
+  _poly1305_carry(h)
+  if _poly1305_ge_p(h) then
+    _poly1305_sub_p(h)
+  end
+  return _poly1305_add_s(h, one_time_key:sub(17, 32))
 end
 
 function ChaCha20Poly1305Pure.encrypt(key, nonce, plaintext, aad)
@@ -2632,12 +2741,7 @@ local function srp_xor_bytes(a, b)
   assert(#a == #b, "XOR operands must be equal length")
   local out = {}
   for i = 1, #a do
-    local x, y, r, bit = a:byte(i), b:byte(i), 0, 1
-    while bit < 256 do
-      if (x % (bit * 2) >= bit) ~= (y % (bit * 2) >= bit) then r = r + bit end
-      bit = bit * 2
-    end
-    out[i] = string.char(r)
+    out[i] = string.char(Bit32.bxor(a:byte(i), b:byte(i)))
   end
   return table.concat(out)
 end
@@ -2888,10 +2992,6 @@ local OpenSSLCrypto = {
 }
 
 OpenSSLCrypto.ED25519_TABLE_CACHE_VERSION = "ed25519-fixed-v2-window5-limb15"
-OpenSSLCrypto.EVP_CTRL_AEAD_GET_TAG = 0x10
-OpenSSLCrypto.EVP_CTRL_AEAD_SET_TAG = 0x11
-OpenSSLCrypto.EVP_CTRL_AEAD_SET_IVLEN = 0x09
-OpenSSLCrypto.chacha_variant = nil
 
 function OpenSSLCrypto.load_openssl()
   if OpenSSLCrypto.openssl then
@@ -2936,37 +3036,6 @@ local function openssl_assert(value, err, label)
     error(label .. " failed: " .. tostring(err))
   end
   return value
-end
-
-function OpenSSLCrypto._pkey()
-  local openssl = OpenSSLCrypto.load_openssl()
-  assert(openssl.pkey, "lua-openssl pkey module is required")
-  return openssl.pkey
-end
-
-function OpenSSLCrypto._read_public_key(algorithm, public_key)
-  local pkey = OpenSSLCrypto._pkey()
-  local key, err = pkey.read(OpenSSLCrypto._spki_der(algorithm, public_key), false, "der")
-  return openssl_assert(key, err, "read " .. algorithm .. " public key")
-end
-
-function OpenSSLCrypto._read_private_key(algorithm, private_key)
-  local pkey = OpenSSLCrypto._pkey()
-  local key, err = pkey.read(OpenSSLCrypto._pkcs8_der(algorithm, private_key), true, "der")
-  return openssl_assert(key, err, "read " .. algorithm .. " private key")
-end
-
-function OpenSSLCrypto._export_raw_public_key(key)
-  local public_key, public_key_err = key:get_public()
-  public_key = openssl_assert(public_key, public_key_err, "get public key")
-  -- pkey:export("der") for X25519 always returns SubjectPublicKeyInfo DER (i2d_PUBKEY_bio),
-  -- not raw bytes -- the raw=true switch in pkey.c only handles RSA/DSA/EC, X25519 falls
-  -- to default which is the same i2d_PUBKEY_bio call. Strip the 12-byte SPKI header.
-  local der, export_err = public_key:export("der", false)
-  der = openssl_assert(der, export_err, "export X25519 public key")
-  assert(type(der) == "string" and #der == 44,
-    "X25519 SPKI DER expected 44 bytes, got " .. tostring(#der))
-  return der:sub(13)
 end
 
 OpenSSLCrypto._pregenerated_x25519_keypair = nil
@@ -3234,132 +3303,6 @@ end
 
 OpenSSLCrypto._verify_ed25519 = OpenSSLCrypto._default_verify_ed25519
 
-function OpenSSLCrypto._cipher()
-  local openssl = OpenSSLCrypto.load_openssl()
-  assert(openssl.cipher, "lua-openssl cipher module is required")
-  return openssl.cipher
-end
-
-function OpenSSLCrypto._cipher_ctrl(name, fallback)
-  local cipher = OpenSSLCrypto._cipher()
-  return cipher[name] or fallback
-end
-
-function OpenSSLCrypto._chacha_algorithm()
-  local cipher = OpenSSLCrypto._cipher()
-  local algorithm, algorithm_err = cipher.get("chacha20-poly1305")
-  return openssl_assert(algorithm, algorithm_err, "get ChaCha20-Poly1305 cipher")
-end
-
-function OpenSSLCrypto._cipher_ctx(encrypting, key, nonce, variant)
-  local cipher = OpenSSLCrypto._cipher()
-  local algorithm = OpenSSLCrypto._chacha_algorithm()
-  local ctx, err
-  variant = variant or OpenSSLCrypto.chacha_variant or "method_init_ctrl"
-
-  if variant == "method_args" then
-    if encrypting then
-      ctx, err = algorithm:encrypt_new(key, nonce)
-    else
-      ctx, err = algorithm:decrypt_new(key, nonce)
-    end
-    return openssl_assert(ctx, err, "create ChaCha20-Poly1305 " .. (encrypting and "encrypt" or "decrypt") .. " context")
-  end
-
-  if variant == "method_args_pad_false" then
-    if encrypting then
-      ctx, err = algorithm:encrypt_new(key, nonce, false)
-    else
-      ctx, err = algorithm:decrypt_new(key, nonce, false)
-    end
-    return openssl_assert(ctx, err, "create ChaCha20-Poly1305 " .. (encrypting and "encrypt" or "decrypt") .. " context")
-  end
-
-  if variant == "module_new_ctrl" or variant == "module_new_no_ctrl" then
-    assert(cipher.new, "lua-openssl cipher.new is required for " .. variant)
-    ctx, err = cipher.new(algorithm, encrypting)
-    ctx = openssl_assert(ctx, err, "create ChaCha20-Poly1305 context")
-  elseif variant == "module_new_named_ctrl" or variant == "module_new_named_no_ctrl" then
-    assert(cipher.new, "lua-openssl cipher.new is required for " .. variant)
-    ctx, err = cipher.new("chacha20-poly1305", encrypting)
-    ctx = openssl_assert(ctx, err, "create ChaCha20-Poly1305 context")
-  else
-    if encrypting then
-      ctx, err = algorithm:encrypt_new()
-      ctx = openssl_assert(ctx, err, "create ChaCha20-Poly1305 encrypt context")
-    else
-      ctx, err = algorithm:decrypt_new()
-      ctx = openssl_assert(ctx, err, "create ChaCha20-Poly1305 decrypt context")
-    end
-  end
-
-  assert(ctx.init, "lua-openssl cipher context init is required for ChaCha20-Poly1305 AEAD")
-  if variant ~= "method_init_no_ctrl" and variant ~= "module_new_no_ctrl" and variant ~= "module_new_named_no_ctrl" then
-    openssl_assert(ctx:ctrl(OpenSSLCrypto._cipher_ctrl("EVP_CTRL_GCM_SET_IVLEN", OpenSSLCrypto.EVP_CTRL_AEAD_SET_IVLEN), #nonce),
-      nil, "set ChaCha20-Poly1305 IV length")
-  end
-  openssl_assert(ctx:init(key, nonce), nil, "initialize ChaCha20-Poly1305 context")
-  return ctx
-end
-
-function OpenSSLCrypto._chacha20_poly1305_encrypt_variant(variant, key, nonce, plaintext, aad)
-  local ctx = OpenSSLCrypto._cipher_ctx(true, key, nonce, variant)
-  if aad and aad ~= "" then
-    ctx:update(aad, true)
-  end
-  local ciphertext = (ctx:update(plaintext) or "") .. (ctx:final() or "")
-  local tag = assert(ctx:ctrl(OpenSSLCrypto._cipher_ctrl("EVP_CTRL_GCM_GET_TAG", OpenSSLCrypto.EVP_CTRL_AEAD_GET_TAG), 16),
-    "failed to get ChaCha20-Poly1305 auth tag")
-  return ciphertext .. tag
-end
-
-function OpenSSLCrypto._chacha20_poly1305_decrypt_variant(variant, key, nonce, ciphertext_and_tag, aad)
-  assert(#ciphertext_and_tag >= 16, "ChaCha20-Poly1305 ciphertext is missing auth tag")
-  local ciphertext = ciphertext_and_tag:sub(1, #ciphertext_and_tag - 16)
-  local tag = ciphertext_and_tag:sub(#ciphertext_and_tag - 15)
-  local ctx = OpenSSLCrypto._cipher_ctx(false, key, nonce, variant)
-  assert(ctx:ctrl(OpenSSLCrypto._cipher_ctrl("EVP_CTRL_GCM_SET_TAG", OpenSSLCrypto.EVP_CTRL_AEAD_SET_TAG), tag),
-    "failed to set ChaCha20-Poly1305 auth tag")
-  if aad and aad ~= "" then
-    ctx:update(aad, true)
-  end
-  return (ctx:update(ciphertext) or "") .. (ctx:final() or "")
-end
-
-function OpenSSLCrypto._select_chacha_variant()
-  if OpenSSLCrypto.chacha_variant then
-    return OpenSSLCrypto.chacha_variant
-  end
-  local variants = {
-    "method_init_ctrl",
-    "method_init_no_ctrl",
-    "method_args",
-    "method_args_pad_false",
-    "module_new_ctrl",
-    "module_new_no_ctrl",
-    "module_new_named_ctrl",
-    "module_new_named_no_ctrl",
-  }
-  local key = Bytes.from_hex(
-    "000102030405060708090a0b0c0d0e0f" ..
-    "101112131415161718191a1b1c1d1e1f"
-  )
-  local nonce = Bytes.from_hex("000102030405060708090a0b")
-  local expected = Bytes.from_hex("f99769694763c038c388540d8367db9102148f2c2034e779d0")
-  local diagnostics = {}
-  for _, variant in ipairs(variants) do
-    local ok, result = pcall(OpenSSLCrypto._chacha20_poly1305_encrypt_variant,
-      variant, key, nonce, "plaintext", "aad")
-    if ok and result == expected then
-      OpenSSLCrypto.chacha_variant = variant
-      Log.debug("crypto self-test: ChaCha20-Poly1305 using variant " .. variant)
-      return variant
-    end
-    diagnostics[#diagnostics + 1] = variant .. "=" .. (ok and Bytes.hex(result) or tostring(result))
-  end
-  error("no usable ChaCha20-Poly1305 lua-openssl call shape: " .. table.concat(diagnostics, "; "))
-end
-
 function OpenSSLCrypto._chacha20_poly1305_encrypt(key, nonce, plaintext, aad)
   assert(#key == 32, "ChaCha20-Poly1305 key must be 32 bytes")
   assert(#nonce == 12, "ChaCha20-Poly1305 nonce must be 12 bytes")
@@ -3390,6 +3333,16 @@ end
 
 function OpenSSLCrypto.hmac_sha512(key, data)
   assert(type(key) == "string" and type(data) == "string", "HMAC-SHA512 requires string inputs")
+  if has_c4() and C4.HMAC then
+    local result, err = C4:HMAC("SHA512", key, data, {
+      return_encoding = "NONE",
+      key_encoding = "NONE",
+      data_encoding = "NONE",
+    })
+    assert(not err, err)
+    return result
+  end
+
   local block_size = 128
   if #key > block_size then
     key = _sha512_bytes(key)
@@ -3968,17 +3921,7 @@ end
 function PairSetup:compute_m5()
   Log.debug("Pair-Setup M5 compute started: signing controller identity")
   assert(self.state == "M4_VERIFIED", "must verify M4 before computing M5")
-  local ios_device_x = crypto_method(self.crypto, "hkdf_sha512")(
-    "Pair-Setup-Controller-Sign-Salt", "Pair-Setup-Controller-Sign-Info", self.K)
-  local device_info = ios_device_x .. self.pairing_id .. self.auth_public
-  local signature = crypto_method(self.crypto, "ed25519_sign")(self.auth_private, device_info)
-  local inner_tlv = TLV8.encode_ordered({
-    { 1, self.pairing_id },
-    { 3, self.auth_public },
-    { 10, signature },
-  })
-  local nonce = string.rep("\0", 4) .. "PS-Msg05"  -- 12-byte nonce for ChaCha20
-  local encrypted = crypto_method(self.crypto, "encrypt")(self.session_key, inner_tlv, "", nonce)
+  local encrypted = self:_compute_m5_encrypted()
   Log.debug("Pair-Setup M5 progress: identity signed and encrypted")
   local pairing_data = TLV8.encode_ordered({
     { 6, string.char(0x05) },  -- SeqNo = M5
@@ -3993,8 +3936,7 @@ function PairSetup:compute_m5()
   return CompanionFrame.encode(CompanionFrame.PS_NEXT, payload)
 end
 
-function PairSetup:compute_m5_hap()
-  self:compute_m5()
+function PairSetup:_compute_m5_encrypted()
   local ios_device_x = crypto_method(self.crypto, "hkdf_sha512")(
     "Pair-Setup-Controller-Sign-Salt", "Pair-Setup-Controller-Sign-Info", self.K)
   local device_info = ios_device_x .. self.pairing_id .. self.auth_public
@@ -4004,8 +3946,14 @@ function PairSetup:compute_m5_hap()
     { 3, self.auth_public },
     { 10, signature },
   })
-  local nonce = string.rep("\0", 4) .. "PS-Msg05"
-  local encrypted = crypto_method(self.crypto, "encrypt")(self.session_key, inner_tlv, "", nonce)
+  local nonce = string.rep("\0", 4) .. "PS-Msg05"  -- 12-byte nonce for ChaCha20
+  return crypto_method(self.crypto, "encrypt")(self.session_key, inner_tlv, "", nonce)
+end
+
+function PairSetup:compute_m5_hap()
+  assert(self.state == "M4_VERIFIED", "must verify M4 before computing M5")
+  local encrypted = self:_compute_m5_encrypted()
+  self.state = "M5_SENT"
   Log.debug("AirPlay Pair-Setup M5 sent: encrypted_len=" .. tostring(#encrypted))
   return TLV8.encode_ordered({
     { 6, string.char(0x05) },
@@ -4186,10 +4134,10 @@ local Companion = {
   state = "DISCONNECTED",
   port = 49153,
   tx = 0,
-  socket = nil,
   sent_messages = {},
-  pending_commands = {},
-  session = nil,
+  sent_messages_max = 100,
+  watchdog_interval_ms = 60000,
+  watchdog_stale_ms = 90000,
   credentials = nil,
   client = nil,
   app_list = {},
@@ -4197,12 +4145,26 @@ local Companion = {
   now_playing = {},
 }
 
+function Companion.record_sent_message(request)
+  local messages = Companion.sent_messages
+  if type(messages) ~= "table" then
+    return
+  end
+  messages[#messages + 1] = request
+  local max = tonumber(Companion.sent_messages_max) or 0
+  if max <= 0 then
+    Companion.sent_messages = {}
+    return
+  end
+  while #messages > max do
+    table.remove(messages, 1)
+  end
+end
+
 local AirPlay = {
   port = nil,
   txt = {},
   credentials = nil,
-  verifier = nil,
-  control_keys = nil,
   pair_setup = nil,
   pairing_active = false,
   control_client = nil,
@@ -4681,20 +4643,9 @@ end
 function Companion.encode_opack_request(identifier, content, message_type)
   local request = Companion.build_request(identifier, content, message_type)
   local payload = Companion.encode_request_payload(request)
-  local frame = Companion.session and Companion.session:encode_frame(CompanionFrame.E_OPACK, payload) or CompanionFrame.encode(CompanionFrame.E_OPACK, payload)
+  local session = Companion.client and Companion.client.session
+  local frame = session and session:encode_frame(CompanionFrame.E_OPACK, payload) or CompanionFrame.encode(CompanionFrame.E_OPACK, payload)
   return request, frame
-end
-
-function Companion.encode_pair_setup_start()
-  local pairing_data = TLV8.encode({
-    [0] = string.char(0x00),
-    [6] = string.char(0x01),
-  })
-  local payload = OPACK.encode(OPACK.dict({
-    { "_pd", OPACK.bytes(pairing_data) },
-    { "_pwTy", 1 },
-  }))
-  return CompanionFrame.encode(CompanionFrame.PS_START, payload)
 end
 
 function Companion.send_opack(identifier, content, message_type)
@@ -4703,13 +4654,9 @@ function Companion.send_opack(identifier, content, message_type)
   end
 
   local request, frame = Companion.encode_opack_request(identifier, content, message_type)
-  Companion.sent_messages[#Companion.sent_messages + 1] = request
+  Companion.record_sent_message(request)
 
-  if Companion.socket and Companion.socket.send then
-    Companion.socket:send(frame)
-  else
-    Log.debug("queued Companion request " .. identifier)
-  end
+  Log.debug("queued Companion request " .. identifier)
 
   return request, frame
 end
@@ -4994,6 +4941,7 @@ function Companion.button_action(name, action)
   error("unsupported HID action: " .. tostring(action))
 end
 
+local C4Driver
 local CompanionClient = {}
 
 function CompanionClient.new(options)
@@ -5014,6 +4962,7 @@ function CompanionClient.new(options)
     session_remote_sid = nil,
     session_start_xid = nil,
     pending_responses = {},
+    response_timeout_ms = options.response_timeout_ms or 30000,
     pending_commands = {},
     startup_steps = nil,
     startup_index = 0,
@@ -5037,7 +4986,10 @@ function CompanionClient.new(options)
 end
 
 function CompanionClient:now_ms()
-  return math.floor(os.clock() * 1000 + 0.5)
+  if C4Driver and C4Driver.now_ms then
+    return C4Driver.now_ms()
+  end
+  return (os.time() or 0) * 1000
 end
 
 function CompanionClient:mark_tx()
@@ -5067,10 +5019,6 @@ function CompanionClient:clear_runtime_state(options)
   self.pending_responses = {}
   if options.clear_pending_commands then
     self.pending_commands = {}
-  end
-  if Companion.client == self then
-    Companion.session = nil
-    Companion.socket = nil
   end
 end
 
@@ -5250,8 +5198,6 @@ end
 
 function CompanionClient:enable_session(keys)
   self.session = CompanionSession.new(keys.output_key, keys.input_key, self.crypto)
-  Companion.session = self.session
-  Companion.socket = self
   self:set_state("READY")
   self:start_companion_services()
 end
@@ -5563,6 +5509,7 @@ end
 
 function CompanionClient:send_opack(identifier, content, message_type, on_response, on_error, request)
   request = request or Companion.build_request(identifier, content, message_type)
+  self:cleanup_pending_responses()
   local payload = Companion.encode_request_payload(request)
   local frame = self.session and self.session:encode_frame(CompanionFrame.E_OPACK, payload) or CompanionFrame.encode(CompanionFrame.E_OPACK, payload)
   if request._t == 2 then
@@ -5570,19 +5517,44 @@ function CompanionClient:send_opack(identifier, content, message_type, on_respon
       identifier = identifier,
       on_response = on_response,
       on_error = on_error,
+      created_at_ms = self:now_ms(),
     }
   end
   self:send_raw(frame)
   return request, frame
 end
 
+function CompanionClient:cleanup_pending_responses(now_ms)
+  now_ms = now_ms or self:now_ms()
+  local timeout_ms = tonumber(self.response_timeout_ms) or 0
+  if timeout_ms <= 0 then
+    return 0
+  end
+  local expired = 0
+  for xid, pending in pairs(self.pending_responses or {}) do
+    local created_at = pending and pending.created_at_ms or now_ms
+    if now_ms - created_at > timeout_ms then
+      self.pending_responses[xid] = nil
+      expired = expired + 1
+      Log.debug("Companion pending response expired: xid=" .. tostring(xid) ..
+        " identifier=" .. tostring(pending and pending.identifier))
+    end
+  end
+  return expired
+end
+
 function CompanionClient:is_ready_for_commands()
   return self.state == "SESSION_ACTIVE" and self.session ~= nil
 end
 
-function CompanionClient:needs_reconnect()
+function CompanionClient:state_code()
   local state = tostring(self.state or "")
-  return state == "DISCONNECTED" or state:match("^DISCONNECTED") or state:match("^ERROR")
+  return state:match("^([^:]+)") or state
+end
+
+function CompanionClient:needs_reconnect()
+  local state = self:state_code()
+  return state == "DISCONNECTED" or state == "ERROR"
 end
 
 function CompanionClient:queue_pending_command(item)
@@ -5614,7 +5586,7 @@ end
 
 function CompanionClient:send_or_queue_opack(identifier, content, message_type)
   local request = Companion.build_request(identifier, content, message_type)
-  Companion.sent_messages[#Companion.sent_messages + 1] = request
+  Companion.record_sent_message(request)
   if self:is_ready_for_commands() then
     return self:send_opack(identifier, content, message_type, nil, nil, request)
   end
@@ -5655,8 +5627,6 @@ end
 function CompanionClient:fetch_apps()
   return self:send_or_queue_opack("FetchLaunchableApplicationsEvent", {}, 2)
 end
-
-local C4Driver
 
 local C4MiniApps = {
   PASSTHROUGH_PROXY = 5001,
@@ -5829,6 +5799,9 @@ function C4MiniApps.queue_retry(service, app_proxy_id)
 end
 
 function C4MiniApps.now_ms()
+  if C4Driver and C4Driver.now_ms then
+    return C4Driver.now_ms()
+  end
   return (os.time() or 0) * 1000
 end
 
@@ -7383,8 +7356,8 @@ function C4Driver.print_app_list()
   end
   Log.output("App List (" .. tostring(#rows) .. " apps)")
   for _, row in ipairs(rows) do
-    Log.output("  " .. tostring(row.name or row.bundle_id or "") ..
-      " | " .. tostring(row.bundle_id or ""))
+    Log.output("  " .. tostring(row.name or row.identifier or "") ..
+      " | " .. tostring(row.identifier or ""))
   end
   return true
 end
@@ -7673,7 +7646,6 @@ function C4Driver.pair_airplay()
     AirPlay.pair_setup = PairSetup.new(Crypto)
     AirPlay.pairing_active = true
     AirPlay.credentials = nil
-    AirPlay.control_keys = nil
 
     Log.debug("AirPlay Pair-Setup PIN start requested: port=" .. tostring(AirPlay.port))
     return C4Driver.airplay_post("/pair-pin-start", "", function(_, _, pin_code, _, pin_error)
@@ -7880,8 +7852,6 @@ function C4Driver.import_credentials(detail_string)
   Driver.state = Driver.state or {}
   Driver.state.companion_credentials = canonical
   Companion.credentials = credentials
-  Companion.session = nil
-  Companion.socket = nil
   Companion.client = nil
   OpenSSLCrypto.prune_ed25519_private_key_cache(credentials.ltsk)
   Storage.save(Driver.state)
@@ -7911,6 +7881,7 @@ end
 
 function C4Driver.reset_pairing()
   C4Driver.cancel_timer("AppleTV_crypto_prewarm_x25519")
+  C4Driver.cancel_timer("AppleTV_companion_watchdog")
   OpenSSLCrypto._pregenerated_x25519_keypair = nil
   if Companion.client and Companion.client.close then
     Companion.client:close()
@@ -7927,13 +7898,8 @@ function C4Driver.reset_pairing()
   OpenSSLCrypto.ed25519_private_key_cache = {}
   Companion.credentials = nil
   AirPlay.credentials = nil
-  AirPlay.verifier = nil
-  AirPlay.control_keys = nil
   C4Driver.stop_airplay_monitor("reset pairing")
-  Companion.session = nil
-  Companion.socket = nil
   Companion.client = nil
-  Companion.pending_commands = {}
   Companion.app_list = {}
   Companion.app_list_rows = {}
   Companion.current_app = nil
@@ -7960,6 +7926,7 @@ end
 
 function C4Driver.disconnect_companion()
   C4Driver.cancel_timer("AppleTV_crypto_prewarm_x25519")
+  C4Driver.cancel_timer("AppleTV_companion_watchdog")
   MDNS.close()
   OpenSSLCrypto._pregenerated_x25519_keypair = nil
   if Companion.client and Companion.client.close then
@@ -7967,8 +7934,6 @@ function C4Driver.disconnect_companion()
   end
   C4Driver.stop_airplay_monitor("disconnect")
   Companion.client = nil
-  Companion.socket = nil
-  Companion.session = nil
   C4Driver.set_connection_state("Disconnected")
 end
 
@@ -7993,7 +7958,58 @@ function C4Driver.ensure_companion_client()
   return C4Driver.connect_companion()
 end
 
+function C4Driver.schedule_companion_watchdog()
+  if not (has_c4() and type(SetTimer) == "function") then return end
+  C4Driver.cancel_timer("AppleTV_companion_watchdog")
+  local ok, err = pcall(SetTimer, "AppleTV_companion_watchdog", Companion.watchdog_interval_ms, function()
+    C4Driver.check_companion_watchdog()
+  end)
+  if not ok then
+    Log.debug("Companion watchdog timer unavailable: " .. tostring(err))
+  end
+end
+
+function C4Driver.check_companion_watchdog()
+  local client = Companion.client
+  if not client then return end
+  if client.cleanup_pending_responses then
+    client:cleanup_pending_responses()
+  end
+
+  local state = tostring(client.state or "")
+  local active = state == "READY" or state == "SESSION_ACTIVE" or state:match("^SESSION_")
+  if active and client.transport then
+    local now = C4Driver.now_ms()
+    local last_activity = client.last_rx_ms or client.session_active_since_ms or client.last_tx_ms or 0
+    local age = now - last_activity
+    if last_activity > 0 and age > Companion.watchdog_stale_ms then
+      Log.debug("Companion watchdog stale: state=" .. state .. " age_ms=" .. tostring(age))
+      local ok, err = pcall(function()
+        client:close({ clear_pending_commands = false })
+      end)
+      if not ok then
+        Log.debug("Companion watchdog close failed: " .. tostring(err))
+        client.transport = nil
+        client:clear_runtime_state({ clear_pending_commands = false })
+        client:set_state("DISCONNECTED")
+      end
+      C4Driver.set_connection_state("DISCONNECTED")
+      if Companion.client == client and client.credentials and client.connect then
+        local reconnect_ok, reconnect_err = pcall(function() client:connect() end)
+        if not reconnect_ok then
+          Log.debug("Companion watchdog reconnect failed: " .. tostring(reconnect_err))
+        end
+      end
+      C4Driver.schedule_companion_watchdog()
+      return
+    end
+  end
+
+  C4Driver.schedule_companion_watchdog()
+end
+
 function C4Driver.start_companion_client(client, host, label)
+  C4Driver.schedule_companion_watchdog()
   if MDNS.has_cached_port(host) then
     client.port = MDNS.cached_port(host)
     client:connect()
@@ -8010,6 +8026,43 @@ function C4Driver.start_companion_client(client, host, label)
   end)
 end
 
+function C4Driver.build_companion_client(host, options)
+  options = options or {}
+  local label = options.label or "Companion"
+  local client = CompanionClient.new({
+    host = host,
+    port = MDNS.cached_port(host),
+    credentials = options.credentials,
+    crypto = Crypto,
+    on_state = function(state)
+      C4Driver.set_connection_state(state)
+    end,
+    on_message = function(message)
+      C4Driver.handle_companion_message(message)
+    end,
+    on_connection_refused = function(refused_client)
+      if refused_client._port_rediscover_attempted then
+        Log.debug(label .. " TCP refused after rediscovery; not retrying again")
+        return
+      end
+      refused_client._port_rediscover_attempted = true
+      MDNS.invalidate(host)
+      Log.debug(label .. " TCP refused; rediscovering Companion port")
+      MDNS.discover_companion_port(host, function(port)
+        if Companion.client ~= refused_client then return end
+        refused_client.port = port or MDNS.DEFAULT_COMPANION_PORT
+        Log.debug(label .. " retrying TCP connect after port discovery: port=" ..
+          tostring(refused_client.port))
+        refused_client:connect()
+      end)
+    end,
+    on_pair_setup_m2 = options.on_pair_setup_m2,
+    on_paired = options.on_paired,
+  })
+  Companion.client = client
+  return client
+end
+
 function C4Driver.connect_companion()
   C4Driver.ensure_crypto_provider()
   local host = Properties and Properties["Apple TV Address"]
@@ -8023,36 +8076,10 @@ function C4Driver.connect_companion()
     return Companion.client
   end
 
-  local client = CompanionClient.new({
-    host = host,
-    port = MDNS.cached_port(host),
+  local client = C4Driver.build_companion_client(host, {
+    label = "Companion",
     credentials = credentials,
-    crypto = Crypto,
-    on_state = function(state)
-      C4Driver.set_connection_state(state)
-    end,
-    on_message = function(message)
-      C4Driver.handle_companion_message(message)
-    end,
-    on_connection_refused = function(refused_client)
-      if refused_client._port_rediscover_attempted then
-        Log.debug("Companion TCP refused after rediscovery; not retrying again")
-        return
-      end
-      refused_client._port_rediscover_attempted = true
-      MDNS.invalidate(host)
-      Log.debug("Companion TCP refused; rediscovering Companion port")
-      MDNS.discover_companion_port(host, function(port)
-        if Companion.client ~= refused_client then return end
-        refused_client.port = port or MDNS.DEFAULT_COMPANION_PORT
-        Log.debug("Companion retrying TCP connect after port discovery: port=" ..
-          tostring(refused_client.port))
-        refused_client:connect()
-      end)
-    end,
   })
-  Companion.client = client
-  Companion.socket = client
   C4Driver.start_companion_client(client, host, "Companion")
   return client
 end
@@ -8065,28 +8092,8 @@ function C4Driver.pair_companion()
     error("Apple TV Address is required for pairing")
   end
   C4Driver.update_property("Pairing PIN", "")
-  local client = CompanionClient.new({
-    host = host,
-    port = MDNS.cached_port(host),
-    crypto = Crypto,
-    on_state = function(state) C4Driver.set_connection_state(state) end,
-    on_message = function(message) C4Driver.handle_companion_message(message) end,
-    on_connection_refused = function(refused_client)
-      if refused_client._port_rediscover_attempted then
-        Log.debug("Pair-Setup TCP refused after rediscovery; not retrying again")
-        return
-      end
-      refused_client._port_rediscover_attempted = true
-      MDNS.invalidate(host)
-      Log.debug("Pair-Setup TCP refused; rediscovering Companion port")
-      MDNS.discover_companion_port(host, function(port)
-        if Companion.client ~= refused_client then return end
-        refused_client.port = port or MDNS.DEFAULT_COMPANION_PORT
-        Log.debug("Pair-Setup retrying TCP connect after port discovery: port=" ..
-          tostring(refused_client.port))
-        refused_client:connect()
-      end)
-    end,
+  local client = C4Driver.build_companion_client(host, {
+    label = "Pair-Setup",
     on_pair_setup_m2 = function()
       C4Driver.set_connection_state("Enter PIN from Apple TV")
     end,
@@ -8095,8 +8102,6 @@ function C4Driver.pair_companion()
       Log.debug("Pair-Setup complete, credentials saved")
     end,
   })
-  Companion.client = client
-  Companion.socket = client
   C4Driver.start_companion_client(client, host, "Pair-Setup")
   client:request_pair_setup()
   return client
@@ -8230,6 +8235,7 @@ function C4Driver.cancel_driver_timers()
   C4Driver.cancel_timer("AppleTV_reselect_passthrough")
   C4Driver.cancel_timer("AppleTV_mdns_timeout")
   C4Driver.cancel_timer("AppleTV_tv_rc_session_start_timeout")
+  C4Driver.cancel_timer("AppleTV_companion_watchdog")
   C4Driver.cancel_timer("AppleTV_airplay_monitor_start")
   C4Driver.cancel_timer("AppleTV_airplay_monitor_retry")
   C4Driver.cancel_timer("AppleTV_airplay_monitor_watchdog")
@@ -8295,12 +8301,6 @@ function C4Driver.init()
   C4Driver.publish_app_list()
   C4Driver.load_persisted_credentials()
   C4Driver.load_persisted_airplay_credentials()
-  C4MiniApps.PASSTHROUGH_PROXY = 5001
-  C4MiniApps.SWITCHER_PROXY = 5002
-  C4MiniApps.USES_DEDICATED_SWITCHER = true
-  C4MiniApps.MINIAPP_BINDING_START = 3101
-  C4MiniApps.MINIAPP_BINDING_END = 3125
-  C4MiniApps.MINIAPP_TYPE = "UM_APPLETV"
   Log.debug("driver init " .. Driver.VERSION)
 end
 
@@ -8320,8 +8320,6 @@ function C4Driver.destroy()
     Companion.client:close()
   end
   Companion.client = nil
-  Companion.socket = nil
-  Companion.session = nil
   C4Driver.close_airplay_control_client("driver destroy")
   AirPlay.monitor_enabled = false
   Log.debug("driver destroyed")
@@ -8345,7 +8343,9 @@ OPC.Pairing_PIN = function(value)
 end
 
 OPC.AirPlay_Credentials = function(value)
-  if value and value ~= "" and value ~= (Driver.state and Driver.state.airplay_credentials) then
+  if value and value ~= "" and
+      (value ~= (Driver.state and Driver.state.airplay_credentials) or not AirPlay.credentials)
+  then
     local ok, err = pcall(function() C4Driver.import_airplay_credentials(value) end)
     if not ok then
       Log.error("AirPlay credentials import failed: " .. tostring(err))
@@ -8402,6 +8402,7 @@ Driver.SRP = SRP
 Driver.CompanionFrame = CompanionFrame
 Driver.CompanionSession = CompanionSession
 Driver.HAPSession = HAPSession
+Driver.ChaCha20Poly1305Pure = ChaCha20Poly1305Pure
 Driver.CompanionClient = CompanionClient
 Driver.Companion = Companion
 Driver.AirPlay = AirPlay
