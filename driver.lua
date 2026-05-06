@@ -5184,7 +5184,15 @@ function CompanionClient:connect(host, port)
       local ok, err = pcall(function() self:receive(data) end)
       if not ok then
         Log.error("Companion receive failed: " .. tostring(err))
+        if tcp_client.Close then
+          pcall(function() tcp_client:Close() end)
+        elseif tcp_client.close then
+          pcall(function() tcp_client:close() end)
+        end
+        self.transport = nil
+        self:clear_runtime_state({ clear_pending_commands = false })
         self:set_state("ERROR: " .. tostring(err))
+        return
       end
       tcp_client:ReadUpTo(4096)
     end)
@@ -5484,7 +5492,6 @@ function CompanionClient:handle_frame(frame)
     Log.debug("Companion OPACK message: id=" .. tostring(message._i) ..
       " type=" .. tostring(message._t) ..
       " xid=" .. tostring(message._x))
-    self.received_messages[#self.received_messages + 1] = message
 
     if message._t == 3 and message._x ~= nil then
       local pending = self.pending_responses[message._x]
@@ -6632,6 +6639,7 @@ end
 function AirPlayDataChannelClient:connect()
   assert(type(self.host) == "string" and self.host ~= "", "AirPlay data host is required")
   assert(type(self.port) == "number", "AirPlay data port is required")
+  self.closed = false
 
   if self.transport then
     if self.on_connected then self.on_connected(self) end
@@ -6657,6 +6665,8 @@ function AirPlayDataChannelClient:connect()
       if not ok then
         Log.error("AirPlay data channel receive failed: " .. tostring(err))
         if self.on_error then self.on_error(err) end
+        self:close()
+        return
       end
       tcp_client:ReadUpTo(4096)
     end)
@@ -6754,8 +6764,12 @@ function AirPlayDataChannelClient:receive(data)
   while #self.buffer >= DATA_HEADER_LENGTH do
     local size = Bytes.read_uint_be(self.buffer, 1, 4)
     if size < DATA_HEADER_LENGTH then
-      Log.error("AirPlay data channel: invalid frame size=" .. tostring(size) .. ", closing")
-      break
+      local err = "AirPlay data channel invalid frame size=" .. tostring(size)
+      Log.error(err .. ", closing")
+      self.buffer = ""
+      if self.on_error then self.on_error(err) end
+      self:close()
+      return
     end
     if #self.buffer < size then
       return
@@ -6829,6 +6843,7 @@ end
 function AirPlayEventChannelClient:connect()
   assert(type(self.host) == "string" and self.host ~= "", "AirPlay event host is required")
   assert(type(self.port) == "number", "AirPlay event port is required")
+  self.closed = false
 
   if self.transport then
     if self.on_connected then self.on_connected(self) end
@@ -6852,6 +6867,8 @@ function AirPlayEventChannelClient:connect()
       if not ok then
         Log.error("AirPlay event channel receive failed: " .. tostring(err))
         if self.on_error then self.on_error(err) end
+        self:close()
+        return
       end
       tcp_client:ReadUpTo(4096)
     end)
@@ -6928,6 +6945,9 @@ function AirPlayControlClient.new(options)
     session = nil,
     raw_buffer = "",
     http_buffer = "",
+    connecting = false,
+    connected = false,
+    closed = false,
     state = "DISCONNECTED",
     probe = options.probe or "info",
     rtsp_cseq = 0,
@@ -7117,7 +7137,16 @@ function AirPlayControlClient:connect(host, port)
   self.port = port or self.port or 7000
   assert(type(self.host) == "string" and self.host ~= "", "Apple TV address is required")
   assert(self.credentials and self.credentials.type == "HAP", "AirPlay HAP credentials are required")
+  self.closed = false
 
+  if self.connecting then
+    Log.debug("AirPlay control TCP connect already in progress")
+    return self
+  end
+  if self.connected and self.transport then
+    Log.debug("AirPlay control TCP already connected")
+    return self
+  end
   if self.transport then
     self:on_connected(self.transport)
     return self
@@ -7127,6 +7156,7 @@ function AirPlayControlClient:connect(host, port)
   Log.debug("AirPlay control TCP connect requested: host=" .. tostring(self.host) ..
     " port=" .. tostring(self.port))
   local client
+  self.connecting = true
   client = C4:CreateTCPClient()
     :OnConnect(function(tcp_client)
       Log.debug("AirPlay control TCP connected")
@@ -7140,6 +7170,8 @@ function AirPlayControlClient:connect(host, port)
         Log.error("AirPlay control receive failed: " .. tostring(err))
         self:set_state("ERROR: " .. tostring(err))
         if self.on_error then self.on_error(err) end
+        self:close()
+        return
       end
       tcp_client:ReadUpTo(4096)
     end)
@@ -7147,6 +7179,8 @@ function AirPlayControlClient:connect(host, port)
       Log.debug("AirPlay control TCP disconnected: code=" .. tostring(err_code) ..
         " message=" .. tostring(err_msg))
       self.transport = nil
+      self.connecting = false
+      self.connected = false
       self:set_state("DISCONNECTED")
       if not self.closed and self.on_disconnect then self.on_disconnect(err_msg or err_code) end
     end)
@@ -7155,6 +7189,8 @@ function AirPlayControlClient:connect(host, port)
       Log.error("AirPlay control TCP error: code=" .. tostring(err_code) ..
         " message=" .. tostring(err_msg))
       self.transport = nil
+      self.connecting = false
+      self.connected = false
       self:set_state("ERROR: " .. tostring(err_code) .. " " .. tostring(err_msg))
       if self.on_error then self.on_error(err_msg or err_code) end
     end)
@@ -7179,10 +7215,14 @@ function AirPlayControlClient:close()
     self.transport:close()
   end
   self.transport = nil
+  self.connecting = false
+  self.connected = false
 end
 
 function AirPlayControlClient:on_connected(transport)
   self.transport = transport
+  self.connecting = false
+  self.connected = true
   self:set_state("PAIR_VERIFY_M1")
   self.verifier = PairVerify.new(self.credentials, self.crypto)
   self:send_plain("POST", "/pair-verify", self.verifier:start_hap(), {
@@ -7890,6 +7930,9 @@ function C4Driver.import_credentials(detail_string)
   local credentials = Credentials.parse(detail_string)
   local canonical = Credentials.stringify(credentials)
 
+  if Companion.client and Companion.client.close then
+    Companion.client:close()
+  end
   Driver.state = Driver.state or {}
   Driver.state.companion_credentials = canonical
   Companion.credentials = credentials
@@ -8070,6 +8113,9 @@ end
 function C4Driver.build_companion_client(host, options)
   options = options or {}
   local label = options.label or "Companion"
+  if Companion.client and Companion.client.close then
+    Companion.client:close()
+  end
   local client = CompanionClient.new({
     host = host,
     port = MDNS.cached_port(host),

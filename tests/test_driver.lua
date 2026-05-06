@@ -1237,6 +1237,7 @@ function tests.airplay_control_client_runs_rtsp_tunnel_setup_probe()
   }
   local writes = {}
   local event_writes = {}
+  local channel_close_calls = 0
   local transport = {
     Write = function(_, data)
       writes[#writes + 1] = data
@@ -1259,6 +1260,9 @@ function tests.airplay_control_client_runs_rtsp_tunnel_setup_probe()
         Write = function(_, data)
           event_writes[#event_writes + 1] = data
           return true
+        end,
+        Close = function()
+          channel_close_calls = channel_close_calls + 1
         end,
       }
       return tcp
@@ -1318,6 +1322,9 @@ function tests.airplay_control_client_runs_rtsp_tunnel_setup_probe()
   assert_eq(tunnel_result.data_port, 49153, "data port")
   assert(client.data_channel ~= nil, "data channel created")
   assert_eq(#event_writes, 1, "data channel sends initial device info only")
+  client.data_channel:receive(hap_frame(Driver.Bytes.uint_be(1, 4) .. string.rep("\0", 28)))
+  assert_eq(channel_close_calls, 1, "invalid data frame closes data channel")
+  assert_eq(client.data_channel.buffer, "", "invalid data frame clears buffer")
   C4 = old_c4
 end
 
@@ -1716,6 +1723,153 @@ function tests.driver_destroy_closes_client_and_cancels_timers()
   Driver.AirPlay.control_client = old_airplay_client
   Driver.AirPlay.monitor_enabled = old_monitor_enabled
   Driver.OpenSSLCrypto._pregenerated_x25519_keypair = old_pregen
+end
+
+function tests.import_credentials_closes_existing_companion_client()
+  local old_client = Driver.Companion.client
+  local old_credentials = Driver.Companion.credentials
+  local old_state = Driver.state
+  local old_test_storage = Driver._test_storage
+  local closed = false
+  Driver.Companion.client = {
+    close = function()
+      closed = true
+    end,
+  }
+  Driver.state = {}
+  Driver._test_storage = {}
+
+  Driver.C4Driver.import_credentials(table.concat({
+    Driver.Bytes.hex(bytes_range(0, 31)),
+    Driver.Bytes.hex(bytes_range(32, 63)),
+    Driver.Bytes.hex("ATV-ID"),
+    Driver.Bytes.hex("CLIENT-ID"),
+  }, ":"))
+
+  assert_eq(closed, true, "existing Companion client closed on import")
+  assert_eq(Driver.Companion.client, nil, "Companion client cleared on import")
+
+  Driver.Companion.client = old_client
+  Driver.Companion.credentials = old_credentials
+  Driver.state = old_state
+  Driver._test_storage = old_test_storage
+end
+
+function tests.build_companion_client_closes_replaced_client()
+  local old_client = Driver.Companion.client
+  local closed = false
+  Driver.Companion.client = {
+    close = function()
+      closed = true
+    end,
+  }
+
+  local client = Driver.C4Driver.build_companion_client("192.0.2.10", {})
+
+  assert_eq(closed, true, "replaced Companion client closed")
+  assert_eq(Driver.Companion.client, client, "new Companion client installed")
+
+  Driver.Companion.client = old_client
+end
+
+function tests.companion_read_error_closes_transport()
+  local old_c4 = C4
+  local callbacks = {}
+  local close_called = false
+  local read_up_to_calls = 0
+  C4 = {
+    CreateTCPClient = function()
+      local tcp = {
+        OnConnect = function(self, cb) callbacks.connect = cb; return self end,
+        OnRead = function(self, cb) callbacks.read = cb; return self end,
+        OnDisconnect = function(self, cb) callbacks.disconnect = cb; return self end,
+        OnError = function(self, cb) callbacks.error = cb; return self end,
+        Connect = function(self)
+          callbacks.connect(self)
+          return self
+        end,
+        ReadUpTo = function()
+          read_up_to_calls = read_up_to_calls + 1
+          return true
+        end,
+        Close = function()
+          close_called = true
+        end,
+      }
+      return tcp
+    end,
+  }
+
+  local client = Driver.CompanionClient.new({})
+  client:connect("192.0.2.10", 49153)
+  client.receive = function()
+    error("boom")
+  end
+  callbacks.read(client.transport, "bad")
+
+  assert_eq(close_called, true, "transport closed after receive error")
+  assert_eq(client.transport, nil, "transport cleared after receive error")
+  assert_eq(client.connected, false, "client runtime state cleared")
+  assert_eq(read_up_to_calls, 1, "read loop not rescheduled after receive error")
+  assert(client.state:match("^ERROR:"), "client state records receive error")
+
+  C4 = old_c4
+end
+
+function tests.airplay_control_connect_is_guarded_while_pending()
+  local old_c4 = C4
+  local callbacks = {}
+  local connect_calls = 0
+  local writes = 0
+  C4 = {
+    CreateTCPClient = function()
+      local tcp = {
+        OnConnect = function(self, cb) callbacks.connect = cb; return self end,
+        OnRead = function(self, cb) callbacks.read = cb; return self end,
+        OnDisconnect = function(self, cb) callbacks.disconnect = cb; return self end,
+        OnError = function(self, cb) callbacks.error = cb; return self end,
+        Connect = function(self)
+          connect_calls = connect_calls + 1
+          return self
+        end,
+        ReadUpTo = function() return true end,
+        Write = function()
+          writes = writes + 1
+          return true
+        end,
+      }
+      return tcp
+    end,
+  }
+  local credentials = Driver.Credentials.parse(table.concat({
+    Driver.Bytes.hex(bytes_range(0, 31)),
+    Driver.Bytes.hex(bytes_range(32, 63)),
+    Driver.Bytes.hex("ATV-ID"),
+    Driver.Bytes.hex("CLIENT-ID"),
+  }, ":"))
+  local fake_crypto = {
+    generate_x25519_keypair = function()
+      return { private_key = "private-key", public_key = bytes_range(64, 95) }
+    end,
+  }
+
+  local client = Driver.AirPlayControlClient.new({
+    host = "192.0.2.10",
+    port = 7000,
+    credentials = credentials,
+    crypto = fake_crypto,
+  })
+
+  client:connect()
+  client:connect()
+  assert_eq(connect_calls, 1, "second pending connect does not create another TCP client")
+  callbacks.connect(client.transport)
+  assert_eq(client.connected, true, "client marked connected")
+  client:connect()
+  assert_eq(connect_calls, 1, "connected connect call reuses existing TCP client")
+  assert_eq(writes, 1, "Pair-Verify start written once")
+
+  C4 = old_c4
 end
 
 function tests.crypto_prewarm_schedule_is_manual_only()
