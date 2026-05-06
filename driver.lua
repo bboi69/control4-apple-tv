@@ -1712,15 +1712,44 @@ local function _fp_mul(a, b)
 end
 
 function _fp_mul_into(out, a, b)
-  for i = 1, _FE_LIMBS * 2 do out[i] = 0 end
-  for i = 1, _FE_LIMBS do
-    local ai = a[i]
-    if ai ~= 0 then
-      for j = 1, _FE_LIMBS do
-        out[i + j - 1] = out[i + j - 1] + ai * (b[j] or 0)
-      end
-    end
-  end
+  local a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,a16,a17 =
+    a[1] or 0,a[2] or 0,a[3] or 0,a[4] or 0,a[5] or 0,a[6] or 0,a[7] or 0,a[8] or 0,a[9] or 0,a[10] or 0,a[11] or 0,a[12] or 0,a[13] or 0,a[14] or 0,a[15] or 0,a[16] or 0,a[17] or 0
+  local b1,b2,b3,b4,b5,b6,b7,b8,b9,b10,b11,b12,b13,b14,b15,b16,b17 =
+    b[1] or 0,b[2] or 0,b[3] or 0,b[4] or 0,b[5] or 0,b[6] or 0,b[7] or 0,b[8] or 0,b[9] or 0,b[10] or 0,b[11] or 0,b[12] or 0,b[13] or 0,b[14] or 0,b[15] or 0,b[16] or 0,b[17] or 0
+  local c1  = a1*b1
+  local c2  = a1*b2+a2*b1
+  local c3  = a1*b3+a2*b2+a3*b1
+  local c4  = a1*b4+a2*b3+a3*b2+a4*b1
+  local c5  = a1*b5+a2*b4+a3*b3+a4*b2+a5*b1
+  local c6  = a1*b6+a2*b5+a3*b4+a4*b3+a5*b2+a6*b1
+  local c7  = a1*b7+a2*b6+a3*b5+a4*b4+a5*b3+a6*b2+a7*b1
+  local c8  = a1*b8+a2*b7+a3*b6+a4*b5+a5*b4+a6*b3+a7*b2+a8*b1
+  local c9  = a1*b9+a2*b8+a3*b7+a4*b6+a5*b5+a6*b4+a7*b3+a8*b2+a9*b1
+  local c10 = a1*b10+a2*b9+a3*b8+a4*b7+a5*b6+a6*b5+a7*b4+a8*b3+a9*b2+a10*b1
+  local c11 = a1*b11+a2*b10+a3*b9+a4*b8+a5*b7+a6*b6+a7*b5+a8*b4+a9*b3+a10*b2+a11*b1
+  local c12 = a1*b12+a2*b11+a3*b10+a4*b9+a5*b8+a6*b7+a7*b6+a8*b5+a9*b4+a10*b3+a11*b2+a12*b1
+  local c13 = a1*b13+a2*b12+a3*b11+a4*b10+a5*b9+a6*b8+a7*b7+a8*b6+a9*b5+a10*b4+a11*b3+a12*b2+a13*b1
+  local c14 = a1*b14+a2*b13+a3*b12+a4*b11+a5*b10+a6*b9+a7*b8+a8*b7+a9*b6+a10*b5+a11*b4+a12*b3+a13*b2+a14*b1
+  local c15 = a1*b15+a2*b14+a3*b13+a4*b12+a5*b11+a6*b10+a7*b9+a8*b8+a9*b7+a10*b6+a11*b5+a12*b4+a13*b3+a14*b2+a15*b1
+  local c16 = a1*b16+a2*b15+a3*b14+a4*b13+a5*b12+a6*b11+a7*b10+a8*b9+a9*b8+a10*b7+a11*b6+a12*b5+a13*b4+a14*b3+a15*b2+a16*b1
+  local c17 = a1*b17+a2*b16+a3*b15+a4*b14+a5*b13+a6*b12+a7*b11+a8*b10+a9*b9+a10*b8+a11*b7+a12*b6+a13*b5+a14*b4+a15*b3+a16*b2+a17*b1
+  local c18 = a2*b17+a3*b16+a4*b15+a5*b14+a6*b13+a7*b12+a8*b11+a9*b10+a10*b9+a11*b8+a12*b7+a13*b6+a14*b5+a15*b4+a16*b3+a17*b2
+  local c19 = a3*b17+a4*b16+a5*b15+a6*b14+a7*b13+a8*b12+a9*b11+a10*b10+a11*b9+a12*b8+a13*b7+a14*b6+a15*b5+a16*b4+a17*b3
+  local c20 = a4*b17+a5*b16+a6*b15+a7*b14+a8*b13+a9*b12+a10*b11+a11*b10+a12*b9+a13*b8+a14*b7+a15*b6+a16*b5+a17*b4
+  local c21 = a5*b17+a6*b16+a7*b15+a8*b14+a9*b13+a10*b12+a11*b11+a12*b10+a13*b9+a14*b8+a15*b7+a16*b6+a17*b5
+  local c22 = a6*b17+a7*b16+a8*b15+a9*b14+a10*b13+a11*b12+a12*b11+a13*b10+a14*b9+a15*b8+a16*b7+a17*b6
+  local c23 = a7*b17+a8*b16+a9*b15+a10*b14+a11*b13+a12*b12+a13*b11+a14*b10+a15*b9+a16*b8+a17*b7
+  local c24 = a8*b17+a9*b16+a10*b15+a11*b14+a12*b13+a13*b12+a14*b11+a15*b10+a16*b9+a17*b8
+  local c25 = a9*b17+a10*b16+a11*b15+a12*b14+a13*b13+a14*b12+a15*b11+a16*b10+a17*b9
+  local c26 = a10*b17+a11*b16+a12*b15+a13*b14+a14*b13+a15*b12+a16*b11+a17*b10
+  local c27 = a11*b17+a12*b16+a13*b15+a14*b14+a15*b13+a16*b12+a17*b11
+  local c28 = a12*b17+a13*b16+a14*b15+a15*b14+a16*b13+a17*b12
+  local c29 = a13*b17+a14*b16+a15*b15+a16*b14+a17*b13
+  local c30 = a14*b17+a15*b16+a16*b15+a17*b14
+  local c31 = a15*b17+a16*b16+a17*b15
+  local c32 = a16*b17+a17*b16
+  local c33 = a17*b17
+  out[1]=c1; out[2]=c2; out[3]=c3; out[4]=c4; out[5]=c5; out[6]=c6; out[7]=c7; out[8]=c8; out[9]=c9; out[10]=c10; out[11]=c11; out[12]=c12; out[13]=c13; out[14]=c14; out[15]=c15; out[16]=c16; out[17]=c17; out[18]=c18; out[19]=c19; out[20]=c20; out[21]=c21; out[22]=c22; out[23]=c23; out[24]=c24; out[25]=c25; out[26]=c26; out[27]=c27; out[28]=c28; out[29]=c29; out[30]=c30; out[31]=c31; out[32]=c32; out[33]=c33; out[34]=0
   return _fe_reduce(out)
 end
 
@@ -1745,20 +1774,42 @@ local function _fp_sq(a)
 end
 
 function _fp_sq_into(out, a)
-  for i = 1, _FE_LIMBS * 2 do out[i] = 0 end
-  for i = 1, _FE_LIMBS do
-    local ai = a[i]
-    if ai ~= 0 then
-      out[2 * i - 1] = out[2 * i - 1] + ai * ai
-      local twice_ai = ai + ai
-      for j = i + 1, _FE_LIMBS do
-        local aj = a[j]
-        if aj ~= 0 then
-          out[i + j - 1] = out[i + j - 1] + twice_ai * aj
-        end
-      end
-    end
-  end
+  local a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,a16,a17 =
+    a[1] or 0,a[2] or 0,a[3] or 0,a[4] or 0,a[5] or 0,a[6] or 0,a[7] or 0,a[8] or 0,a[9] or 0,a[10] or 0,a[11] or 0,a[12] or 0,a[13] or 0,a[14] or 0,a[15] or 0,a[16] or 0,a[17] or 0
+  local c1  = a1*a1
+  local c2  = 2*(a1*a2)
+  local c3  = a2*a2+2*(a1*a3)
+  local c4  = 2*(a1*a4+a2*a3)
+  local c5  = a3*a3+2*(a1*a5+a2*a4)
+  local c6  = 2*(a1*a6+a2*a5+a3*a4)
+  local c7  = a4*a4+2*(a1*a7+a2*a6+a3*a5)
+  local c8  = 2*(a1*a8+a2*a7+a3*a6+a4*a5)
+  local c9  = a5*a5+2*(a1*a9+a2*a8+a3*a7+a4*a6)
+  local c10 = 2*(a1*a10+a2*a9+a3*a8+a4*a7+a5*a6)
+  local c11 = a6*a6+2*(a1*a11+a2*a10+a3*a9+a4*a8+a5*a7)
+  local c12 = 2*(a1*a12+a2*a11+a3*a10+a4*a9+a5*a8+a6*a7)
+  local c13 = a7*a7+2*(a1*a13+a2*a12+a3*a11+a4*a10+a5*a9+a6*a8)
+  local c14 = 2*(a1*a14+a2*a13+a3*a12+a4*a11+a5*a10+a6*a9+a7*a8)
+  local c15 = a8*a8+2*(a1*a15+a2*a14+a3*a13+a4*a12+a5*a11+a6*a10+a7*a9)
+  local c16 = 2*(a1*a16+a2*a15+a3*a14+a4*a13+a5*a12+a6*a11+a7*a10+a8*a9)
+  local c17 = a9*a9+2*(a1*a17+a2*a16+a3*a15+a4*a14+a5*a13+a6*a12+a7*a11+a8*a10)
+  local c18 = 2*(a2*a17+a3*a16+a4*a15+a5*a14+a6*a13+a7*a12+a8*a11+a9*a10)
+  local c19 = a10*a10+2*(a3*a17+a4*a16+a5*a15+a6*a14+a7*a13+a8*a12+a9*a11)
+  local c20 = 2*(a4*a17+a5*a16+a6*a15+a7*a14+a8*a13+a9*a12+a10*a11)
+  local c21 = a11*a11+2*(a5*a17+a6*a16+a7*a15+a8*a14+a9*a13+a10*a12)
+  local c22 = 2*(a6*a17+a7*a16+a8*a15+a9*a14+a10*a13+a11*a12)
+  local c23 = a12*a12+2*(a7*a17+a8*a16+a9*a15+a10*a14+a11*a13)
+  local c24 = 2*(a8*a17+a9*a16+a10*a15+a11*a14+a12*a13)
+  local c25 = a13*a13+2*(a9*a17+a10*a16+a11*a15+a12*a14)
+  local c26 = 2*(a10*a17+a11*a16+a12*a15+a13*a14)
+  local c27 = a14*a14+2*(a11*a17+a12*a16+a13*a15)
+  local c28 = 2*(a12*a17+a13*a16+a14*a15)
+  local c29 = a15*a15+2*(a13*a17+a14*a16)
+  local c30 = 2*(a14*a17+a15*a16)
+  local c31 = a16*a16+2*(a15*a17)
+  local c32 = 2*(a16*a17)
+  local c33 = a17*a17
+  out[1]=c1; out[2]=c2; out[3]=c3; out[4]=c4; out[5]=c5; out[6]=c6; out[7]=c7; out[8]=c8; out[9]=c9; out[10]=c10; out[11]=c11; out[12]=c12; out[13]=c13; out[14]=c14; out[15]=c15; out[16]=c16; out[17]=c17; out[18]=c18; out[19]=c19; out[20]=c20; out[21]=c21; out[22]=c22; out[23]=c23; out[24]=c24; out[25]=c25; out[26]=c26; out[27]=c27; out[28]=c28; out[29]=c29; out[30]=c30; out[31]=c31; out[32]=c32; out[33]=c33; out[34]=0
   return _fe_reduce(out)
 end
 
