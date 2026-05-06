@@ -3333,16 +3333,6 @@ end
 
 function OpenSSLCrypto.hmac_sha512(key, data)
   assert(type(key) == "string" and type(data) == "string", "HMAC-SHA512 requires string inputs")
-  if has_c4() and C4.HMAC then
-    local result, err = C4:HMAC("SHA512", key, data, {
-      return_encoding = "NONE",
-      key_encoding = "NONE",
-      data_encoding = "NONE",
-    })
-    assert(not err, err)
-    return result
-  end
-
   local block_size = 128
   if #key > block_size then
     key = _sha512_bytes(key)

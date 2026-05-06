@@ -696,32 +696,6 @@ function tests.openssl_crypto_hmac_supports_empty_key_without_c4_hmac()
   end)
 end
 
-function tests.openssl_crypto_hmac_prefers_native_c4_hmac()
-  local old_c4 = C4
-  local calls = {}
-  C4 = {
-    HMAC = function(_, algorithm, key, data, options)
-      calls[#calls + 1] = {
-        algorithm = algorithm,
-        key = key,
-        data = data,
-        options = options,
-      }
-      return "native-hmac"
-    end,
-  }
-
-  local digest = Driver.OpenSSLCrypto.hmac_sha512("key", "data")
-  assert_eq(digest, "native-hmac", "native hmac result")
-  assert_eq(#calls, 1, "native hmac call count")
-  assert_eq(calls[1].algorithm, "SHA512", "native hmac algorithm")
-  assert_eq(calls[1].options.return_encoding, "NONE", "native hmac return encoding")
-  assert_eq(calls[1].options.key_encoding, "NONE", "native hmac key encoding")
-  assert_eq(calls[1].options.data_encoding, "NONE", "native hmac data encoding")
-
-  C4 = old_c4
-end
-
 function tests.ed25519_matches_rfc8032_signature_vector()
   with_ed25519_vector_sha512(function()
     local public_key = Driver.Ed25519Pure.public_key_from_private(ED25519_VECTOR_SEED)
