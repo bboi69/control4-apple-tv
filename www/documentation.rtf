@@ -17,11 +17,12 @@ This driver lets Control4 pair with Apple TV, send remote-control commands, laun
 \pard\par
 \b First Pairing\b0\par
 \pard{\pntext\f0 1.\tab}{\*\pn\pnlvlbody\pndec\pnstart1\pnindent360}\fi-360\li720 Set Debug Mode to On while commissioning.\par
-{\pntext\f0 2.\tab}Run Pair Apple TV. The Apple TV should display a PIN.\par
-{\pntext\f0 3.\tab}Enter the PIN in the Pairing PIN property. The driver will continue pairing and save credentials when complete.\par
-{\pntext\f0 4.\tab}Run Prewarm Crypto. Wait for Crypto Prewarm Status to show Complete before continuing.\par
-{\pntext\f0 5.\tab}Run Connect Apple TV. The expected state is SESSION_ACTIVE.\par
-{\pntext\f0 6.\tab}Test directional control, Select, Back/Menu, and Refresh App List.\par
+{\pntext\f0 2.\tab}Run Pair Apple TV first. This pairs Companion remote control, app list, and app launch support. The Apple TV should display a PIN.\par
+{\pntext\f0 3.\tab}Enter the PIN in the Pairing PIN property. The driver will continue pairing and save Companion credentials when complete.\par
+{\pntext\f0 4.\tab}Run Pair AirPlay next. This pairs the metadata monitor used for Current App and Now Playing. Enter the Apple TV PIN in Pairing PIN when Connection State says Enter AirPlay PIN.\par
+{\pntext\f0 5.\tab}Run Prewarm Crypto. Wait for Crypto Prewarm Status to show Complete before continuing.\par
+{\pntext\f0 6.\tab}Run Connect Apple TV. The expected state is SESSION_ACTIVE.\par
+{\pntext\f0 7.\tab}Test directional control, Select, Back/Menu, Refresh App List, and Current App/Now Playing updates.\par
 \pard\par
 \b Normal Use\b0\par
 \pard{\pntext\f0 -\tab}{\*\pn\pnlvlblt\pnf0\pnindent360}\fi-360\li720 Commands automatically connect if the driver is disconnected. The first command after a driver reload may take about a second while Pair-Verify and startup complete; later commands should be immediate while the session remains active.\par
@@ -40,9 +41,11 @@ This driver lets Control4 pair with Apple TV, send remote-control commands, laun
 {\pntext\f0 -\tab}Debug Mode: when On, driver diagnostic messages are printed to the Lua output tab.\par
 \pard\par
 \b Button Mapping\b0\par
-The MENU, GUIDE, INFO, CANCEL, PVR, STAR, POUND, and RECORD Button properties let installers map remote buttons to Apple TV actions. Available actions are Home, Menu, Back, Guide, Select, Play/Pause, Dashboard (Hold TV Button), and Do Nothing.\par
+The MENU, GUIDE, INFO, and CANCEL Button properties let installers map remote buttons to Apple TV actions. Available actions are Home, Menu, Back, Guide, Select, Play/Pause, and Do Nothing.\par
 \par
-Back and Menu both use the Apple TV menu/back HID command. Dashboard uses the Apple TV Home command.\par
+On Power Off lets installers optionally send Home, Back, or Menu when Control4 powers off the Apple TV source. The Red, Green, Yellow, and Blue Button properties can map color-button presses to Menu, Play/Pause, TV/Home, Up, Down, Left, Right, Select, or Do Nothing.\par
+\par
+Back and Menu both use the Apple TV menu/back HID command.\par
 \par
 \b Actions\b0\par
 \pard{\pntext\f0 -\tab}{\*\pn\pnlvlblt\pnf0\pnindent360}\fi-360\li720 Refresh App List: requests launchable apps from the Apple TV and updates the Launch App list.\par
@@ -51,10 +54,8 @@ Back and Menu both use the Apple TV menu/back HID command. Dashboard uses the Ap
 {\pntext\f0 -\tab}Connect Apple TV: opens the TCP connection, performs Pair-Verify, starts the Companion session, and subscribes to status events.\par
 {\pntext\f0 -\tab}Disconnect Apple TV: sends cleanup commands and closes the connection.\par
 {\pntext\f0 -\tab}Prewarm Crypto: prepares cached crypto data after pairing. The action ignores repeated clicks while a prewarm is already running.\par
-{\pntext\f0 -\tab}Start AirPlay Monitor: starts current-app and now-playing monitoring for the room.\par
-{\pntext\f0 -\tab}Stop AirPlay Monitor: stops current-app and now-playing monitoring.\par
-{\pntext\f0 -\tab}Pair AirPlay: pairs the metadata monitor path. Enter the PIN shown by Apple TV into Pairing PIN when Connection State says Enter AirPlay PIN.\par
-{\pntext\f0 -\tab}Pair Apple TV: starts Apple TV pairing for remote control and app launching.\par
+{\pntext\f0 -\tab}Pair Apple TV: pairs Companion remote control, app list, and app launching. Run this before Pair AirPlay.\par
+{\pntext\f0 -\tab}Pair AirPlay: pairs the metadata monitor path for Current App and Now Playing. Enter the PIN shown by Apple TV into Pairing PIN when Connection State says Enter AirPlay PIN.\par
 {\pntext\f0 -\tab}Reset Pairing: clears saved credentials so the Apple TV can be paired again.\par
 \pard\par
 \b Mini Apps\b0\par

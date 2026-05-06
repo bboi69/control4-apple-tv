@@ -2232,10 +2232,7 @@ function tests.remote_passthrough_uses_configurable_button_mapping()
   local old_properties = Properties
   Properties = {
     ["CANCEL Button"] = "Menu",
-    ["PVR Button"] = "Back",
-    ["RECORD Button"] = "Play/Pause",
-    ["STAR Button"] = "Do Nothing",
-    ["INFO Button"] = "Dashboard (Hold TV Button)",
+    ["INFO Button"] = "Home",
   }
 
   Driver.Companion.sent_messages = {}
@@ -2253,21 +2250,80 @@ function tests.remote_passthrough_uses_configurable_button_mapping()
   assert_eq(Driver.Companion.sent_messages[2]._c._hBtS, 2, "cancel menu release")
 
   Driver.Companion.sent_messages = {}
-  ReceivedFromProxy(5001, "PVR", {})
-  assert_eq(#Driver.Companion.sent_messages, 2, "pvr maps to back/menu tap")
-  assert_eq(Driver.Companion.sent_messages[1]._c._hidC, 5, "pvr back hid")
-
-  Driver.Companion.sent_messages = {}
-  ReceivedFromProxy(5001, "RECORD", {})
-  assert_eq(Driver.Companion.sent_messages[1]._c._hidC, 14, "record play/pause hid")
-
-  Driver.Companion.sent_messages = {}
-  ReceivedFromProxy(5001, "STAR", {})
-  assert_eq(#Driver.Companion.sent_messages, 0, "star do nothing")
-
-  Driver.Companion.sent_messages = {}
   ReceivedFromProxy(5001, "INFO", {})
-  assert_eq(Driver.Companion.sent_messages[1]._c._hidC, 7, "info dashboard home hid")
+  assert_eq(Driver.Companion.sent_messages[1]._c._hidC, 7, "info home hid")
+
+  Properties = old_properties
+end
+
+function tests.remote_passthrough_uses_power_off_mapping()
+  local old_properties = Properties
+  local old_monitor_enabled = Driver.AirPlay.monitor_enabled
+  local old_client = Driver.AirPlay.control_client
+  local old_state = Driver.AirPlay.monitor_state
+
+  local function assert_power_off_mapping(value, expected_hid, label)
+    Properties = { ["On Power Off"] = value }
+    Driver.Companion.sent_messages = {}
+    Driver.AirPlay.monitor_enabled = true
+    Driver.AirPlay.control_client = nil
+
+    ReceivedFromProxy(5001, "OFF", {})
+
+    if expected_hid then
+      assert_eq(#Driver.Companion.sent_messages, 2, label .. " sends a tap")
+      assert_eq(Driver.Companion.sent_messages[1]._c._hidC, expected_hid, label .. " hid")
+    else
+      assert_eq(#Driver.Companion.sent_messages, 0, label .. " sends no hid")
+    end
+    assert_eq(Driver.AirPlay.monitor_enabled, false, label .. " stops monitor")
+    assert_eq(Driver.AirPlay.monitor_state, "STOPPED", label .. " monitor stopped state")
+  end
+
+  assert_power_off_mapping("Do Nothing", nil, "power off do nothing")
+  assert_power_off_mapping("Home", 7, "power off home")
+  assert_power_off_mapping("Back", 5, "power off back")
+  assert_power_off_mapping("Menu", 5, "power off menu")
+
+  Properties = old_properties
+  Driver.AirPlay.monitor_enabled = old_monitor_enabled
+  Driver.AirPlay.control_client = old_client
+  Driver.AirPlay.monitor_state = old_state
+end
+
+function tests.remote_passthrough_uses_color_button_mappings()
+  local old_properties = Properties
+  local cases = {
+    { command = "RED", property = "Red Button", value = "TV/Home", hid = 7 },
+    { command = "GREEN", property = "Green Button", value = "Menu", hid = 5 },
+    { command = "YELLOW", property = "Yellow Button", value = "Play/Pause", hid = 14 },
+    { command = "BLUE", property = "Blue Button", value = "Select", hid = 6 },
+    { command = "RED", property = "Red Button", value = "Up", hid = 1 },
+    { command = "GREEN", property = "Green Button", value = "Down", hid = 2 },
+    { command = "YELLOW", property = "Yellow Button", value = "Left", hid = 3 },
+    { command = "BLUE", property = "Blue Button", value = "Right", hid = 4 },
+  }
+
+  for _, case in ipairs(cases) do
+    Properties = { [case.property] = case.value }
+    Driver.Companion.sent_messages = {}
+    ReceivedFromProxy(5001, case.command, {})
+    assert_eq(#Driver.Companion.sent_messages, 2, case.property .. " " .. case.value .. " sends a tap")
+    assert_eq(Driver.Companion.sent_messages[1]._c._hidC, case.hid, case.property .. " " .. case.value .. " hid")
+  end
+
+  Properties = {}
+  Driver.Companion.sent_messages = {}
+  ReceivedFromProxy(5001, "RED", {})
+  assert_eq(#Driver.Companion.sent_messages, 0, "red defaults to do nothing")
+
+  Properties = { ["Blue Button"] = "Right" }
+  Driver.Companion.sent_messages = {}
+  ReceivedFromProxy(5002, "PASSTHROUGH", {
+    PASSTHROUGH_COMMAND = "BLUE",
+  })
+  assert_eq(#Driver.Companion.sent_messages, 2, "blue passthrough sends a tap")
+  assert_eq(Driver.Companion.sent_messages[1]._c._hidC, 4, "blue passthrough right hid")
 
   Properties = old_properties
 end
@@ -2540,9 +2596,11 @@ function tests.room_power_scopes_airplay_monitor()
       closed = true
     end,
   }
+  Driver.Companion.sent_messages = {}
 
   ReceivedFromProxy(5002, "OFF", {})
 
+  assert_eq(#Driver.Companion.sent_messages, 0, "room off defaults to no remote command")
   assert_eq(closed, true, "room off closes monitor client")
   assert_eq(Driver.AirPlay.monitor_enabled, false, "room off disables monitor")
   assert_eq(Driver.AirPlay.control_client, nil, "room off clears monitor client")

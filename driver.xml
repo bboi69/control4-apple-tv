@@ -5,16 +5,16 @@
     <name>Apple TV</name>
     <model>Apple TV</model>
     <created>05/02/2026 12:00 AM</created>
-    <modified>05/04/2026 02:10 AM</modified>
-    <version>36</version>
+    <modified>05/04/2026 11:02 PM</modified>
+    <version>53</version>
     <small image_source="c4z">icons/device_sm.png</small>
     <large image_source="c4z">icons/device_lg.png</large>
     <control>lua_gen</control>
     <controlmethod>ip</controlmethod>
     <driver>DriverWorks</driver>
     <proxies qty="2">
-        <proxy proxybindingid="5001" name="Apple TV">media_player</proxy>
-        <proxy proxybindingid="5002" name="Apple TV App Switcher">avswitch</proxy>
+        <proxy proxybindingid="5001" name="Apple TV" image_source="c4z" large_image="icons/device_lg.png" small_image="icons/device_sm.png">media_player</proxy>
+        <proxy proxybindingid="5002" name="Apple TV App Switcher" image_source="c4z" large_image="icons/apps_lg.png" small_image="icons/apps_sm.png">avswitch</proxy>
     </proxies>
     <events />
     <capabilities>
@@ -487,12 +487,6 @@
         <script file="driver.lua" />
         <properties>
             <property>
-                <name>Driver Version</name>
-                <default />
-                <type>STRING</type>
-                <readonly>true</readonly>
-            </property>
-            <property>
                 <name>Apple TV Address</name>
                 <default />
                 <type>STRING</type>
@@ -548,7 +542,6 @@
                     <item>Guide</item>
                     <item>Select</item>
                     <item>Play/Pause</item>
-                    <item>Dashboard (Hold TV Button)</item>
                     <item>Do Nothing</item>
                 </items>
                 <default>Home</default>
@@ -564,7 +557,6 @@
                     <item>Guide</item>
                     <item>Select</item>
                     <item>Play/Pause</item>
-                    <item>Dashboard (Hold TV Button)</item>
                     <item>Do Nothing</item>
                 </items>
                 <default>Menu</default>
@@ -580,10 +572,9 @@
                     <item>Guide</item>
                     <item>Select</item>
                     <item>Play/Pause</item>
-                    <item>Dashboard (Hold TV Button)</item>
                     <item>Do Nothing</item>
                 </items>
-                <default>Dashboard (Hold TV Button)</default>
+                <default>Home</default>
                 <readonly>false</readonly>
             </property>
             <property>
@@ -596,74 +587,89 @@
                     <item>Guide</item>
                     <item>Select</item>
                     <item>Play/Pause</item>
-                    <item>Dashboard (Hold TV Button)</item>
                     <item>Do Nothing</item>
                 </items>
                 <default>Menu</default>
                 <readonly>false</readonly>
             </property>
             <property>
-                <name>PVR Button</name>
+                <name>Red Button</name>
                 <type>LIST</type>
                 <items>
-                    <item>Home</item>
-                    <item>Menu</item>
-                    <item>Back</item>
-                    <item>Guide</item>
-                    <item>Select</item>
-                    <item>Play/Pause</item>
-                    <item>Dashboard (Hold TV Button)</item>
                     <item>Do Nothing</item>
-                </items>
-                <default>Back</default>
-                <readonly>false</readonly>
-            </property>
-            <property>
-                <name>STAR Button</name>
-                <type>LIST</type>
-                <items>
-                    <item>Home</item>
                     <item>Menu</item>
-                    <item>Back</item>
-                    <item>Guide</item>
-                    <item>Select</item>
                     <item>Play/Pause</item>
-                    <item>Dashboard (Hold TV Button)</item>
-                    <item>Do Nothing</item>
+                    <item>TV/Home</item>
+                    <item>Up</item>
+                    <item>Down</item>
+                    <item>Left</item>
+                    <item>Right</item>
+                    <item>Select</item>
                 </items>
                 <default>Do Nothing</default>
                 <readonly>false</readonly>
             </property>
             <property>
-                <name>POUND Button</name>
+                <name>Green Button</name>
                 <type>LIST</type>
                 <items>
-                    <item>Home</item>
-                    <item>Menu</item>
-                    <item>Back</item>
-                    <item>Guide</item>
-                    <item>Select</item>
-                    <item>Play/Pause</item>
-                    <item>Dashboard (Hold TV Button)</item>
                     <item>Do Nothing</item>
+                    <item>Menu</item>
+                    <item>Play/Pause</item>
+                    <item>TV/Home</item>
+                    <item>Up</item>
+                    <item>Down</item>
+                    <item>Left</item>
+                    <item>Right</item>
+                    <item>Select</item>
                 </items>
                 <default>Do Nothing</default>
                 <readonly>false</readonly>
             </property>
             <property>
-                <name>RECORD Button</name>
+                <name>Yellow Button</name>
                 <type>LIST</type>
                 <items>
-                    <item>Home</item>
-                    <item>Menu</item>
-                    <item>Back</item>
-                    <item>Guide</item>
-                    <item>Select</item>
-                    <item>Play/Pause</item>
-                    <item>Dashboard (Hold TV Button)</item>
                     <item>Do Nothing</item>
+                    <item>Menu</item>
+                    <item>Play/Pause</item>
+                    <item>TV/Home</item>
+                    <item>Up</item>
+                    <item>Down</item>
+                    <item>Left</item>
+                    <item>Right</item>
+                    <item>Select</item>
                 </items>
-                <default>Play/Pause</default>
+                <default>Do Nothing</default>
+                <readonly>false</readonly>
+            </property>
+            <property>
+                <name>Blue Button</name>
+                <type>LIST</type>
+                <items>
+                    <item>Do Nothing</item>
+                    <item>Menu</item>
+                    <item>Play/Pause</item>
+                    <item>TV/Home</item>
+                    <item>Up</item>
+                    <item>Down</item>
+                    <item>Left</item>
+                    <item>Right</item>
+                    <item>Select</item>
+                </items>
+                <default>Do Nothing</default>
+                <readonly>false</readonly>
+            </property>
+            <property>
+                <name>On Power Off</name>
+                <type>LIST</type>
+                <items>
+                    <item>Do Nothing</item>
+                    <item>Home</item>
+                    <item>Back</item>
+                    <item>Menu</item>
+                </items>
+                <default>Do Nothing</default>
                 <readonly>false</readonly>
             </property>
             <property>
@@ -685,44 +691,36 @@
         </properties>
         <actions>
             <action>
-                <name>Refresh App List</name>
-                <command>REFRESH_APP_LIST</command>
-            </action>
-            <action>
-                <name>Print App List</name>
-                <command>PRINT_APP_LIST</command>
-            </action>
-            <action>
-                <name>Launch App</name>
-                <command>LAUNCH_SELECTED_APP</command>
-            </action>
-            <action>
-                <name>Connect Apple TV</name>
-                <command>CONNECT_COMPANION</command>
-            </action>
-            <action>
-                <name>Disconnect Apple TV</name>
-                <command>DISCONNECT_COMPANION</command>
-            </action>
-            <action>
-                <name>Prewarm Crypto</name>
-                <command>PREWARM_CRYPTO</command>
-            </action>
-            <action>
-                <name>Start AirPlay Monitor</name>
-                <command>START_AIRPLAY_MONITOR</command>
-            </action>
-            <action>
-                <name>Stop AirPlay Monitor</name>
-                <command>STOP_AIRPLAY_MONITOR</command>
+                <name>Pair Apple TV</name>
+                <command>PAIR_COMPANION</command>
             </action>
             <action>
                 <name>Pair AirPlay</name>
                 <command>PAIR_AIRPLAY</command>
             </action>
             <action>
-                <name>Pair Apple TV</name>
-                <command>PAIR_COMPANION</command>
+                <name>Prewarm Crypto</name>
+                <command>PREWARM_CRYPTO</command>
+            </action>
+            <action>
+                <name>Connect Apple TV</name>
+                <command>CONNECT_COMPANION</command>
+            </action>
+            <action>
+                <name>Refresh App List</name>
+                <command>REFRESH_APP_LIST</command>
+            </action>
+            <action>
+                <name>Launch App</name>
+                <command>LAUNCH_SELECTED_APP</command>
+            </action>
+            <action>
+                <name>Print App List</name>
+                <command>PRINT_APP_LIST</command>
+            </action>
+            <action>
+                <name>Disconnect Apple TV</name>
+                <command>DISCONNECT_COMPANION</command>
             </action>
             <action>
                 <name>Reset Pairing</name>

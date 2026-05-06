@@ -5691,12 +5691,20 @@ local C4MiniApps = {
   button_defaults = {
     MENU = "Home",
     GUIDE = "Menu",
-    INFO = "Dashboard (Hold TV Button)",
+    INFO = "Home",
     CANCEL = "Menu",
-    PVR = "Back",
-    STAR = "Do Nothing",
-    POUND = "Do Nothing",
-    RECORD = "Play/Pause",
+    OFF = "Do Nothing",
+    RED = "Do Nothing",
+    GREEN = "Do Nothing",
+    YELLOW = "Do Nothing",
+    BLUE = "Do Nothing",
+  },
+  button_properties = {
+    OFF = "On Power Off",
+    RED = "Red Button",
+    GREEN = "Green Button",
+    YELLOW = "Yellow Button",
+    BLUE = "Blue Button",
   },
   room_ids = {},
   room_sources = {},
@@ -6002,7 +6010,7 @@ function C4MiniApps.normalize_proxy_button(command, params)
 end
 
 function C4MiniApps.mapped_button_action(command, action)
-  local property_name = command .. " Button"
+  local property_name = C4MiniApps.button_properties[command] or (command .. " Button")
   local configured = Properties and Properties[property_name] or nil
   configured = configured or C4MiniApps.button_defaults[command]
   if not configured or configured == "" then
@@ -6014,12 +6022,16 @@ function C4MiniApps.mapped_button_action(command, action)
 
   local mapped = {
     ["Home"] = { "HOME", nil },
+    ["TV/Home"] = { "HOME", nil },
     ["Menu"] = { "MENU", nil },
     ["Back"] = { "MENU", nil },
     ["Guide"] = { "GUIDE", nil },
     ["Select"] = { "SELECT", nil },
     ["Play/Pause"] = { "PLAY_PAUSE", nil },
-    ["Dashboard (Hold TV Button)"] = { "HOME", "hold" },
+    ["Up"] = { "UP", nil },
+    ["Down"] = { "DOWN", nil },
+    ["Left"] = { "LEFT", nil },
+    ["Right"] = { "RIGHT", nil },
   }
   local entry = mapped[configured]
   if not entry then
@@ -6076,6 +6088,13 @@ function C4MiniApps.handle_proxy_command(binding_id, command, params)
     return
   end
   if command == "OFF" then
+    local mapped_hid, mapped_action, handled_mapping = C4MiniApps.mapped_button_action(command, params._resolved_action)
+    if handled_mapping and mapped_hid then
+      if Companion.credentials or (Driver.state and Driver.state.companion_credentials) then
+        C4Driver.ensure_companion_client()
+      end
+      Companion.button_action(mapped_hid, mapped_action)
+    end
     C4Driver.stop_airplay_monitor("room off")
     return
   end
@@ -8271,7 +8290,6 @@ function C4Driver.init()
   Companion.app_list = Driver.state.app_list or {}
   local _, rows = Companion.parse_app_list(Companion.app_list)
   Companion.app_list_rows = rows
-  C4Driver.update_property("Driver Version", Driver.VERSION)
   C4Driver.update_property("Pairing PIN", "")
   C4Driver.set_crypto_prewarm_status("Idle")
   C4Driver.publish_app_list()
