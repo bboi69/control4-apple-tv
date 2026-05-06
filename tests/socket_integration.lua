@@ -182,6 +182,17 @@ client:receive(read_exact(transport, #session_response_frame))
 assert_eq(states[6], "SESSION_ACTIVE", "session active state")
 
 frame_type, payload = read_frame(accepted)
+local tv_rc_start = decode_encrypted_message(client.session, frame_type, payload)
+assert_eq(tv_rc_start._i, "TVRCSessionStart", "tv remote control start identifier")
+local tv_rc_start_response = client.session:encode_frame(Driver.CompanionFrame.E_OPACK, Driver.OPACK.encode(Driver.OPACK.dict({
+  { "_t", 3 },
+  { "_c", Driver.OPACK.dict({}) },
+  { "_x", tv_rc_start._x },
+})))
+assert(accepted:send(tv_rc_start_response))
+client:receive(read_exact(transport, #tv_rc_start_response))
+
+frame_type, payload = read_frame(accepted)
 local ti_start = decode_encrypted_message(client.session, frame_type, payload)
 assert_eq(ti_start._i, "_tiStart", "text input start identifier")
 local ti_start_response = client.session:encode_frame(Driver.CompanionFrame.E_OPACK, Driver.OPACK.encode(Driver.OPACK.dict({

@@ -18,8 +18,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def archive_name(item_name: str, c4z_dir: str) -> str:
-    name = Path(item_name).name
-    return name if not c4z_dir else f"{c4z_dir.rstrip('/')}/{name}"
+    name = Path(item_name).as_posix()
+    if c4z_dir:
+        name = Path(item_name).name
+        return f"{c4z_dir.rstrip('/')}/{name}"
+    return name
 
 
 def package(project_path: Path, output_path: Path) -> None:

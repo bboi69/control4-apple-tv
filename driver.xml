@@ -703,6 +703,10 @@
                 <command>PREWARM_CRYPTO</command>
             </action>
             <action>
+                <name>Check Crypto Provider</name>
+                <command>CHECK_CRYPTO_PROVIDER</command>
+            </action>
+            <action>
                 <name>Connect Apple TV</name>
                 <command>CONNECT_COMPANION</command>
             </action>
