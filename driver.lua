@@ -4689,9 +4689,9 @@ function Companion.encode_opack_request(identifier, content, message_type)
   return request, frame
 end
 
-function Companion.send_opack(identifier, content, message_type)
+function Companion.send_opack(identifier, content, message_type, options)
   if Companion.client and Companion.client.send_or_queue_opack then
-    return Companion.client:send_or_queue_opack(identifier, content, message_type)
+    return Companion.client:send_or_queue_opack(identifier, content, message_type, options)
   end
 
   local request, frame = Companion.encode_opack_request(identifier, content, message_type)
@@ -4948,41 +4948,42 @@ local HID_COMMANDS = {
   GUIDE = 17,
 }
 
-function Companion.button(name, state)
+function Companion.button(name, state, options)
   local command = HID_COMMANDS[name]
   assert(command, "unsupported HID command: " .. tostring(name))
   return Companion.send_opack("_hidC", {
     _hidC = command,
     _hBtS = state or 2,
-  }, 2)
+  }, 2, options)
 end
 
-function Companion.button_action(name, action)
+function Companion.button_action(name, action, options)
   action = string.lower(tostring(action or "single"))
   if action == "singletap" or action == "tap" or action == "single" or action == "" then
-    return { Companion.button(name, 1), Companion.button(name, 2) }
+    return { Companion.button(name, 1, options), Companion.button(name, 2, options) }
   end
   if action == "doubletap" or action == "double" then
     return {
-      Companion.button(name, 1),
-      Companion.button(name, 2),
-      Companion.button(name, 1),
-      Companion.button(name, 2),
+      Companion.button(name, 1, options),
+      Companion.button(name, 2, options),
+      Companion.button(name, 1, options),
+      Companion.button(name, 2, options),
     }
   end
   if action == "hold" or action == "longpress" or action == "long_press" then
-    return { Companion.button(name, 1), Companion.button(name, 2) }
+    return { Companion.button(name, 1, options), Companion.button(name, 2, options) }
   end
   if action == "down" or action == "press" or action == "start" then
-    return { Companion.button(name, 1) }
+    return { Companion.button(name, 1, options) }
   end
   if action == "up" or action == "release" or action == "stop" then
-    return { Companion.button(name, 2) }
+    return { Companion.button(name, 2, options) }
   end
   error("unsupported HID action: " .. tostring(action))
 end
 
 local C4Driver
+local C4MiniApps
 local CompanionClient = {}
 
 function CompanionClient.new(options)
@@ -5353,6 +5354,8 @@ function CompanionClient:finish_tv_remote_control_session(xid, reason)
   if reason and reason ~= "" then
     Log.debug("Companion TV RC session continuing: " .. tostring(reason))
   end
+  self:flush_pending_commands({ priority_only = true })
+  C4MiniApps.schedule_pending_launch_retry()
   self:send_next_startup_step()
 end
 
@@ -5632,7 +5635,8 @@ function CompanionClient:queue_pending_command(item)
   self.pending_commands[#self.pending_commands + 1] = item
 end
 
-function CompanionClient:send_or_queue_opack(identifier, content, message_type)
+function CompanionClient:send_or_queue_opack(identifier, content, message_type, options)
+  options = options or {}
   local request = Companion.build_request(identifier, content, message_type)
   Companion.record_sent_message(request)
   if self:is_ready_for_commands() then
@@ -5644,6 +5648,7 @@ function CompanionClient:send_or_queue_opack(identifier, content, message_type)
     content = content,
     message_type = message_type,
     request = request,
+    priority = options.priority == true,
   })
   if self:needs_reconnect() and not self.connecting then
     self:connect()
@@ -5651,15 +5656,32 @@ function CompanionClient:send_or_queue_opack(identifier, content, message_type)
   return request, nil
 end
 
-function CompanionClient:flush_pending_commands()
+function CompanionClient:flush_pending_commands(options)
+  options = options or {}
   if not self:is_ready_for_commands() then
     return
   end
   if #self.pending_commands == 0 then
     return
   end
-  local queued = self.pending_commands
-  self.pending_commands = {}
+  local queued = {}
+  if options.priority_only then
+    local remaining = {}
+    for _, item in ipairs(self.pending_commands) do
+      if item.priority then
+        queued[#queued + 1] = item
+      else
+        remaining[#remaining + 1] = item
+      end
+    end
+    self.pending_commands = remaining
+  else
+    queued = self.pending_commands
+    self.pending_commands = {}
+  end
+  if #queued == 0 then
+    return
+  end
   Log.debug("flushing queued Companion requests: count=" .. tostring(#queued))
   for _, item in ipairs(queued) do
     self:send_opack(item.identifier, item.content, item.message_type, nil, nil, item.request)
@@ -5676,7 +5698,7 @@ function CompanionClient:fetch_apps()
   return self:send_or_queue_opack("FetchLaunchableApplicationsEvent", {}, 2)
 end
 
-local C4MiniApps = {
+C4MiniApps = {
   PASSTHROUGH_PROXY = 5001,
   SWITCHER_PROXY = 5002,
   USES_DEDICATED_SWITCHER = true,
@@ -5703,9 +5725,15 @@ local C4MiniApps = {
   },
   bindings = {},
   pending_retry = nil,
+  launch_retry_timer = "AppleTV_miniapp_launch_retry",
+  launch_retry_delay_ms = 1500,
+  launch_retry_window_ms = 5000,
   launch_debounce_ms = 1000,
   last_launch_id = nil,
   last_launch_at_ms = nil,
+  power_off_debounce_ms = 1000,
+  last_power_off_hid = nil,
+  last_power_off_at_ms = nil,
   button_defaults = {
     MENU = "Home",
     GUIDE = "Menu",
@@ -5867,15 +5895,103 @@ function C4MiniApps.is_duplicate_launch(launch_id)
   return false
 end
 
-function C4MiniApps.launch_service(service, app_proxy_id)
+function C4MiniApps.is_duplicate_power_off_action(hid)
+  local now = C4MiniApps.now_ms()
+  local last_at = C4MiniApps.last_power_off_at_ms
+  if C4MiniApps.last_power_off_hid == hid and last_at and
+     (now - last_at) >= 0 and (now - last_at) < C4MiniApps.power_off_debounce_ms
+  then
+    Log.debug("power-off duplicate action suppressed: " .. tostring(hid))
+    return true
+  end
+  C4MiniApps.last_power_off_hid = hid
+  C4MiniApps.last_power_off_at_ms = now
+  return false
+end
+
+function C4MiniApps.is_startup_launch_window()
+  local client = Companion.client
+  if not client then
+    return false
+  end
+  if client.startup_in_progress then
+    return true
+  end
+  local active_since = client.session_active_since_ms
+  if not active_since then
+    return false
+  end
+  local age = C4MiniApps.now_ms() - active_since
+  return age >= 0 and age <= C4MiniApps.launch_retry_window_ms
+end
+
+function C4MiniApps.cancel_launch_retry()
+  if C4Driver and C4Driver.cancel_timer then
+    C4Driver.cancel_timer(C4MiniApps.launch_retry_timer)
+  end
+  C4MiniApps.pending_launch_retry_id = nil
+end
+
+function C4MiniApps.schedule_launch_retry(launch_id)
+  if not C4MiniApps.is_startup_launch_window() then
+    return false
+  end
+  if not (has_c4() and type(SetTimer) == "function") then
+    return false
+  end
+  C4MiniApps.cancel_launch_retry()
+  C4MiniApps.pending_launch_retry_id = launch_id
+  local ok, err = pcall(SetTimer, C4MiniApps.launch_retry_timer, C4MiniApps.launch_retry_delay_ms, function()
+    if C4MiniApps.pending_launch_retry_id ~= launch_id then
+      return
+    end
+    C4MiniApps.pending_launch_retry_id = nil
+    Log.debug("retry mini app launch after startup " .. tostring(launch_id))
+    C4Driver.launch_app(launch_id)
+  end)
+  if not ok then
+    C4MiniApps.pending_launch_retry_id = nil
+    Log.debug("mini app launch retry timer unavailable: " .. tostring(err))
+    return false
+  end
+  Log.debug("scheduled mini app launch retry " .. tostring(launch_id) ..
+    " in " .. tostring(C4MiniApps.launch_retry_delay_ms) .. "ms")
+  return true
+end
+
+function C4MiniApps.request_launch_retry(launch_id)
+  if C4MiniApps.schedule_launch_retry(launch_id) then
+    return true
+  end
+  C4MiniApps.pending_launch_retry_id = launch_id
+  Log.debug("pending mini app launch retry after startup " .. tostring(launch_id))
+  return false
+end
+
+function C4MiniApps.schedule_pending_launch_retry()
+  local launch_id = C4MiniApps.pending_launch_retry_id
+  if not launch_id then
+    return false
+  end
+  return C4MiniApps.schedule_launch_retry(launch_id)
+end
+
+function C4MiniApps.launch_service(service, app_proxy_id, options)
+  options = options or {}
   local launch_id = C4MiniApps.resolve_launch_id(service)
   if launch_id then
     if C4MiniApps.is_duplicate_launch(launch_id) then
       C4MiniApps.reselect_passthrough_if_needed(app_proxy_id)
       return nil
     end
+    if C4MiniApps.pending_launch_retry_id and C4MiniApps.pending_launch_retry_id ~= launch_id then
+      C4MiniApps.cancel_launch_retry()
+    end
     Log.debug("launch mini app " .. launch_id)
     local request, frame = C4Driver.launch_app(launch_id)
+    if not options.retry then
+      C4MiniApps.request_launch_retry(launch_id)
+    end
     C4MiniApps.reselect_passthrough_if_needed(app_proxy_id)
     return request, frame
   end
@@ -6114,7 +6230,10 @@ function C4MiniApps.handle_proxy_command(binding_id, command, params)
       if Companion.credentials or (Driver.state and Driver.state.companion_credentials) then
         C4Driver.ensure_companion_client()
       end
-      Companion.button_action(mapped_hid, mapped_action)
+      if not C4MiniApps.is_duplicate_power_off_action(mapped_hid) then
+        Log.debug("power-off action queued: " .. tostring(mapped_hid))
+        Companion.button_action(mapped_hid, mapped_action, { priority = true })
+      end
     end
     C4Driver.stop_airplay_monitor("room off")
     return
@@ -8326,6 +8445,7 @@ function C4Driver.cancel_driver_timers()
   C4Driver.cancel_timer("AppleTV_airplay_monitor_start")
   C4Driver.cancel_timer("AppleTV_airplay_monitor_retry")
   C4Driver.cancel_timer("AppleTV_airplay_monitor_watchdog")
+  C4Driver.cancel_timer(C4MiniApps.launch_retry_timer)
   MDNS.close()
 end
 

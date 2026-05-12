@@ -1593,6 +1593,36 @@ function tests.queued_hid_commands_are_coalesced_while_connecting()
   assert_eq(client.pending_commands[3].content._hidC, 1, "different HID retained")
 end
 
+function tests.priority_pending_commands_flush_before_normal_queue()
+  local writes = {}
+  local client = Driver.CompanionClient.new({
+    credentials = Driver.Credentials.parse(table.concat({
+      Driver.Bytes.hex(string.rep("\x01", 32)),
+      Driver.Bytes.hex(string.rep("\x02", 32)),
+      Driver.Bytes.hex("ATV-ID"),
+      Driver.Bytes.hex("CLIENT-ID"),
+    }, ":")),
+    crypto = {
+      encrypt = function(_, plaintext) return plaintext .. string.rep("\0", 16) end,
+      decrypt = function(_, ciphertext) return ciphertext:sub(1, #ciphertext - 16) end,
+    },
+    transport = { Write = function(_, data) writes[#writes + 1] = data end },
+  })
+  client.session = Driver.CompanionSession.new("out", "in", client.crypto)
+  client.state = "SESSION_ACTIVE"
+  client.pending_commands = {
+    { identifier = "_launchApp", content = { _bundleID = "com.att.tv" }, message_type = 2 },
+    { identifier = "_hidC", content = { _hidC = 7, _hBtS = 1 }, message_type = 2, priority = true },
+    { identifier = "_hidC", content = { _hidC = 7, _hBtS = 2 }, message_type = 2, priority = true },
+  }
+
+  client:flush_pending_commands({ priority_only = true })
+
+  assert_eq(#writes, 2, "priority flush writes only power-off tap")
+  assert_eq(#client.pending_commands, 1, "normal command remains queued")
+  assert_eq(client.pending_commands[1].identifier, "_launchApp", "normal queued launch remains")
+end
+
 function tests.companion_pending_responses_expire_by_ttl()
   local writes = {}
   local now = 1000
@@ -2037,6 +2067,115 @@ function tests.mini_app_launch_debounces_duplicate_switcher_burst()
   Driver.Companion.app_list_rows = old_app_rows
 end
 
+function tests.mini_app_launch_schedules_startup_retry()
+  local old_c4 = C4
+  local old_set_timer = SetTimer
+  local old_cancel_timer = CancelTimer
+  local old_client = Driver.Companion.client
+  local old_last_launch_id = Driver.C4MiniApps.last_launch_id
+  local old_last_launch_at_ms = Driver.C4MiniApps.last_launch_at_ms
+  local old_retry_id = Driver.C4MiniApps.pending_launch_retry_id
+  local scheduled
+  local cancelled
+
+  C4 = {
+    GetTime = function() return 2000 end,
+  }
+  SetTimer = function(name, delay, callback)
+    scheduled = { name = name, delay = delay, callback = callback }
+  end
+  CancelTimer = function(name)
+    cancelled = name
+  end
+  Driver.Companion.client = {
+    state = "SESSION_ACTIVE",
+    session_active_since_ms = 1000,
+  }
+  Driver.C4MiniApps.last_launch_id = nil
+  Driver.C4MiniApps.last_launch_at_ms = nil
+  Driver.C4MiniApps.pending_launch_retry_id = nil
+  Driver.C4MiniApps.register_binding(3101, {
+    name = "DirecTV",
+    service_id = "DirecTV",
+  })
+  Driver.Companion.sent_messages = {}
+
+  ReceivedFromProxy(3101, "SELECT", {})
+
+  assert_eq(Driver.Companion.sent_messages[1]._c._bundleID, "com.att.tv", "initial directv launch")
+  assert(scheduled ~= nil, "startup retry scheduled")
+  assert_eq(scheduled.name, Driver.C4MiniApps.launch_retry_timer, "retry timer name")
+  assert_eq(scheduled.delay, Driver.C4MiniApps.launch_retry_delay_ms, "retry timer delay")
+  assert_eq(cancelled, Driver.C4MiniApps.launch_retry_timer, "old retry timer cancelled")
+
+  scheduled.callback()
+
+  assert_eq(Driver.Companion.sent_messages[2]._c._bundleID, "com.att.tv", "retry directv launch")
+
+  C4 = old_c4
+  SetTimer = old_set_timer
+  CancelTimer = old_cancel_timer
+  Driver.Companion.client = old_client
+  Driver.C4MiniApps.last_launch_id = old_last_launch_id
+  Driver.C4MiniApps.last_launch_at_ms = old_last_launch_at_ms
+  Driver.C4MiniApps.pending_launch_retry_id = old_retry_id
+end
+
+function tests.mini_app_launch_before_session_defers_startup_retry()
+  local old_c4 = C4
+  local old_set_timer = SetTimer
+  local old_cancel_timer = CancelTimer
+  local old_client = Driver.Companion.client
+  local old_last_launch_id = Driver.C4MiniApps.last_launch_id
+  local old_last_launch_at_ms = Driver.C4MiniApps.last_launch_at_ms
+  local old_retry_id = Driver.C4MiniApps.pending_launch_retry_id
+  local scheduled
+
+  C4 = {
+    GetTime = function() return 3000 end,
+  }
+  SetTimer = function(name, delay, callback)
+    scheduled = { name = name, delay = delay, callback = callback }
+  end
+  CancelTimer = function() end
+  Driver.Companion.client = {
+    state = "DISCONNECTED",
+  }
+  Driver.C4MiniApps.last_launch_id = nil
+  Driver.C4MiniApps.last_launch_at_ms = nil
+  Driver.C4MiniApps.pending_launch_retry_id = nil
+  Driver.C4MiniApps.register_binding(3101, {
+    name = "DirecTV",
+    service_id = "DirecTV",
+  })
+  Driver.Companion.sent_messages = {}
+
+  ReceivedFromProxy(3101, "SELECT", {})
+
+  assert_eq(Driver.Companion.sent_messages[1]._c._bundleID, "com.att.tv", "initial directv launch requested")
+  assert_eq(scheduled, nil, "retry waits for startup window")
+  assert_eq(Driver.C4MiniApps.pending_launch_retry_id, "com.att.tv", "retry id retained")
+
+  Driver.Companion.client.session_active_since_ms = 2500
+
+  Driver.C4MiniApps.schedule_pending_launch_retry()
+
+  assert(scheduled ~= nil, "retry scheduled once session is active")
+  assert_eq(scheduled.name, Driver.C4MiniApps.launch_retry_timer, "retry timer name")
+
+  scheduled.callback()
+
+  assert_eq(Driver.Companion.sent_messages[2]._c._bundleID, "com.att.tv", "deferred retry directv launch")
+
+  C4 = old_c4
+  SetTimer = old_set_timer
+  CancelTimer = old_cancel_timer
+  Driver.Companion.client = old_client
+  Driver.C4MiniApps.last_launch_id = old_last_launch_id
+  Driver.C4MiniApps.last_launch_at_ms = old_last_launch_at_ms
+  Driver.C4MiniApps.pending_launch_retry_id = old_retry_id
+end
+
 function tests.mini_apps_and_companion_client_use_c4_wall_clock()
   local old_c4 = C4
   C4 = {
@@ -2478,12 +2617,16 @@ function tests.remote_passthrough_uses_power_off_mapping()
   local old_monitor_enabled = Driver.AirPlay.monitor_enabled
   local old_client = Driver.AirPlay.control_client
   local old_state = Driver.AirPlay.monitor_state
+  local old_last_power_off_hid = Driver.C4MiniApps.last_power_off_hid
+  local old_last_power_off_at_ms = Driver.C4MiniApps.last_power_off_at_ms
 
   local function assert_power_off_mapping(value, expected_hid, label)
     Properties = { ["On Power Off"] = value }
     Driver.Companion.sent_messages = {}
     Driver.AirPlay.monitor_enabled = true
     Driver.AirPlay.control_client = nil
+    Driver.C4MiniApps.last_power_off_hid = nil
+    Driver.C4MiniApps.last_power_off_at_ms = nil
 
     ReceivedFromProxy(5001, "OFF", {})
 
@@ -2506,6 +2649,33 @@ function tests.remote_passthrough_uses_power_off_mapping()
   Driver.AirPlay.monitor_enabled = old_monitor_enabled
   Driver.AirPlay.control_client = old_client
   Driver.AirPlay.monitor_state = old_state
+  Driver.C4MiniApps.last_power_off_hid = old_last_power_off_hid
+  Driver.C4MiniApps.last_power_off_at_ms = old_last_power_off_at_ms
+end
+
+function tests.remote_passthrough_debounces_duplicate_power_off_from_proxies()
+  local old_properties = Properties
+  local old_now_ms = Driver.C4MiniApps.now_ms
+  local old_last_power_off_hid = Driver.C4MiniApps.last_power_off_hid
+  local old_last_power_off_at_ms = Driver.C4MiniApps.last_power_off_at_ms
+
+  Properties = { ["On Power Off"] = "Home" }
+  Driver.C4MiniApps.now_ms = function() return 123000 end
+  Driver.C4MiniApps.last_power_off_hid = nil
+  Driver.C4MiniApps.last_power_off_at_ms = nil
+  Driver.Companion.sent_messages = {}
+
+  ReceivedFromProxy(5001, "OFF", {})
+  ReceivedFromProxy(5002, "OFF", {})
+
+  assert_eq(#Driver.Companion.sent_messages, 2, "duplicate proxy off sends one tap")
+  assert_eq(Driver.Companion.sent_messages[1]._c._hidC, 7, "home press hid")
+  assert_eq(Driver.Companion.sent_messages[2]._c._hidC, 7, "home release hid")
+
+  Properties = old_properties
+  Driver.C4MiniApps.now_ms = old_now_ms
+  Driver.C4MiniApps.last_power_off_hid = old_last_power_off_hid
+  Driver.C4MiniApps.last_power_off_at_ms = old_last_power_off_at_ms
 end
 
 function tests.remote_passthrough_uses_color_button_mappings()
