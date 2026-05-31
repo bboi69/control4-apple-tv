@@ -5,8 +5,8 @@
     <name>Apple TV</name>
     <model>Apple TV</model>
     <created>05/02/2026 12:00 AM</created>
-    <modified>05/04/2026 11:02 PM</modified>
-    <version>53</version>
+    <modified>05/30/2026 07:31 PM</modified>
+    <version>59</version>
     <small image_source="c4z">icons/device_sm.png</small>
     <large image_source="c4z">icons/device_lg.png</large>
     <control>lua_gen</control>
@@ -522,15 +522,21 @@
                 <readonly>false</readonly>
             </property>
             <property>
-                <name>Passthrough Mode</name>
+                <name>After Mini App Launch</name>
                 <type>LIST</type>
                 <items>
-                    <item>Off</item>
-                    <item>On</item>
+                    <item>Return To This Driver</item>
+                    <item>Select Native Apple TV Driver</item>
                 </items>
-                <default>On</default>
+                <default>Return To This Driver</default>
                 <readonly>false</readonly>
-                <tooltip>When On, MiniApp launches return selection to the main Apple TV device so remote commands keep controlling Apple TV.</tooltip>
+                <tooltip>Choose which driver should receive room focus after a MiniApp launches.</tooltip>
+            </property>
+            <property>
+                <name>Native Apple TV Driver</name>
+                <type>DYNAMIC_LIST</type>
+                <readonly>false</readonly>
+                <tooltip>Native Control4 Apple TV driver to select after a MiniApp launch.</tooltip>
             </property>
             <property>
                 <name>MENU Button</name>
@@ -721,6 +727,10 @@
             <action>
                 <name>Print App List</name>
                 <command>PRINT_APP_LIST</command>
+            </action>
+            <action>
+                <name>Refresh Native Apple TV Drivers</name>
+                <command>REFRESH_NATIVE_APPLE_TV_DRIVERS</command>
             </action>
             <action>
                 <name>Disconnect Apple TV</name>

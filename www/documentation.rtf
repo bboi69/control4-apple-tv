@@ -2,11 +2,21 @@
 \viewkind4\uc1\pard\f0\fs32\b\cf2 Control4 Apple TV Driver\cf0\b0\fs22\par
 \par
 \b Overview\b0\par
-This driver lets Control4 pair with Apple TV, send remote-control commands, launch installed apps, and display current app and now-playing status. No separate service is required.\par
+This driver lets Control4 pair with Apple TV, send remote-control commands, launch installed apps, display current app and now-playing status, and expose Universal Mini Apps. No separate service is required.\par
+\par
+Halo push-to-talk is handled by Control4's native Apple TV voice path. This driver does not process Halo microphone audio. For voice, configure the native AppleBridge / Apple TV driver first, then let this driver hand room focus to the native Apple TV driver after MiniApp launch.\par
 \par
 \b Requirements\b0\par
 \pard{\pntext\f0 -\tab}{\*\pn\pnlvlblt\pnf0\pnindent360}\fi-360\li720 Apple TV and Control4 controller must be on the same network and able to reach TCP port 49153 on the Apple TV.\par
 {\pntext\f0 -\tab}Apple TV must allow local network/remote connections. If Apple TV prompts for remote control pairing, leave the PIN visible while entering it in Composer.\par
+{\pntext\f0 -\tab}For Halo push-to-talk, the native Control4 AppleBridge / Apple TV driver must be configured and working in the same room.\par
+\pard\par
+\b Push-To-Talk Prerequisite\b0\par
+\pard{\pntext\f0 1.\tab}{\*\pn\pnlvlbody\pndec\pnstart1\pnindent360}\fi-360\li720 Configure the native Control4 AppleBridge and Apple TV drivers normally.\par
+{\pntext\f0 2.\tab}Add the native Apple TV source to the room's Watch menu.\par
+{\pntext\f0 3.\tab}On the native Apple TV driver, disable menu-tap behaviors: Send Menu Tap on ON = False, and Send Menu Tap/Hold on OFF = False.\par
+{\pntext\f0 4.\tab}Manually select the native Apple TV source and confirm Halo push-to-talk works.\par
+{\pntext\f0 5.\tab}After native voice works, continue with this driver's setup.\par
 \pard\par
 \b Installation\b0\par
 \pard{\pntext\f0 1.\tab}{\*\pn\pnlvlbody\pndec\pnstart1\pnindent360}\fi-360\li720 Install the .c4z driver in Composer Pro.\par
@@ -22,7 +32,15 @@ This driver lets Control4 pair with Apple TV, send remote-control commands, laun
 {\pntext\f0 4.\tab}Run Pair AirPlay next. This pairs the metadata monitor used for Current App and Now Playing. Enter the Apple TV PIN in Pairing PIN when Connection State says Enter AirPlay PIN.\par
 {\pntext\f0 5.\tab}Run Prewarm Crypto. Wait for Crypto Prewarm Status to show Complete before continuing.\par
 {\pntext\f0 6.\tab}Run Connect Apple TV. The expected state is SESSION_ACTIVE.\par
-{\pntext\f0 7.\tab}Test directional control, Select, Back/Menu, Refresh App List, and Current App/Now Playing updates.\par
+{\pntext\f0 7.\tab}Run Refresh App List.\par
+{\pntext\f0 8.\tab}Test directional control, Select, Back/Menu, app launching, and Current App/Now Playing updates.\par
+\pard\par
+\b Push-To-Talk Handoff\b0\par
+\pard{\pntext\f0 1.\tab}{\*\pn\pnlvlbody\pndec\pnstart1\pnindent360}\fi-360\li720 Run Refresh Native Apple TV Drivers.\par
+{\pntext\f0 2.\tab}Set After Mini App Launch to Select Native Apple TV Driver.\par
+{\pntext\f0 3.\tab}Set Native Apple TV Driver to the native appleTV.c4z driver for the same room/Apple TV.\par
+{\pntext\f0 4.\tab}Keep the native Apple TV source in the room's Watch menu.\par
+{\pntext\f0 5.\tab}Select a MiniApp. The driver launches the app, then selects the native Apple TV proxy so Halo voice uses the native voice path.\par
 \pard\par
 \b Normal Use\b0\par
 \pard{\pntext\f0 -\tab}{\*\pn\pnlvlblt\pnf0\pnindent360}\fi-360\li720 Commands automatically connect if the driver is disconnected. The first command after a driver reload may take about a second while Pair-Verify and startup complete; later commands should be immediate while the session remains active.\par
@@ -37,7 +55,8 @@ This driver lets Control4 pair with Apple TV, send remote-control commands, laun
 {\pntext\f0 -\tab}Launch App: dynamic list populated by Refresh App List. Use the Launch App action to launch the selected row.\par
 {\pntext\f0 -\tab}Pairing PIN: enter the Apple TV PIN here after running Pair Apple TV. The driver clears this field after pairing completes.\par
 {\pntext\f0 -\tab}Crypto Prewarm Status: progress/result for the Prewarm Crypto action.\par
-{\pntext\f0 -\tab}Passthrough Mode: when On, MiniApp launches return selection to the main Apple TV device so remote commands keep controlling Apple TV.\par
+{\pntext\f0 -\tab}After Mini App Launch: choose Return To This Driver or Select Native Apple TV Driver.\par
+{\pntext\f0 -\tab}Native Apple TV Driver: native appleTV.c4z driver to select after MiniApp launch when using Halo push-to-talk handoff.\par
 {\pntext\f0 -\tab}Debug Mode: when On, driver diagnostic messages are printed to the Lua output tab.\par
 \pard\par
 \b Button Mapping\b0\par
@@ -51,6 +70,7 @@ Back and Menu both use the Apple TV menu/back HID command.\par
 \pard{\pntext\f0 -\tab}{\*\pn\pnlvlblt\pnf0\pnindent360}\fi-360\li720 Refresh App List: requests launchable apps from the Apple TV and updates the Launch App list.\par
 {\pntext\f0 -\tab}Print App List: prints the full app list to the Lua output tab.\par
 {\pntext\f0 -\tab}Launch App: launches the app selected in the Launch App property.\par
+{\pntext\f0 -\tab}Refresh Native Apple TV Drivers: populates the Native Apple TV Driver dropdown with native appleTV.c4z drivers.\par
 {\pntext\f0 -\tab}Connect Apple TV: opens the TCP connection, performs Pair-Verify, starts the Companion session, and subscribes to status events.\par
 {\pntext\f0 -\tab}Disconnect Apple TV: sends cleanup commands and closes the connection.\par
 {\pntext\f0 -\tab}Prewarm Crypto: prepares cached crypto data after pairing. The action ignores repeated clicks while a prewarm is already running.\par
@@ -65,7 +85,8 @@ Recommended MiniApp workflow:\par
 \pard{\pntext\f0 1.\tab}{\*\pn\pnlvlbody\pndec\pnstart1\pnindent360}\fi-360\li720 Connect Apple TV.\par
 {\pntext\f0 2.\tab}Run Refresh App List.\par
 {\pntext\f0 3.\tab}Bind MiniApps to the desired MiniApp inputs.\par
-{\pntext\f0 4.\tab}Select the MiniApp from Watch or Programming and confirm the app launches.\par
+{\pntext\f0 4.\tab}Set After Mini App Launch. Use Return To This Driver for normal remote control, or Select Native Apple TV Driver when using Halo push-to-talk handoff.\par
+{\pntext\f0 5.\tab}Select the MiniApp from Watch or Programming and confirm the app launches.\par
 \pard\par
 If an app does not launch, run Refresh App List again and check the Lua logs. The driver fuzzy-matches names and aliases, but exact bundle IDs from the Apple TV app list are the most reliable launch targets.\par
 \par
@@ -76,6 +97,12 @@ If an app does not launch, run Refresh App List again and check the Lua logs. Th
 {\pntext\f0 -\tab}Prewarm Crypto says skipped: pair Apple TV first, or wait for the current prewarm to finish.\par
 {\pntext\f0 -\tab}First command after reload is delayed: this is normally Pair-Verify/session startup. Subsequent commands should be fast once SESSION_ACTIVE appears.\par
 {\pntext\f0 -\tab}MiniApp does not launch: run Refresh App List, verify the app is installed on the Apple TV, and check whether the MiniApp name matches a listed app or known alias.\par
+{\pntext\f0 -\tab}Halo says to switch to a voice-capable room: confirm the native Apple TV source is in the room Watch menu and that push-to-talk works when the native Apple TV source is selected manually.\par
+\pard\par
+\b Expected Handoff Logs\b0\par
+\pard{\pntext\f0 -\tab}{\*\pn\pnlvlblt\pnf0\pnindent360}\fi-360\li720 native Apple TV driver proxy resolved: driver=<native-driver-id> proxy=<native-proxy-id>\par
+{\pntext\f0 -\tab}mini app native handoff selecting device <native-proxy-id> in room <room-id>\par
+{\pntext\f0 -\tab}mini app native handoff verified: room=<room-id> selected=<native-proxy-id>\par
 \pard\par
 \b Notes\b0\par
 Leave Debug Mode off for normal use. Turn it on only while pairing, troubleshooting, or validating after an Apple TV software update.\par

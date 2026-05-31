@@ -2280,6 +2280,204 @@ function tests.mini_app_launch_from_switcher_set_input()
   C4 = old_c4
 end
 
+function tests.native_apple_tv_driver_list_populates_dropdown()
+  local old_c4 = C4
+  local property_lists = {}
+  C4 = {
+    GetDeviceID = function()
+      return 42
+    end,
+    GetDevices = function(_, _)
+      return {
+        [42] = { name = "Custom Apple TV", driverFileName = "control4_apple_tv.c4z" },
+        [1106] = { name = "Apple TV Office", driverFileName = "appleTV.c4z" },
+        [1107] = { name = "Apple TV Clone", driverFileName = "apple_tv.c4z" },
+        [1099] = { name = "Apple TV App Switcher", driverFileName = "control4_apple_tv.c4z" },
+        [1109] = { name = "Apple TV Office", driverFileName = "" },
+        [1200] = { name = "Roku", driverFileName = "roku.c4z" },
+      }
+    end,
+    UpdatePropertyList = function(_, name, items)
+      property_lists[name] = items
+    end,
+  }
+
+  local items = Driver.C4MiniApps.refresh_native_apple_tv_drivers()
+
+  assert_eq(items[1], "Not Selected", "first native driver item")
+  assert_contains(items, "Apple TV Office [1106]", "native Apple TV candidate")
+  assert(not property_lists["Native Apple TV Driver"]:match("%[42%]"), "own driver excluded from native list")
+  assert(not property_lists["Native Apple TV Driver"]:match("%[1107%]"), "non-exact Apple TV filename excluded")
+  assert(not property_lists["Native Apple TV Driver"]:match("%[1099%]"), "custom app switcher excluded")
+  assert(not property_lists["Native Apple TV Driver"]:match("%[1109%]"), "Apple TV name without driver filename excluded")
+  assert(not property_lists["Native Apple TV Driver"]:match("Roku"), "non Apple TV driver excluded")
+  C4 = old_c4
+end
+
+function tests.native_apple_tv_driver_refresh_resets_stale_selection()
+  local old_c4 = C4
+  local old_properties = Properties
+  Properties = {
+    ["Native Apple TV Driver"] = "Apple TV [1095]",
+  }
+  C4 = {
+    GetDeviceID = function()
+      return 42
+    end,
+    GetDevices = function(_, _)
+      return {
+        [1106] = { name = "Apple TV Office", driverFileName = "appleTV.c4z" },
+      }
+    end,
+    UpdatePropertyList = function(_, _, _) end,
+  }
+
+  Driver.C4MiniApps.refresh_native_apple_tv_drivers()
+
+  assert_eq(Properties["Native Apple TV Driver"], "Not Selected", "stale native driver selection reset")
+  C4 = old_c4
+  Properties = old_properties
+end
+
+function tests.native_apple_tv_driver_selection_parses_device_id()
+  assert_eq(Driver.C4MiniApps.parse_native_driver_selection("Apple TV Office [1106]"), 1106, "bracketed native id")
+  assert_eq(Driver.C4MiniApps.parse_native_driver_selection("1106"), 1106, "raw native id")
+  assert_eq(Driver.C4MiniApps.parse_native_driver_selection("Not Selected"), nil, "not selected native id")
+end
+
+function tests.native_handoff_selects_native_driver_after_mini_app_launch()
+  local old_c4 = C4
+  local old_properties = Properties
+  local old_set_timer = SetTimer
+  local old_room_sources = Driver.C4MiniApps.room_sources
+  local selections = {}
+  Properties = {
+    ["After Mini App Launch"] = "Select Native Apple TV Driver",
+    ["Native Apple TV Driver"] = "Apple TV Office [1106]",
+  }
+  Driver.C4MiniApps.room_sources = {
+    [260] = 9102,
+    [261] = 1234,
+  }
+  C4 = {
+    GetBoundConsumerDevices = function(_, device_id, binding_id)
+      assert_eq(device_id, 1106, "native driver id")
+      assert_eq(binding_id, 5001, "native media proxy binding")
+      return { [1110] = "Apple TV Office Proxy" }
+    end,
+    SendToDevice = function(_, room_id, command, params)
+      selections[#selections + 1] = {
+        room_id = room_id,
+        command = command,
+        deviceid = params.deviceid,
+        DEVICE_ID = params.DEVICE_ID,
+      }
+    end,
+  }
+  SetTimer = nil
+
+  Driver.C4MiniApps.after_launch_selection(9102)
+
+  assert_eq(#selections, 1, "native handoff selection count")
+  assert_eq(selections[1].room_id, 260, "native handoff room")
+  assert_eq(selections[1].command, "SELECT_VIDEO_DEVICE", "native handoff command")
+  assert_eq(selections[1].deviceid, 1110, "native handoff selects media proxy")
+  assert_eq(selections[1].DEVICE_ID, 1110, "native handoff uppercase media proxy")
+  C4 = old_c4
+  Properties = old_properties
+  SetTimer = old_set_timer
+  Driver.C4MiniApps.room_sources = old_room_sources
+end
+
+function tests.after_mini_app_launch_native_selects_native_driver()
+  local old_c4 = C4
+  local old_properties = Properties
+  local old_set_timer = SetTimer
+  local old_room_sources = Driver.C4MiniApps.room_sources
+  local selections = {}
+  Properties = {
+    ["After Mini App Launch"] = "Select Native Apple TV Driver",
+    ["Native Apple TV Driver"] = "Apple TV Office [1106]",
+  }
+  Driver.C4MiniApps.room_sources = {
+    [260] = 9102,
+  }
+  C4 = {
+    GetDeviceID = function()
+      return 42
+    end,
+    GetBoundConsumerDevices = function(_, _, binding_id)
+      if binding_id == 5001 then
+        return { [1110] = "Apple TV Office Proxy" }
+      end
+      return {}
+    end,
+    SendToDevice = function(_, room_id, command, params)
+      selections[#selections + 1] = {
+        room_id = room_id,
+        command = command,
+        deviceid = params.deviceid,
+        DEVICE_ID = params.DEVICE_ID,
+      }
+    end,
+  }
+  SetTimer = nil
+
+  Driver.C4MiniApps.after_launch_selection(9102)
+
+  assert_eq(#selections, 1, "native handoff selection count")
+  assert_eq(selections[1].deviceid, 1110, "native handoff proxy target wins")
+  assert_eq(selections[1].DEVICE_ID, 1110, "native handoff uppercase proxy target wins")
+  C4 = old_c4
+  Properties = old_properties
+  SetTimer = old_set_timer
+  Driver.C4MiniApps.room_sources = old_room_sources
+end
+
+function tests.after_mini_app_launch_return_selects_this_driver_proxy()
+  local old_c4 = C4
+  local old_properties = Properties
+  local old_set_timer = SetTimer
+  local old_room_sources = Driver.C4MiniApps.room_sources
+  local selections = {}
+  Properties = {
+    ["After Mini App Launch"] = "Return To This Driver",
+  }
+  Driver.C4MiniApps.room_sources = {
+    [260] = 9102,
+  }
+  C4 = {
+    GetDeviceID = function()
+      return 42
+    end,
+    GetBoundConsumerDevices = function(_, _, binding_id)
+      if binding_id == 5001 then
+        return { [50010] = "Main Apple TV Proxy" }
+      end
+      return {}
+    end,
+    SendToDevice = function(_, room_id, command, params)
+      selections[#selections + 1] = {
+        room_id = room_id,
+        command = command,
+        deviceid = params.deviceid,
+        DEVICE_ID = params.DEVICE_ID,
+      }
+    end,
+  }
+  SetTimer = nil
+
+  Driver.C4MiniApps.after_launch_selection(9102)
+
+  assert_eq(#selections, 1, "return to this driver selection count")
+  assert_eq(selections[1].deviceid, 50010, "return to main proxy target")
+  assert_eq(selections[1].DEVICE_ID, 50010, "return to main proxy uppercase target")
+  C4 = old_c4
+  Properties = old_properties
+  SetTimer = old_set_timer
+  Driver.C4MiniApps.room_sources = old_room_sources
+end
+
 function tests.mini_app_switcher_resolves_app_id_that_is_friendly_name()
   local old_c4 = C4
   local old_app_list = Driver.Companion.app_list

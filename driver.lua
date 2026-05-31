@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.34-dev",
+  VERSION = "0.1.40-dev",
 }
 
 local function has_c4()
@@ -5729,6 +5729,14 @@ C4MiniApps = {
   launch_retry_delay_ms = 1500,
   launch_retry_window_ms = 5000,
   launch_debounce_ms = 1000,
+  native_handoff_timer = "AppleTV_native_driver_handoff",
+  native_handoff_delay_ms = 750,
+  handoff_verify_delay_ms = 1000,
+  after_launch_property = "After Mini App Launch",
+  native_driver_property = "Native Apple TV Driver",
+  after_launch_return = "Return To This Driver",
+  after_launch_native = "Select Native Apple TV Driver",
+  native_driver_not_selected = "Not Selected",
   last_launch_id = nil,
   last_launch_at_ms = nil,
   power_off_debounce_ms = 1000,
@@ -5909,6 +5917,231 @@ function C4MiniApps.is_duplicate_power_off_action(hid)
   return false
 end
 
+function C4MiniApps.native_driver_row(device_id, name)
+  return tostring(name or ("Device " .. tostring(device_id))) .. " [" .. tostring(device_id) .. "]"
+end
+
+function C4MiniApps.parse_native_driver_selection(value)
+  local text = tostring(value or "")
+  if text == "" or text == C4MiniApps.native_driver_not_selected then
+    return nil
+  end
+  local bracketed = text:match("%[(%d+)%]%s*$")
+  return tonumber(bracketed or text)
+end
+
+function C4MiniApps.device_info_value(info, ...)
+  if type(info) ~= "table" then
+    return nil
+  end
+  for i = 1, select("#", ...) do
+    local key = select(i, ...)
+    local value = info[key]
+    if value ~= nil and tostring(value) ~= "" then
+      return value
+    end
+  end
+  return nil
+end
+
+function C4MiniApps.device_display_name(device_id, info, fallback)
+  local name = C4MiniApps.device_info_value(info, "name", "deviceName", "displayName", "device_display_name")
+  if name then
+    return tostring(name)
+  end
+  if has_c4() and C4.GetDeviceDisplayName then
+    local ok, value = pcall(function() return C4:GetDeviceDisplayName(device_id) end)
+    if ok and value and tostring(value) ~= "" then
+      return tostring(value)
+    end
+  end
+  return tostring(fallback or ("Device " .. tostring(device_id)))
+end
+
+function C4MiniApps.device_driver_filename(info)
+  return tostring(C4MiniApps.device_info_value(info,
+    "driverFileName", "driver_filename", "driverFilename", "filename", "fileName", "c4i", "driver") or "")
+end
+
+function C4MiniApps.is_native_apple_tv_candidate(device_id, info, name)
+  local own_id = has_c4() and C4.GetDeviceID and tonumber(C4:GetDeviceID()) or nil
+  if own_id and tonumber(device_id) == own_id then
+    return false
+  end
+
+  local driver_file = C4MiniApps.device_driver_filename(info)
+  local driver_lower = driver_file:lower()
+  if driver_lower == "" then
+    if tostring(name or ""):lower():find("apple", 1, true) then
+      Log.debug("native Apple TV candidate skipped: no driver filename id=" ..
+        tostring(device_id) .. " name=" .. tostring(name))
+    end
+    return false
+  end
+  if driver_lower:find("control4_apple_tv", 1, true) or driver_lower:find("app switcher", 1, true) then
+    return false
+  end
+  return driver_lower == "appletv.c4z"
+end
+
+function C4MiniApps.refresh_native_apple_tv_drivers()
+  local items = { C4MiniApps.native_driver_not_selected }
+  if not (has_c4() and C4.GetDevices) then
+    C4Driver.update_property_list(C4MiniApps.native_driver_property, items)
+    Log.debug("native Apple TV driver list refresh skipped: C4.GetDevices unavailable")
+    return items
+  end
+
+  local ok, devices = pcall(function() return C4:GetDevices({}) end)
+  if not ok or type(devices) ~= "table" then
+    C4Driver.update_property_list(C4MiniApps.native_driver_property, items)
+    Log.error("native Apple TV driver list refresh failed: " .. tostring(devices))
+    return items
+  end
+
+  local rows = {}
+  for key, info in pairs(devices) do
+    local device_id = tonumber(C4MiniApps.device_info_value(info, "id", "deviceId", "idDevice") or key)
+    if device_id then
+      local name = C4MiniApps.device_display_name(device_id, info, info)
+      if C4MiniApps.is_native_apple_tv_candidate(device_id, info, name) then
+        rows[#rows + 1] = {
+          id = device_id,
+          name = name,
+          driver_file = C4MiniApps.device_driver_filename(info),
+        }
+      end
+    end
+  end
+
+  table.sort(rows, function(a, b)
+    return tostring(a.name):lower() < tostring(b.name):lower()
+  end)
+
+  for _, row in ipairs(rows) do
+    items[#items + 1] = C4MiniApps.native_driver_row(row.id, row.name)
+    Log.debug("native Apple TV driver candidate: id=" .. tostring(row.id) ..
+      " name=" .. tostring(row.name) ..
+      " driver=" .. tostring(row.driver_file))
+  end
+
+  C4Driver.update_property_list(C4MiniApps.native_driver_property, items)
+  local selected = Properties and Properties[C4MiniApps.native_driver_property] or ""
+  local selected_ok = selected == "" or selected == C4MiniApps.native_driver_not_selected
+  for _, item in ipairs(items) do
+    if selected == item then
+      selected_ok = true
+      break
+    end
+  end
+  if not selected_ok then
+    C4Driver.update_property(C4MiniApps.native_driver_property, C4MiniApps.native_driver_not_selected)
+    Log.debug("native Apple TV driver selection reset; previous value no longer valid: " .. tostring(selected))
+  end
+  Log.debug("native Apple TV driver list refreshed: count=" .. tostring(#items - 1))
+  return items
+end
+
+function C4MiniApps.select_native_apple_tv_after_launch(app_proxy_id)
+  if not (has_c4() and C4.SendToDevice) then
+    return false
+  end
+
+  local selected = Properties and Properties[C4MiniApps.native_driver_property] or ""
+  local native_device_id = C4MiniApps.parse_native_driver_selection(selected)
+  if not native_device_id then
+    Log.debug("mini app native handoff skipped: no native Apple TV driver selected")
+    return false
+  end
+  local selectable_device_id = C4MiniApps.resolve_selectable_device_id(native_device_id)
+
+  local function reselect()
+    local matched = false
+    for room_id, device_id in pairs(C4MiniApps.room_sources or {}) do
+      if device_id == app_proxy_id then
+        matched = true
+        Log.debug("mini app native handoff selecting device " .. tostring(selectable_device_id) ..
+          " in room " .. tostring(room_id) ..
+          " nativeDriver=" .. tostring(native_device_id))
+        C4:SendToDevice(room_id, "SELECT_VIDEO_DEVICE", {
+          deviceid = selectable_device_id,
+          DEVICE_ID = selectable_device_id,
+        })
+        C4MiniApps.verify_room_selection(room_id, selectable_device_id, "native handoff")
+      end
+    end
+    if not matched then
+      Log.debug("mini app native handoff found no room selected on app proxy " .. tostring(app_proxy_id))
+    end
+  end
+
+  if has_c4() and type(SetTimer) == "function" then
+    SetTimer(C4MiniApps.native_handoff_timer, C4MiniApps.native_handoff_delay_ms, reselect)
+  else
+    reselect()
+  end
+  return true
+end
+
+function C4MiniApps.resolve_selectable_device_id(driver_device_id)
+  if has_c4() and C4.GetBoundConsumerDevices then
+    local ok, consumers = pcall(function()
+      return C4:GetBoundConsumerDevices(driver_device_id, C4MiniApps.PASSTHROUGH_PROXY)
+    end)
+    if ok then
+      local proxy_device_id = next(consumers or {})
+      if proxy_device_id then
+        Log.debug("native Apple TV driver proxy resolved: driver=" ..
+          tostring(driver_device_id) .. " proxy=" .. tostring(proxy_device_id))
+        return tonumber(proxy_device_id) or proxy_device_id
+      end
+    else
+      Log.debug("native Apple TV driver proxy lookup failed: driver=" ..
+        tostring(driver_device_id) .. " err=" .. tostring(consumers))
+    end
+  end
+  return driver_device_id
+end
+
+function C4MiniApps.verify_room_selection(room_id, expected_device_id, reason)
+  if not (has_c4() and C4.GetDeviceVariable) then
+    return
+  end
+
+  local function verify()
+    local ok, value = pcall(function()
+      return C4:GetDeviceVariable(room_id, 1000)
+    end)
+    local selected = ok and tonumber(value) or nil
+    if selected == tonumber(expected_device_id) then
+      Log.debug("mini app " .. tostring(reason or "handoff") ..
+        " verified: room=" .. tostring(room_id) ..
+        " selected=" .. tostring(selected))
+    else
+      Log.error("mini app " .. tostring(reason or "handoff") ..
+        " did not select expected device: room=" .. tostring(room_id) ..
+        " expected=" .. tostring(expected_device_id) ..
+        " actual=" .. tostring(value))
+    end
+  end
+
+  if has_c4() and type(SetTimer) == "function" then
+    SetTimer("AppleTV_verify_handoff_" .. tostring(room_id),
+      C4MiniApps.handoff_verify_delay_ms, verify)
+  else
+    verify()
+  end
+end
+
+function C4MiniApps.after_launch_selection(app_proxy_id)
+  if (Properties and Properties[C4MiniApps.after_launch_property] or C4MiniApps.after_launch_return) == C4MiniApps.after_launch_native then
+    if C4MiniApps.select_native_apple_tv_after_launch(app_proxy_id) then
+      return
+    end
+  end
+  C4MiniApps.reselect_passthrough_if_needed(app_proxy_id)
+end
+
 function C4MiniApps.is_startup_launch_window()
   local client = Companion.client
   if not client then
@@ -5981,7 +6214,7 @@ function C4MiniApps.launch_service(service, app_proxy_id, options)
   local launch_id = C4MiniApps.resolve_launch_id(service)
   if launch_id then
     if C4MiniApps.is_duplicate_launch(launch_id) then
-      C4MiniApps.reselect_passthrough_if_needed(app_proxy_id)
+      C4MiniApps.after_launch_selection(app_proxy_id)
       return nil
     end
     if C4MiniApps.pending_launch_retry_id and C4MiniApps.pending_launch_retry_id ~= launch_id then
@@ -5992,7 +6225,7 @@ function C4MiniApps.launch_service(service, app_proxy_id, options)
     if not options.retry then
       C4MiniApps.request_launch_retry(launch_id)
     end
-    C4MiniApps.reselect_passthrough_if_needed(app_proxy_id)
+    C4MiniApps.after_launch_selection(app_proxy_id)
     return request, frame
   end
   if C4MiniApps.queue_retry(service, app_proxy_id) then
@@ -6097,9 +6330,6 @@ function C4MiniApps.register_rooms()
 end
 
 function C4MiniApps.reselect_passthrough_if_needed(app_proxy_id)
-  if (Properties and (Properties["Passthrough Mode"] or "On") == "On") then
-    return
-  end
   if not (has_c4() and C4.GetBoundConsumerDevices and C4.SendToDevice) then
     return
   end
@@ -6114,12 +6344,14 @@ function C4MiniApps.reselect_passthrough_if_needed(app_proxy_id)
       if device_id == app_proxy_id then
         C4:SendToDevice(room_id, "SELECT_VIDEO_DEVICE", {
           deviceid = passthrough_proxy_device_id,
+          DEVICE_ID = passthrough_proxy_device_id,
         })
+        C4MiniApps.verify_room_selection(room_id, passthrough_proxy_device_id, "return to this driver")
       end
     end
   end
 
-  if has_c4() then
+  if has_c4() and type(SetTimer) == "function" then
     SetTimer("AppleTV_reselect_passthrough", 500, reselect)
   else
     reselect()
@@ -8439,6 +8671,7 @@ function C4Driver.cancel_driver_timers()
   C4Driver.cancel_timer("AppleTV_crypto_prewarm_atv")
   C4Driver.cancel_timer("AppleTV_crypto_prewarm_x25519")
   C4Driver.cancel_timer("AppleTV_reselect_passthrough")
+  C4Driver.cancel_timer(C4MiniApps.native_handoff_timer)
   C4Driver.cancel_timer("AppleTV_mdns_timeout")
   C4Driver.cancel_timer("AppleTV_tv_rc_session_start_timeout")
   C4Driver.cancel_timer("AppleTV_companion_watchdog")
@@ -8458,6 +8691,9 @@ EC.REFRESH_APP_LIST = function()
 end
 EC.PRINT_APP_LIST = function()
   return C4Driver.print_app_list()
+end
+EC.REFRESH_NATIVE_APPLE_TV_DRIVERS = function()
+  return C4MiniApps.refresh_native_apple_tv_drivers()
 end
 EC.LAUNCH_SELECTED_APP = function()
   return C4Driver.launch_selected_app()
@@ -8506,6 +8742,7 @@ function C4Driver.init()
   C4Driver.update_property("Pairing PIN", "")
   C4Driver.set_crypto_prewarm_status("Idle")
   C4Driver.publish_app_list()
+  C4MiniApps.refresh_native_apple_tv_drivers()
   C4Driver.load_persisted_credentials()
   C4Driver.load_persisted_airplay_credentials()
   Log.debug("driver init " .. Driver.VERSION)
@@ -8567,6 +8804,7 @@ end
 -- OSE: System event dispatch (DCP parses the event name automatically)
 OSE.OnPIP = function()
   C4MiniApps.register_rooms()
+  C4MiniApps.refresh_native_apple_tv_drivers()
 end
 
 -- RFP: Proxy command dispatch — route all proxy bindings to handle_proxy_command
