@@ -5732,6 +5732,7 @@ C4MiniApps = {
   native_handoff_timer = "AppleTV_native_driver_handoff",
   native_handoff_delay_ms = 750,
   handoff_verify_delay_ms = 1000,
+  active_handoff_timers = {},
   after_launch_property = "After Mini App Launch",
   native_driver_property = "Native Apple TV Driver",
   after_launch_return = "Return To This Driver",
@@ -5944,6 +5945,15 @@ function C4MiniApps.device_info_value(info, ...)
   return nil
 end
 
+function C4MiniApps.same_device_id(left, right)
+  local left_num = tonumber(left)
+  local right_num = tonumber(right)
+  if left_num and right_num then
+    return left_num == right_num
+  end
+  return tostring(left) == tostring(right)
+end
+
 function C4MiniApps.device_display_name(device_id, info, fallback)
   local name = C4MiniApps.device_info_value(info, "name", "deviceName", "displayName", "device_display_name")
   if name then
@@ -5963,6 +5973,12 @@ function C4MiniApps.device_driver_filename(info)
     "driverFileName", "driver_filename", "driverFilename", "filename", "fileName", "c4i", "driver") or "")
 end
 
+function C4MiniApps.normalized_driver_filename(filename)
+  local text = tostring(filename or ""):gsub("\\", "/")
+  local basename = text:match("([^/]+)$") or text
+  return basename:lower()
+end
+
 function C4MiniApps.is_native_apple_tv_candidate(device_id, info, name)
   local own_id = has_c4() and C4.GetDeviceID and tonumber(C4:GetDeviceID()) or nil
   if own_id and tonumber(device_id) == own_id then
@@ -5970,7 +5986,7 @@ function C4MiniApps.is_native_apple_tv_candidate(device_id, info, name)
   end
 
   local driver_file = C4MiniApps.device_driver_filename(info)
-  local driver_lower = driver_file:lower()
+  local driver_lower = C4MiniApps.normalized_driver_filename(driver_file)
   if driver_lower == "" then
     if tostring(name or ""):lower():find("apple", 1, true) then
       Log.debug("native Apple TV candidate skipped: no driver filename id=" ..
@@ -6046,6 +6062,10 @@ function C4MiniApps.select_native_apple_tv_after_launch(app_proxy_id)
   if not (has_c4() and C4.SendToDevice) then
     return false
   end
+  if not app_proxy_id then
+    Log.debug("mini app native handoff skipped: no app proxy id")
+    return false
+  end
 
   local selected = Properties and Properties[C4MiniApps.native_driver_property] or ""
   local native_device_id = C4MiniApps.parse_native_driver_selection(selected)
@@ -6054,31 +6074,43 @@ function C4MiniApps.select_native_apple_tv_after_launch(app_proxy_id)
     return false
   end
   local selectable_device_id = C4MiniApps.resolve_selectable_device_id(native_device_id)
+  local matched_rooms = {}
 
-  local function reselect()
-    local matched = false
-    for room_id, device_id in pairs(C4MiniApps.room_sources or {}) do
-      if device_id == app_proxy_id then
-        matched = true
-        Log.debug("mini app native handoff selecting device " .. tostring(selectable_device_id) ..
-          " in room " .. tostring(room_id) ..
-          " nativeDriver=" .. tostring(native_device_id))
-        C4:SendToDevice(room_id, "SELECT_VIDEO_DEVICE", {
-          deviceid = selectable_device_id,
-          DEVICE_ID = selectable_device_id,
-        })
-        C4MiniApps.verify_room_selection(room_id, selectable_device_id, "native handoff")
-      end
-    end
-    if not matched then
-      Log.debug("mini app native handoff found no room selected on app proxy " .. tostring(app_proxy_id))
+  for room_id, device_id in pairs(C4MiniApps.room_sources or {}) do
+    if C4MiniApps.same_device_id(device_id, app_proxy_id) then
+      matched_rooms[#matched_rooms + 1] = room_id
     end
   end
+  if #matched_rooms == 0 then
+    Log.debug("mini app native handoff found no room selected on app proxy " .. tostring(app_proxy_id))
+    return false
+  end
 
-  if has_c4() and type(SetTimer) == "function" then
-    SetTimer(C4MiniApps.native_handoff_timer, C4MiniApps.native_handoff_delay_ms, reselect)
-  else
-    reselect()
+  for _, room_id in ipairs(matched_rooms) do
+    local function reselect()
+      C4MiniApps.active_handoff_timers[C4MiniApps.native_handoff_timer .. "_" .. tostring(room_id)] = nil
+      if not C4MiniApps.same_device_id((C4MiniApps.room_sources or {})[room_id], app_proxy_id) then
+        Log.debug("mini app native handoff skipped: room selection changed room=" ..
+          tostring(room_id) .. " appProxy=" .. tostring(app_proxy_id))
+        return
+      end
+      Log.debug("mini app native handoff selecting device " .. tostring(selectable_device_id) ..
+        " in room " .. tostring(room_id) ..
+        " nativeDriver=" .. tostring(native_device_id))
+      C4:SendToDevice(room_id, "SELECT_VIDEO_DEVICE", {
+        deviceid = selectable_device_id,
+        DEVICE_ID = selectable_device_id,
+      })
+      C4MiniApps.verify_room_selection(room_id, selectable_device_id, "native handoff")
+    end
+
+    if has_c4() and type(SetTimer) == "function" then
+      local timer_name = C4MiniApps.native_handoff_timer .. "_" .. tostring(room_id)
+      C4MiniApps.active_handoff_timers[timer_name] = true
+      SetTimer(timer_name, C4MiniApps.native_handoff_delay_ms, reselect)
+    else
+      reselect()
+    end
   end
   return true
 end
@@ -6294,6 +6326,19 @@ function C4MiniApps.resolve_bound_minidriver(input)
   }
 end
 
+function C4MiniApps.resolve_miniapp_service(binding_id, params)
+  local bound = C4MiniApps.resolve_bound_minidriver(binding_id)
+  local configured = C4MiniApps.resolve(binding_id, params)
+  if not configured then
+    return bound
+  end
+  if bound and bound.app_proxy_id then
+    configured.app_proxy_id = configured.app_proxy_id or bound.app_proxy_id
+    configured.app_device_id = configured.app_device_id or bound.app_device_id
+  end
+  return configured
+end
+
 function C4MiniApps.hide_proxy_in_all_rooms(binding_id)
   if not (has_c4() and C4.GetBoundConsumerDevices and C4.GetDevicesByC4iName and C4.SendToDevice) then
     return
@@ -6440,9 +6485,9 @@ function C4MiniApps.handle_proxy_command(binding_id, command, params)
   end
 
   if C4MiniApps.is_binding(binding_id) then
-    local service = C4MiniApps.resolve(binding_id, params)
+    local service = C4MiniApps.resolve_miniapp_service(binding_id, params)
     if service then
-      return C4MiniApps.launch_service(service)
+      return C4MiniApps.launch_service(service, service.app_proxy_id)
     end
     Log.error("mini app selected without a service id on binding " .. tostring(binding_id))
     return nil
@@ -8672,6 +8717,10 @@ function C4Driver.cancel_driver_timers()
   C4Driver.cancel_timer("AppleTV_crypto_prewarm_x25519")
   C4Driver.cancel_timer("AppleTV_reselect_passthrough")
   C4Driver.cancel_timer(C4MiniApps.native_handoff_timer)
+  for timer_name in pairs(C4MiniApps.active_handoff_timers or {}) do
+    C4Driver.cancel_timer(timer_name)
+  end
+  C4MiniApps.active_handoff_timers = {}
   C4Driver.cancel_timer("AppleTV_mdns_timeout")
   C4Driver.cancel_timer("AppleTV_tv_rc_session_start_timeout")
   C4Driver.cancel_timer("AppleTV_companion_watchdog")

@@ -2290,7 +2290,7 @@ function tests.native_apple_tv_driver_list_populates_dropdown()
     GetDevices = function(_, _)
       return {
         [42] = { name = "Custom Apple TV", driverFileName = "control4_apple_tv.c4z" },
-        [1106] = { name = "Apple TV Office", driverFileName = "appleTV.c4z" },
+        [1106] = { name = "Apple TV Office", driverFileName = "/system/drivers/appleTV.c4z" },
         [1107] = { name = "Apple TV Clone", driverFileName = "apple_tv.c4z" },
         [1099] = { name = "Apple TV App Switcher", driverFileName = "control4_apple_tv.c4z" },
         [1109] = { name = "Apple TV Office", driverFileName = "" },
@@ -2387,6 +2387,155 @@ function tests.native_handoff_selects_native_driver_after_mini_app_launch()
   Properties = old_properties
   SetTimer = old_set_timer
   Driver.C4MiniApps.room_sources = old_room_sources
+end
+
+function tests.native_handoff_returns_false_when_no_room_matches_app_proxy()
+  local old_c4 = C4
+  local old_properties = Properties
+  local old_room_sources = Driver.C4MiniApps.room_sources
+  local selections = {}
+  Properties = {
+    ["Native Apple TV Driver"] = "Apple TV Office [1106]",
+  }
+  Driver.C4MiniApps.room_sources = {
+    [260] = 1234,
+  }
+  C4 = {
+    GetBoundConsumerDevices = function(_, _, binding_id)
+      if binding_id == 5001 then
+        return { [1110] = "Apple TV Office Proxy" }
+      end
+      return {}
+    end,
+    SendToDevice = function(_, room_id, command, params)
+      selections[#selections + 1] = { room_id = room_id, command = command, params = params }
+    end,
+  }
+
+  local selected = Driver.C4MiniApps.select_native_apple_tv_after_launch(9102)
+
+  assert_eq(selected, false, "native handoff not scheduled without selected room")
+  assert_eq(#selections, 0, "native handoff sends no selection without matched room")
+  C4 = old_c4
+  Properties = old_properties
+  Driver.C4MiniApps.room_sources = old_room_sources
+end
+
+function tests.native_handoff_uses_room_scoped_timers()
+  local old_c4 = C4
+  local old_properties = Properties
+  local old_set_timer = SetTimer
+  local old_room_sources = Driver.C4MiniApps.room_sources
+  local old_timers = Driver.C4MiniApps.active_handoff_timers
+  local timers = {}
+  Properties = {
+    ["Native Apple TV Driver"] = "Apple TV Office [1106]",
+  }
+  Driver.C4MiniApps.room_sources = {
+    [260] = 9102,
+    [261] = 9102,
+  }
+  Driver.C4MiniApps.active_handoff_timers = {}
+  C4 = {
+    GetBoundConsumerDevices = function(_, _, binding_id)
+      if binding_id == 5001 then
+        return { [1110] = "Apple TV Office Proxy" }
+      end
+      return {}
+    end,
+    SendToDevice = function() end,
+  }
+  SetTimer = function(timer_name, _, _)
+    timers[#timers + 1] = timer_name
+  end
+
+  local selected = Driver.C4MiniApps.select_native_apple_tv_after_launch(9102)
+
+  assert_eq(selected, true, "native handoff scheduled")
+  assert_contains(timers, "AppleTV_native_driver_handoff_260", "room 260 handoff timer")
+  assert_contains(timers, "AppleTV_native_driver_handoff_261", "room 261 handoff timer")
+  assert(Driver.C4MiniApps.active_handoff_timers["AppleTV_native_driver_handoff_260"], "room 260 timer tracked")
+  assert(Driver.C4MiniApps.active_handoff_timers["AppleTV_native_driver_handoff_261"], "room 261 timer tracked")
+  C4 = old_c4
+  Properties = old_properties
+  SetTimer = old_set_timer
+  Driver.C4MiniApps.room_sources = old_room_sources
+  Driver.C4MiniApps.active_handoff_timers = old_timers
+end
+
+function tests.direct_mini_app_binding_hands_off_to_native_driver()
+  local old_c4 = C4
+  local old_properties = Properties
+  local old_set_timer = SetTimer
+  local old_room_sources = Driver.C4MiniApps.room_sources
+  local old_last_launch_id = Driver.C4MiniApps.last_launch_id
+  local old_last_launch_at_ms = Driver.C4MiniApps.last_launch_at_ms
+  local selections = {}
+  Properties = {
+    ["After Mini App Launch"] = "Select Native Apple TV Driver",
+    ["Native Apple TV Driver"] = "Apple TV Office [1106]",
+  }
+  Driver.C4MiniApps.room_sources = {
+    [260] = 9101,
+  }
+  Driver.C4MiniApps.last_launch_id = nil
+  Driver.C4MiniApps.last_launch_at_ms = nil
+  Driver.Companion.sent_messages = {}
+  Driver.C4MiniApps.register_binding(3101, {
+    name = "Netflix",
+    service_id = "com.netflix.Netflix",
+  })
+  C4 = {
+    GetDeviceID = function()
+      return 42
+    end,
+    GetBoundConsumerDevices = function(_, device_id, binding_id)
+      if device_id == 42 and binding_id == 5002 then
+        return { [9001] = "App Switcher" }
+      end
+      if device_id == 1106 and binding_id == 5001 then
+        return { [1110] = "Apple TV Office Proxy" }
+      end
+      return {}
+    end,
+    GetBoundProviderDevice = function(_, device_id, binding_id)
+      if device_id == 9001 and binding_id == 3101 then
+        return 9101
+      end
+      if device_id == 9101 and binding_id == 5001 then
+        return 9201
+      end
+      return nil
+    end,
+    GetDeviceVariables = function(_, _)
+      return {}
+    end,
+    SendToDevice = function(_, room_id, command, params)
+      selections[#selections + 1] = {
+        room_id = room_id,
+        command = command,
+        deviceid = params.deviceid,
+        DEVICE_ID = params.DEVICE_ID,
+      }
+    end,
+  }
+  SetTimer = nil
+
+  ReceivedFromProxy(3101, "SELECT", {})
+
+  local last = Driver.Companion.sent_messages[#Driver.Companion.sent_messages]
+  assert_table_has(last, "_i", "_launchApp")
+  assert_table_has(last._c, "_bundleID", "com.netflix.Netflix")
+  assert_eq(#selections, 1, "direct binding native handoff selection count")
+  assert_eq(selections[1].deviceid, 1110, "direct binding native handoff target")
+  assert_eq(selections[1].DEVICE_ID, 1110, "direct binding native handoff uppercase target")
+  C4 = old_c4
+  Properties = old_properties
+  SetTimer = old_set_timer
+  Driver.C4MiniApps.room_sources = old_room_sources
+  Driver.C4MiniApps.last_launch_id = old_last_launch_id
+  Driver.C4MiniApps.last_launch_at_ms = old_last_launch_at_ms
+  Driver.C4MiniApps.bindings[3101] = nil
 end
 
 function tests.after_mini_app_launch_native_selects_native_driver()
