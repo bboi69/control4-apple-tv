@@ -1099,6 +1099,23 @@ function tests.hap_session_encrypts_with_length_aad_and_padded_counter_nonce()
   assert_eq(Driver.Bytes.hex(calls[2].nonce), "000000000000000000000000", "HAP first decrypt nonce")
 end
 
+function tests.hap_session_encrypted_buffer_is_bounded()
+  local old_max = Driver.HAPSession.MAX_ENCRYPTED_BUFFER_BYTES
+  Driver.HAPSession.MAX_ENCRYPTED_BUFFER_BYTES = 4
+  local session = Driver.HAPSession.new("write-key", "read-key", {
+    decrypt = function() return "" end,
+  })
+
+  local ok, err = pcall(function()
+    session:decrypt(string.rep("x", 5))
+  end)
+
+  Driver.HAPSession.MAX_ENCRYPTED_BUFFER_BYTES = old_max
+  assert_eq(ok, false, "oversized HAP encrypted buffer rejected")
+  assert(tostring(err):find("HAP encrypted buffer", 1, true), "HAP buffer error labels source")
+  assert_eq(session.encrypted_buffer, "", "oversized HAP encrypted buffer cleared")
+end
+
 function tests.airplay_control_client_pair_verifies_then_gets_encrypted_info()
   local credentials = Driver.Credentials.parse(table.concat({
     Driver.Bytes.hex(bytes_range(0, 31)),
@@ -1554,6 +1571,79 @@ function tests.queued_command_reconnects_from_error_state_once()
   assert_eq(#client.pending_commands, 2, "commands queued while reconnecting")
 end
 
+function tests.queued_command_queue_is_bounded()
+  local old_max = Driver.Companion.pending_commands_max
+  Driver.Companion.pending_commands_max = 3
+  local client = Driver.CompanionClient.new({
+    credentials = Driver.Credentials.parse(table.concat({
+      Driver.Bytes.hex(string.rep("\x01", 32)),
+      Driver.Bytes.hex(string.rep("\x02", 32)),
+      Driver.Bytes.hex("ATV-ID"),
+      Driver.Bytes.hex("CLIENT-ID"),
+    }, ":")),
+    transport = { Write = function() end },
+  })
+  client.connecting = true
+  client.connect = function() end
+
+  for i = 1, 5 do
+    client:send_or_queue_opack("_launchApp", { _bundleID = "app" .. tostring(i) }, 2)
+  end
+
+  Driver.Companion.pending_commands_max = old_max
+  assert_eq(#client.pending_commands, 3, "pending Companion commands capped")
+  assert_eq(client.pending_commands[1].content._bundleID, "app3", "oldest queued command dropped")
+  assert_eq(client.pending_commands[3].content._bundleID, "app5", "newest queued command retained")
+end
+
+function tests.companion_receive_buffer_is_bounded()
+  local old_max = Driver.Companion.receive_buffer_max
+  Driver.Companion.receive_buffer_max = 8
+  local client = Driver.CompanionClient.new({})
+
+  local ok, err = pcall(function()
+    client:receive(string.rep("x", 9))
+  end)
+
+  Driver.Companion.receive_buffer_max = old_max
+  assert_eq(ok, false, "oversized Companion receive buffer rejected")
+  assert(tostring(err):find("Companion receive buffer", 1, true), "Companion buffer error labels source")
+  assert_eq(client.buffer, "", "oversized Companion receive buffer cleared")
+end
+
+function tests.companion_dispose_clears_heavy_state_and_callbacks()
+  local close_called = false
+  local client = Driver.CompanionClient.new({
+    credentials = { ltpk = "ltpk" },
+    crypto = {},
+    host = "192.0.2.10",
+    port = 49153,
+    transport = { close = function() close_called = true end },
+    on_state = function() end,
+    on_message = function() end,
+    on_paired = function() end,
+    on_pair_setup_m2 = function() end,
+    on_connection_refused = function() end,
+  })
+  client.pending_commands = { { identifier = "_launchApp" } }
+  client.pending_responses = { [1] = { on_response = function() end } }
+  client.verifier = {}
+  client.pair_setup = {}
+
+  client:dispose()
+
+  assert_eq(close_called, true, "dispose closes Companion transport")
+  assert_eq(client.credentials, nil, "dispose clears Companion credentials")
+  assert_eq(client.crypto, nil, "dispose clears Companion crypto")
+  assert_eq(client.host, nil, "dispose clears Companion host")
+  assert_eq(#client.pending_commands, 0, "dispose clears queued commands")
+  assert_eq(next(client.pending_responses), nil, "dispose clears pending responses")
+  assert_eq(client.on_state, nil, "dispose clears state callback")
+  assert_eq(client.on_message, nil, "dispose clears message callback")
+  assert_eq(client.verifier, nil, "dispose clears pair verifier")
+  assert_eq(client.pair_setup, nil, "dispose clears pair setup")
+end
+
 function tests.companion_reconnect_state_code_ignores_detail_suffix()
   local client = Driver.CompanionClient.new({})
   client.state = "DISCONNECTED: network down"
@@ -1900,6 +1990,54 @@ function tests.airplay_control_connect_is_guarded_while_pending()
   assert_eq(writes, 1, "Pair-Verify start written once")
 
   C4 = old_c4
+end
+
+function tests.airplay_control_close_releases_nested_channels_and_callbacks()
+  local event_closed = false
+  local data_closed = false
+  local transport_closed = false
+  local client = Driver.AirPlayControlClient.new({
+    credentials = { type = "HAP" },
+    crypto = {},
+    on_info = function() end,
+    on_tunnel_setup = function() end,
+    on_activity = function() end,
+    on_error = function() end,
+    on_disconnect = function() end,
+    on_state = function() end,
+  })
+  client.event_channel = { close = function() event_closed = true end }
+  client.data_channel = { close = function() data_closed = true end }
+  client.transport = { close = function() transport_closed = true end }
+  client.raw_buffer = "raw"
+  client.http_buffer = "http"
+  client.verifier = {}
+  client.session = { encrypted_buffer = "ciphertext" }
+  client.connected = true
+  client.rtsp_session_id = "session"
+  client.data_seed = "seed"
+  client.pending_control_keys = { output_key = "out", input_key = "in" }
+
+  client:close()
+
+  assert_eq(event_closed, true, "AirPlay close closes event channel")
+  assert_eq(data_closed, true, "AirPlay close closes data channel")
+  assert_eq(transport_closed, true, "AirPlay close closes transport")
+  assert_eq(client.event_channel, nil, "AirPlay close clears event channel")
+  assert_eq(client.data_channel, nil, "AirPlay close clears data channel")
+  assert_eq(client.transport, nil, "AirPlay close clears transport")
+  assert_eq(client.raw_buffer, "", "AirPlay close clears raw buffer")
+  assert_eq(client.http_buffer, "", "AirPlay close clears HTTP buffer")
+  assert_eq(client.verifier, nil, "AirPlay close clears verifier")
+  assert_eq(client.session, nil, "AirPlay close clears session")
+  assert_eq(client.connected, false, "AirPlay close clears connected flag")
+  assert_eq(client.rtsp_session_id, nil, "AirPlay close clears RTSP session")
+  assert_eq(client.data_seed, nil, "AirPlay close clears data seed")
+  assert_eq(client.pending_control_keys, nil, "AirPlay close clears pending control keys")
+  assert_eq(client.on_error, nil, "AirPlay close clears error callback")
+  assert_eq(client.on_disconnect, nil, "AirPlay close clears disconnect callback")
+  assert_eq(client.credentials, nil, "AirPlay close clears credentials")
+  assert_eq(client.crypto, nil, "AirPlay close clears crypto")
 end
 
 function tests.crypto_prewarm_schedule_is_manual_only()

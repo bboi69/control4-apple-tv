@@ -4114,9 +4114,19 @@ function CompanionSession:try_decode(buffer)
   }, buffer:sub(frame_end + 1)
 end
 
+local function enforce_buffer_limit(owner, field, max_bytes, label)
+  local value = owner[field] or ""
+  if max_bytes and max_bytes > 0 and #value > max_bytes then
+    owner[field] = ""
+    error(tostring(label or field) .. " exceeded " .. tostring(max_bytes) .. " bytes")
+  end
+  return value
+end
+
 local HAPSession = {}
 HAPSession.FRAME_LENGTH = 1024
 HAPSession.AUTH_TAG_LENGTH = 16
+HAPSession.MAX_ENCRYPTED_BUFFER_BYTES = 65536
 
 function HAPSession.new(output_key, input_key, crypto)
   return setmetatable({
@@ -4151,6 +4161,7 @@ end
 function HAPSession:decrypt(data)
   assert(type(data) == "string", "HAP ciphertext must be a string")
   self.encrypted_buffer = self.encrypted_buffer .. data
+  enforce_buffer_limit(self, "encrypted_buffer", HAPSession.MAX_ENCRYPTED_BUFFER_BYTES, "HAP encrypted buffer")
   local out = {}
 
   while #self.encrypted_buffer >= 2 do
@@ -4177,6 +4188,8 @@ local Companion = {
   tx = 0,
   sent_messages = {},
   sent_messages_max = 100,
+  pending_commands_max = 50,
+  receive_buffer_max = 65536,
   watchdog_interval_ms = 60000,
   watchdog_stale_ms = 90000,
   credentials = nil,
@@ -4214,6 +4227,7 @@ local AirPlay = {
   monitor_retry_ms = 15000,
   monitor_heartbeat_ms = 30000,
   monitor_stale_ms = 90000,
+  receive_buffer_max = 65536,
   monitor_last_activity_ms = nil,
 }
 
@@ -5044,8 +5058,14 @@ end
 
 function CompanionClient:clear_runtime_state(options)
   options = options or {}
+  if self.tv_rc_session_xid and C4Driver and C4Driver.cancel_timer then
+    C4Driver.cancel_timer("AppleTV_tv_rc_session_start_timeout")
+  end
   self.connecting = false
   self.connected = false
+  self.verifier = nil
+  self.pair_setup = nil
+  self.pending_pair_setup = false
   self.pending_pair_verify_keys = nil
   self.session = nil
   self.session_local_sid = nil
@@ -5140,6 +5160,22 @@ function CompanionClient:close(options)
     clear_pending_commands = options.clear_pending_commands ~= false,
   })
   self:set_state("DISCONNECTED")
+end
+
+function CompanionClient:dispose(options)
+  self:close(options)
+  self.credentials = nil
+  self.crypto = nil
+  self.host = nil
+  self.port = nil
+  self.transport = nil
+  self.pending_commands = {}
+  self.pending_responses = {}
+  self.on_state = nil
+  self.on_message = nil
+  self.on_paired = nil
+  self.on_pair_setup_m2 = nil
+  self.on_connection_refused = nil
 end
 
 function CompanionClient:connect(host, port)
@@ -5403,6 +5439,7 @@ end
 function CompanionClient:receive(data)
   self:mark_rx()
   self.buffer = self.buffer .. (data or "")
+  enforce_buffer_limit(self, "buffer", Companion.receive_buffer_max, "Companion receive buffer")
   Log.debug("Companion receive buffered: buffer_len=" .. tostring(#self.buffer) ..
     " encrypted_session=" .. tostring(self.session ~= nil))
   while true do
@@ -5609,6 +5646,7 @@ function CompanionClient:needs_reconnect()
 end
 
 function CompanionClient:queue_pending_command(item)
+  self.pending_commands = self.pending_commands or {}
   if item.identifier == "_hidC" and type(item.content) == "table" then
     local hid_command = item.content._hidC
     local hid_state = item.content._hBtS
@@ -5633,6 +5671,12 @@ function CompanionClient:queue_pending_command(item)
     end
   end
   self.pending_commands[#self.pending_commands + 1] = item
+  local max = tonumber(Companion.pending_commands_max) or 0
+  while max > 0 and #self.pending_commands > max do
+    local dropped = table.remove(self.pending_commands, 1)
+    Log.debug("dropped queued Companion request due to queue cap: " ..
+      tostring(dropped and dropped.identifier or "unknown"))
+  end
 end
 
 function CompanionClient:send_or_queue_opack(identifier, content, message_type, options)
@@ -7070,13 +7114,17 @@ function AirPlayDataChannelClient:connect()
       Log.debug("AirPlay data channel TCP disconnected: code=" .. tostring(err_code) ..
         " message=" .. tostring(err_msg))
       self.transport = nil
-      if not self.closed and self.on_error then self.on_error(err_msg or err_code or "disconnect") end
+      local on_error = self.on_error
+      if not self.closed and on_error then on_error(err_msg or err_code or "disconnect") end
+      if not self.closed then self:release_runtime_state(true) end
     end)
     :OnError(function(_, err_code, err_msg)
       Log.error("AirPlay data channel TCP error: code=" .. tostring(err_code) ..
         " message=" .. tostring(err_msg))
       self.transport = nil
-      if self.on_error then self.on_error(err_msg or err_code) end
+      local on_error = self.on_error
+      if on_error then on_error(err_msg or err_code) end
+      self:release_runtime_state(true)
     end)
     :Connect(self.host, self.port)
   self.transport = client
@@ -7156,6 +7204,7 @@ function AirPlayDataChannelClient:receive(data)
   local plaintext = self.session:decrypt(data)
   if plaintext == "" then return end
   self.buffer = self.buffer .. plaintext
+  enforce_buffer_limit(self, "buffer", AirPlay.receive_buffer_max, "AirPlay data channel buffer")
 
   while #self.buffer >= DATA_HEADER_LENGTH do
     local size = Bytes.read_uint_be(self.buffer, 1, 4)
@@ -7212,6 +7261,23 @@ function AirPlayDataChannelClient:handle_payload(message_type, seqno, payload)
   end
 end
 
+function AirPlayDataChannelClient:release_runtime_state(clear_callbacks)
+  self.buffer = ""
+  if self.session then
+    self.session.encrypted_buffer = ""
+  end
+  self.session = nil
+  self.transport = nil
+  self.startup_stage = "closed"
+  if clear_callbacks then
+    self.on_connected = nil
+    self.on_activity = nil
+    self.on_error = nil
+    self.crypto = nil
+    self.client_id = nil
+  end
+end
+
 function AirPlayDataChannelClient:close()
   self.closed = true
   if self.transport and self.transport.Close then
@@ -7219,7 +7285,7 @@ function AirPlayDataChannelClient:close()
   elseif self.transport and self.transport.close then
     self.transport:close()
   end
-  self.transport = nil
+  self:release_runtime_state(true)
 end
 
 function AirPlayEventChannelClient.new(options)
@@ -7272,14 +7338,18 @@ function AirPlayEventChannelClient:connect()
       Log.debug("AirPlay event channel TCP disconnected: code=" .. tostring(err_code) ..
         " message=" .. tostring(err_msg))
       self.transport = nil
-      if not self.closed and self.on_error then self.on_error(err_msg or err_code) end
+      local on_error = self.on_error
+      if not self.closed and on_error then on_error(err_msg or err_code) end
+      if not self.closed then self:release_runtime_state(true) end
     end)
     :OnError(function(_, err_code, err_msg)
       if self.closed then return end
       Log.error("AirPlay event channel TCP error: code=" .. tostring(err_code) ..
         " message=" .. tostring(err_msg))
       self.transport = nil
-      if self.on_error then self.on_error(err_msg or err_code) end
+      local on_error = self.on_error
+      if on_error then on_error(err_msg or err_code) end
+      self:release_runtime_state(true)
     end)
     :Connect(self.host, self.port)
   self.transport = client
@@ -7303,6 +7373,7 @@ function AirPlayEventChannelClient:receive(data)
   local plaintext = self.session:decrypt(data)
   if plaintext == "" then return end
   self.buffer = self.buffer .. plaintext
+  enforce_buffer_limit(self, "buffer", AirPlay.receive_buffer_max, "AirPlay event channel buffer")
 
   while true do
     local request, rest = AirPlayHTTP.try_parse_request(self.buffer)
@@ -7319,6 +7390,19 @@ function AirPlayEventChannelClient:receive(data)
   end
 end
 
+function AirPlayEventChannelClient:release_runtime_state(clear_callbacks)
+  self.buffer = ""
+  if self.session then
+    self.session.encrypted_buffer = ""
+  end
+  self.session = nil
+  self.transport = nil
+  if clear_callbacks then
+    self.on_connected = nil
+    self.on_error = nil
+  end
+end
+
 function AirPlayEventChannelClient:close()
   self.closed = true
   if self.transport and self.transport.Close then
@@ -7326,7 +7410,7 @@ function AirPlayEventChannelClient:close()
   elseif self.transport and self.transport.close then
     self.transport:close()
   end
-  self.transport = nil
+  self:release_runtime_state(true)
 end
 
 function AirPlayControlClient.new(options)
@@ -7578,7 +7662,9 @@ function AirPlayControlClient:connect(host, port)
       self.connecting = false
       self.connected = false
       self:set_state("DISCONNECTED")
-      if not self.closed and self.on_disconnect then self.on_disconnect(err_msg or err_code) end
+      local on_disconnect = self.on_disconnect
+      if not self.closed and on_disconnect then on_disconnect(err_msg or err_code) end
+      if not self.closed then self:release_runtime_state(false) end
     end)
     :OnError(function(_, err_code, err_msg)
       if self.closed then return end
@@ -7588,15 +7674,16 @@ function AirPlayControlClient:connect(host, port)
       self.connecting = false
       self.connected = false
       self:set_state("ERROR: " .. tostring(err_code) .. " " .. tostring(err_msg))
-      if self.on_error then self.on_error(err_msg or err_code) end
+      local on_error = self.on_error
+      if on_error then on_error(err_msg or err_code) end
+      self:close()
     end)
     :Connect(self.host, self.port)
   self.transport = client
   return self
 end
 
-function AirPlayControlClient:close()
-  self.closed = true
+function AirPlayControlClient:release_runtime_state(clear_callbacks)
   if self.event_channel and self.event_channel.close then
     self.event_channel:close()
   end
@@ -7605,14 +7692,43 @@ function AirPlayControlClient:close()
     self.data_channel:close()
   end
   self.data_channel = nil
+  self.raw_buffer = ""
+  self.http_buffer = ""
+  self.verifier = nil
+  if self.session then
+    self.session.encrypted_buffer = ""
+  end
+  self.session = nil
+  self.transport = nil
+  self.connecting = false
+  self.connected = false
+  self.rtsp_session_id = nil
+  self.rtsp_dacp_id = nil
+  self.rtsp_active_remote = nil
+  self.event_port = nil
+  self.data_port = nil
+  self.data_seed = nil
+  self.pending_control_keys = nil
+  if clear_callbacks then
+    self.on_info = nil
+    self.on_tunnel_setup = nil
+    self.on_activity = nil
+    self.on_error = nil
+    self.on_disconnect = nil
+    self.on_state = nil
+    self.credentials = nil
+    self.crypto = nil
+  end
+end
+
+function AirPlayControlClient:close()
+  self.closed = true
   if self.transport and self.transport.Close then
     self.transport:Close()
   elseif self.transport and self.transport.close then
     self.transport:close()
   end
-  self.transport = nil
-  self.connecting = false
-  self.connected = false
+  self:release_runtime_state(true)
 end
 
 function AirPlayControlClient:on_connected(transport)
@@ -7633,12 +7749,14 @@ function AirPlayControlClient:receive(data)
     local plaintext = self.session:decrypt(data)
     if plaintext ~= "" then
       self.http_buffer = self.http_buffer .. plaintext
+      enforce_buffer_limit(self, "http_buffer", AirPlay.receive_buffer_max, "AirPlay control HTTP buffer")
       self:process_http_buffer(true)
     end
     return
   end
 
   self.raw_buffer = self.raw_buffer .. data
+  enforce_buffer_limit(self, "raw_buffer", AirPlay.receive_buffer_max, "AirPlay control raw buffer")
   self:process_http_buffer(false)
 end
 
@@ -8293,6 +8411,16 @@ function C4Driver.import_airplay_credentials(detail_string)
   return credentials
 end
 
+function C4Driver.dispose_companion_client(client)
+  client = client or Companion.client
+  if not client then return end
+  if client.dispose then
+    client:dispose()
+  elseif client.close then
+    client:close()
+  end
+end
+
 function C4Driver.load_persisted_airplay_credentials()
   local raw = Driver.state and Driver.state.airplay_credentials
   if not raw or raw == "" then
@@ -8326,9 +8454,7 @@ function C4Driver.import_credentials(detail_string)
   local credentials = Credentials.parse(detail_string)
   local canonical = Credentials.stringify(credentials)
 
-  if Companion.client and Companion.client.close then
-    Companion.client:close()
-  end
+  C4Driver.dispose_companion_client(Companion.client)
   Driver.state = Driver.state or {}
   Driver.state.companion_credentials = canonical
   Companion.credentials = credentials
@@ -8363,9 +8489,7 @@ function C4Driver.reset_pairing()
   C4Driver.cancel_timer("AppleTV_crypto_prewarm_x25519")
   C4Driver.cancel_timer("AppleTV_companion_watchdog")
   OpenSSLCrypto._pregenerated_x25519_keypair = nil
-  if Companion.client and Companion.client.close then
-    Companion.client:close()
-  end
+  C4Driver.dispose_companion_client(Companion.client)
   Driver.state = Driver.state or {}
   Driver.state.companion_credentials = nil
   Driver.state.airplay_credentials = nil
@@ -8409,9 +8533,7 @@ function C4Driver.disconnect_companion()
   C4Driver.cancel_timer("AppleTV_companion_watchdog")
   MDNS.close()
   OpenSSLCrypto._pregenerated_x25519_keypair = nil
-  if Companion.client and Companion.client.close then
-    Companion.client:close()
-  end
+  C4Driver.dispose_companion_client(Companion.client)
   C4Driver.stop_airplay_monitor("disconnect")
   Companion.client = nil
   C4Driver.set_connection_state("Disconnected")
@@ -8509,9 +8631,7 @@ end
 function C4Driver.build_companion_client(host, options)
   options = options or {}
   local label = options.label or "Companion"
-  if Companion.client and Companion.client.close then
-    Companion.client:close()
-  end
+  C4Driver.dispose_companion_client(Companion.client)
   local client = CompanionClient.new({
     host = host,
     port = MDNS.cached_port(host),
@@ -8809,9 +8929,7 @@ end
 function C4Driver.destroy()
   C4Driver.cancel_driver_timers()
   OpenSSLCrypto._pregenerated_x25519_keypair = nil
-  if Companion.client and Companion.client.close then
-    Companion.client:close()
-  end
+  C4Driver.dispose_companion_client(Companion.client)
   Companion.client = nil
   C4Driver.close_airplay_control_client("driver destroy")
   AirPlay.monitor_enabled = false
