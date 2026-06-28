@@ -40,7 +40,7 @@ Halo push-to-talk is handled by Control4's native Apple TV voice path. This driv
 {\pntext\f0 2.\tab}Set After Mini App Launch to Select Native Apple TV Driver.\par
 {\pntext\f0 3.\tab}Set Native Apple TV Driver to the native appleTV.c4z driver for the same room/Apple TV.\par
 {\pntext\f0 4.\tab}Keep the native Apple TV source in the room's Watch menu.\par
-{\pntext\f0 5.\tab}Select a MiniApp. The driver launches the app, then selects the native Apple TV proxy so Halo voice uses the native voice path.\par
+{\pntext\f0 5.\tab}Select a MiniApp. The driver launches the app, then selects the native Apple TV source so Halo voice uses the native voice path.\par
 \pard\par
 \b Normal Use\b0\par
 \pard{\pntext\f0 -\tab}{\*\pn\pnlvlblt\pnf0\pnindent360}\fi-360\li720 Commands automatically connect if the driver is disconnected. The first command after a driver reload may take about a second while Pair-Verify and startup complete; later commands should be immediate while the session remains active.\par
@@ -101,8 +101,8 @@ If an app does not launch, run Refresh App List again and check the Lua logs. Th
 \pard\par
 \b Expected Handoff Logs\b0\par
 \pard{\pntext\f0 -\tab}{\*\pn\pnlvlblt\pnf0\pnindent360}\fi-360\li720 native Apple TV driver proxy resolved: driver=<native-driver-id> proxy=<native-proxy-id>\par
-{\pntext\f0 -\tab}mini app native handoff selecting device <native-proxy-id> in room <room-id>\par
-{\pntext\f0 -\tab}mini app native handoff verified: room=<room-id> selected=<native-proxy-id>\par
+{\pntext\f0 -\tab}mini app native handoff selecting device <native-driver-id> in room <room-id> nativeProxy=<native-proxy-id>\par
+{\pntext\f0 -\tab}mini app native handoff verified: room=<room-id> selected=<native-driver-id>\par
 \pard\par
 \b Notes\b0\par
 Leave Debug Mode off for normal use. Turn it on only while pairing, troubleshooting, or validating after an Apple TV software update.\par

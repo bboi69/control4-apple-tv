@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.41-dev",
+  VERSION = "0.1.42-dev",
 }
 
 local function has_c4()
@@ -6117,7 +6117,8 @@ function C4MiniApps.select_native_apple_tv_after_launch(app_proxy_id)
     Log.debug("mini app native handoff skipped: no native Apple TV driver selected")
     return false
   end
-  local selectable_device_id = C4MiniApps.resolve_selectable_device_id(native_device_id)
+  local proxy_device_id = C4MiniApps.resolve_selectable_device_id(native_device_id)
+  local passthrough_proxy_device_id = C4MiniApps.resolve_own_passthrough_device_id()
   local matched_rooms = {}
 
   for room_id, device_id in pairs(C4MiniApps.room_sources or {}) do
@@ -6133,19 +6134,23 @@ function C4MiniApps.select_native_apple_tv_after_launch(app_proxy_id)
   for _, room_id in ipairs(matched_rooms) do
     local function reselect()
       C4MiniApps.active_handoff_timers[C4MiniApps.native_handoff_timer .. "_" .. tostring(room_id)] = nil
-      if not C4MiniApps.same_device_id((C4MiniApps.room_sources or {})[room_id], app_proxy_id) then
+      local current_source = (C4MiniApps.room_sources or {})[room_id]
+      local source_still_relevant = C4MiniApps.same_device_id(current_source, app_proxy_id) or
+        (passthrough_proxy_device_id and C4MiniApps.same_device_id(current_source, passthrough_proxy_device_id))
+      if not source_still_relevant then
         Log.debug("mini app native handoff skipped: room selection changed room=" ..
-          tostring(room_id) .. " appProxy=" .. tostring(app_proxy_id))
+          tostring(room_id) .. " appProxy=" .. tostring(app_proxy_id) ..
+          " current=" .. tostring(current_source))
         return
       end
-      Log.debug("mini app native handoff selecting device " .. tostring(selectable_device_id) ..
+      Log.debug("mini app native handoff selecting device " .. tostring(native_device_id) ..
         " in room " .. tostring(room_id) ..
-        " nativeDriver=" .. tostring(native_device_id))
+        " nativeProxy=" .. tostring(proxy_device_id))
       C4:SendToDevice(room_id, "SELECT_VIDEO_DEVICE", {
-        deviceid = selectable_device_id,
-        DEVICE_ID = selectable_device_id,
+        deviceid = native_device_id,
+        DEVICE_ID = native_device_id,
       })
-      C4MiniApps.verify_room_selection(room_id, selectable_device_id, "native handoff")
+      C4MiniApps.verify_native_handoff(room_id, native_device_id, proxy_device_id)
     end
 
     if has_c4() and type(SetTimer) == "function" then
@@ -6157,6 +6162,21 @@ function C4MiniApps.select_native_apple_tv_after_launch(app_proxy_id)
     end
   end
   return true
+end
+
+function C4MiniApps.resolve_own_passthrough_device_id()
+  if has_c4() and C4.GetBoundConsumerDevices and C4.GetDeviceID then
+    local ok, consumers = pcall(function()
+      return C4:GetBoundConsumerDevices(C4:GetDeviceID(), C4MiniApps.PASSTHROUGH_PROXY)
+    end)
+    if ok then
+      local proxy_device_id = next(consumers or {})
+      if proxy_device_id then
+        return tonumber(proxy_device_id) or proxy_device_id
+      end
+    end
+  end
+  return nil
 end
 
 function C4MiniApps.resolve_selectable_device_id(driver_device_id)
@@ -6177,6 +6197,56 @@ function C4MiniApps.resolve_selectable_device_id(driver_device_id)
     end
   end
   return driver_device_id
+end
+
+function C4MiniApps.verify_native_handoff(room_id, native_device_id, proxy_device_id)
+  if not (has_c4() and C4.GetDeviceVariable) then
+    return
+  end
+
+  local function verify()
+    local ok, value = pcall(function()
+      return C4:GetDeviceVariable(room_id, 1000)
+    end)
+    local selected = ok and tonumber(value) or nil
+    if C4MiniApps.same_device_id(selected, native_device_id) then
+      Log.debug("mini app native handoff verified: room=" .. tostring(room_id) ..
+        " selected=" .. tostring(selected))
+      return
+    end
+    if proxy_device_id and C4MiniApps.same_device_id(selected, proxy_device_id) then
+      Log.debug("mini app native handoff verified via proxy: room=" .. tostring(room_id) ..
+        " selected=" .. tostring(selected) ..
+        " nativeDriver=" .. tostring(native_device_id))
+      return
+    end
+    if proxy_device_id and not C4MiniApps.same_device_id(proxy_device_id, native_device_id)
+        and has_c4() and C4.SendToDevice
+    then
+      Log.debug("mini app native handoff falling back to proxy " .. tostring(proxy_device_id) ..
+        " in room " .. tostring(room_id) ..
+        " nativeDriver=" .. tostring(native_device_id) ..
+        " current=" .. tostring(value))
+      C4:SendToDevice(room_id, "SELECT_VIDEO_DEVICE", {
+        deviceid = proxy_device_id,
+        DEVICE_ID = proxy_device_id,
+      })
+      C4MiniApps.verify_room_selection(room_id, proxy_device_id, "native handoff proxy fallback")
+      return
+    end
+    Log.error("mini app native handoff did not select expected device: room=" ..
+      tostring(room_id) ..
+      " expected=" .. tostring(native_device_id) ..
+      " proxy=" .. tostring(proxy_device_id) ..
+      " actual=" .. tostring(value))
+  end
+
+  if has_c4() and type(SetTimer) == "function" then
+    SetTimer("AppleTV_verify_native_handoff_" .. tostring(room_id),
+      C4MiniApps.handoff_verify_delay_ms, verify)
+  else
+    verify()
+  end
 end
 
 function C4MiniApps.verify_room_selection(room_id, expected_device_id, reason)
@@ -6423,7 +6493,7 @@ function C4MiniApps.reselect_passthrough_if_needed(app_proxy_id)
     return
   end
 
-  local passthrough_proxy_device_id = next(C4:GetBoundConsumerDevices(C4:GetDeviceID(), C4MiniApps.PASSTHROUGH_PROXY) or {})
+  local passthrough_proxy_device_id = C4MiniApps.resolve_own_passthrough_device_id()
   if not passthrough_proxy_device_id then
     return
   end

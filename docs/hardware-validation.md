@@ -100,8 +100,8 @@ Expected logs:
 
 ```text
 native Apple TV driver proxy resolved: driver=<native-driver-id> proxy=<native-proxy-id>
-mini app native handoff selecting device <native-proxy-id> in room <room-id>
-mini app native handoff verified: room=<room-id> selected=<native-proxy-id>
+mini app native handoff selecting device <native-driver-id> in room <room-id> nativeProxy=<native-proxy-id>
+mini app native handoff verified: room=<room-id> selected=<native-driver-id>
 ```
 
 After the verified handoff, Halo push-to-talk should use the native Apple TV

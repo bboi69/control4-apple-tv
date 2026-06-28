@@ -2519,8 +2519,8 @@ function tests.native_handoff_selects_native_driver_after_mini_app_launch()
   assert_eq(#selections, 1, "native handoff selection count")
   assert_eq(selections[1].room_id, 260, "native handoff room")
   assert_eq(selections[1].command, "SELECT_VIDEO_DEVICE", "native handoff command")
-  assert_eq(selections[1].deviceid, 1110, "native handoff selects media proxy")
-  assert_eq(selections[1].DEVICE_ID, 1110, "native handoff uppercase media proxy")
+  assert_eq(selections[1].deviceid, 1106, "native handoff selects native driver")
+  assert_eq(selections[1].DEVICE_ID, 1106, "native handoff uppercase native driver")
   C4 = old_c4
   Properties = old_properties
   SetTimer = old_set_timer
@@ -2601,6 +2601,130 @@ function tests.native_handoff_uses_room_scoped_timers()
   Driver.C4MiniApps.active_handoff_timers = old_timers
 end
 
+function tests.native_handoff_allows_passthrough_intermediate_selection()
+  local old_c4 = C4
+  local old_properties = Properties
+  local old_set_timer = SetTimer
+  local old_room_sources = Driver.C4MiniApps.room_sources
+  local old_timers = Driver.C4MiniApps.active_handoff_timers
+  local scheduled
+  local selections = {}
+  Properties = {
+    ["Native Apple TV Driver"] = "Apple TV Office [1106]",
+  }
+  Driver.C4MiniApps.room_sources = {
+    [260] = 9102,
+  }
+  Driver.C4MiniApps.active_handoff_timers = {}
+  C4 = {
+    GetDeviceID = function()
+      return 42
+    end,
+    GetBoundConsumerDevices = function(_, device_id, binding_id)
+      if device_id == 42 and binding_id == 5001 then
+        return { [50010] = "Custom Apple TV Proxy" }
+      end
+      if device_id == 1106 and binding_id == 5001 then
+        return { [1110] = "Apple TV Office Proxy" }
+      end
+      return {}
+    end,
+    SendToDevice = function(_, room_id, command, params)
+      selections[#selections + 1] = {
+        room_id = room_id,
+        command = command,
+        deviceid = params.deviceid,
+        DEVICE_ID = params.DEVICE_ID,
+      }
+    end,
+  }
+  SetTimer = function(timer_name, _, callback)
+    scheduled = { name = timer_name, callback = callback }
+  end
+
+  local selected = Driver.C4MiniApps.select_native_apple_tv_after_launch(9102)
+  Driver.C4MiniApps.room_sources[260] = 50010
+  scheduled.callback()
+
+  assert_eq(selected, true, "native handoff scheduled")
+  assert_eq(scheduled.name, "AppleTV_native_driver_handoff_260", "native handoff timer")
+  assert_eq(#selections, 1, "native handoff selection count")
+  assert_eq(selections[1].deviceid, 1106, "native handoff target")
+  assert_eq(selections[1].DEVICE_ID, 1106, "native handoff uppercase target")
+  C4 = old_c4
+  Properties = old_properties
+  SetTimer = old_set_timer
+  Driver.C4MiniApps.room_sources = old_room_sources
+  Driver.C4MiniApps.active_handoff_timers = old_timers
+end
+
+function tests.native_handoff_falls_back_to_proxy_when_driver_id_does_not_select()
+  local old_c4 = C4
+  local old_properties = Properties
+  local old_set_timer = SetTimer
+  local old_room_sources = Driver.C4MiniApps.room_sources
+  local old_timers = Driver.C4MiniApps.active_handoff_timers
+  local timers = {}
+  local selections = {}
+  local current_selected = 9102
+  Properties = {
+    ["Native Apple TV Driver"] = "Apple TV Office [1106]",
+  }
+  Driver.C4MiniApps.room_sources = {
+    [260] = 9102,
+  }
+  Driver.C4MiniApps.active_handoff_timers = {}
+  C4 = {
+    GetDeviceID = function()
+      return 42
+    end,
+    GetBoundConsumerDevices = function(_, device_id, binding_id)
+      if device_id == 42 and binding_id == 5001 then
+        return { [50010] = "Custom Apple TV Proxy" }
+      end
+      if device_id == 1106 and binding_id == 5001 then
+        return { [1110] = "Apple TV Office Proxy" }
+      end
+      return {}
+    end,
+    GetDeviceVariable = function(_, room_id, variable_id)
+      assert_eq(room_id, 260, "room id")
+      assert_eq(variable_id, 1000, "selected device variable")
+      return current_selected
+    end,
+    SendToDevice = function(_, room_id, command, params)
+      selections[#selections + 1] = {
+        room_id = room_id,
+        command = command,
+        deviceid = params.deviceid,
+        DEVICE_ID = params.DEVICE_ID,
+      }
+      if params.deviceid == 1110 then
+        current_selected = 1110
+      end
+    end,
+  }
+  SetTimer = function(timer_name, _, callback)
+    timers[timer_name] = callback
+  end
+
+  local selected = Driver.C4MiniApps.select_native_apple_tv_after_launch(9102)
+  timers["AppleTV_native_driver_handoff_260"]()
+  current_selected = 50010
+  timers["AppleTV_verify_native_handoff_260"]()
+
+  assert_eq(selected, true, "native handoff scheduled")
+  assert_eq(#selections, 2, "native handoff plus proxy fallback")
+  assert_eq(selections[1].deviceid, 1106, "first tries native driver")
+  assert_eq(selections[2].deviceid, 1110, "fallback selects native proxy")
+  assert_eq(selections[2].DEVICE_ID, 1110, "fallback uppercase native proxy")
+  C4 = old_c4
+  Properties = old_properties
+  SetTimer = old_set_timer
+  Driver.C4MiniApps.room_sources = old_room_sources
+  Driver.C4MiniApps.active_handoff_timers = old_timers
+end
+
 function tests.direct_mini_app_binding_hands_off_to_native_driver()
   local old_c4 = C4
   local old_properties = Properties
@@ -2665,8 +2789,8 @@ function tests.direct_mini_app_binding_hands_off_to_native_driver()
   assert_table_has(last, "_i", "_launchApp")
   assert_table_has(last._c, "_bundleID", "com.netflix.Netflix")
   assert_eq(#selections, 1, "direct binding native handoff selection count")
-  assert_eq(selections[1].deviceid, 1110, "direct binding native handoff target")
-  assert_eq(selections[1].DEVICE_ID, 1110, "direct binding native handoff uppercase target")
+  assert_eq(selections[1].deviceid, 1106, "direct binding native handoff target")
+  assert_eq(selections[1].DEVICE_ID, 1106, "direct binding native handoff uppercase target")
   C4 = old_c4
   Properties = old_properties
   SetTimer = old_set_timer
@@ -2713,8 +2837,8 @@ function tests.after_mini_app_launch_native_selects_native_driver()
   Driver.C4MiniApps.after_launch_selection(9102)
 
   assert_eq(#selections, 1, "native handoff selection count")
-  assert_eq(selections[1].deviceid, 1110, "native handoff proxy target wins")
-  assert_eq(selections[1].DEVICE_ID, 1110, "native handoff uppercase proxy target wins")
+  assert_eq(selections[1].deviceid, 1106, "native handoff target")
+  assert_eq(selections[1].DEVICE_ID, 1106, "native handoff uppercase target")
   C4 = old_c4
   Properties = old_properties
   SetTimer = old_set_timer
