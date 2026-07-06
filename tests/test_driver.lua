@@ -470,6 +470,83 @@ function tests.pyatv_hap_credentials_roundtrip()
   assert_eq(Driver.Credentials.stringify(credentials), original, "credential string")
 end
 
+function tests.hap_pairing_errors_include_stage_code_and_backoff()
+  local payload = Driver.TLV8.encode_ordered({
+    { 6, string.char(0x04) },
+    { 7, string.char(0x03) },
+    { 8, string.char(0x0a) },
+  })
+  local ok, err = pcall(Driver.PairVerify.decode_hap_response, payload, "AirPlay Pair-Setup M4")
+  assert_eq(ok, false, "HAP error response rejected")
+  assert(tostring(err):find("AirPlay Pair-Setup M4 error 3 (BackOff)", 1, true), "named HAP error")
+  assert(tostring(err):find("state=M4", 1, true), "HAP error state")
+  assert(tostring(err):find("backoff=10s", 1, true), "HAP error backoff")
+end
+
+function tests.companion_pairing_errors_include_stage_and_code()
+  local payload = Driver.OPACK.encode(Driver.OPACK.dict({
+    { "_pd", Driver.OPACK.bytes(Driver.TLV8.encode_ordered({
+      { 6, string.char(0x04) },
+      { 7, string.char(0x02) },
+    })) },
+  }))
+  local ok, err = pcall(Driver.PairVerify.decode_pairing_data, payload, "Companion Pair-Setup M4")
+  assert_eq(ok, false, "Companion HAP error response rejected")
+  assert(tostring(err):find("Companion Pair-Setup M4 error 2 (Authentication)", 1, true),
+    "named Companion HAP error")
+end
+
+function tests.pairing_pin_routes_only_to_selected_protocol()
+  local old_target = Driver.C4Driver.pairing_target
+  local old_airplay_active = Driver.AirPlay.pairing_active
+  local old_airplay_setup = Driver.AirPlay.pair_setup
+  local old_companion_client = Driver.Companion.client
+  local airplay_calls = 0
+  local companion_pin
+
+  Driver.AirPlay.pairing_active = true
+  Driver.AirPlay.pair_setup = {
+    state = "M2_RECEIVED",
+    compute_m3_hap = function()
+      airplay_calls = airplay_calls + 1
+      return "unused"
+    end,
+  }
+  Driver.Companion.client = {
+    state = "PAIR_SETUP_AWAITING_PIN",
+    pair_setup_submit_pin = function(_, pin) companion_pin = pin end,
+  }
+  Driver.C4Driver.pairing_target = "companion"
+
+  OPC.Pairing_PIN("7061")
+  assert_eq(companion_pin, "7061", "PIN routed to Companion")
+  assert_eq(airplay_calls, 0, "stale AirPlay pairing did not capture Companion PIN")
+
+  Driver.C4Driver.pairing_target = old_target
+  Driver.AirPlay.pairing_active = old_airplay_active
+  Driver.AirPlay.pair_setup = old_airplay_setup
+  Driver.Companion.client = old_companion_client
+end
+
+function tests.starting_companion_pairing_cancels_airplay_pairing()
+  local old_target = Driver.C4Driver.pairing_target
+  local old_airplay_active = Driver.AirPlay.pairing_active
+  local old_airplay_setup = Driver.AirPlay.pair_setup
+
+  Driver.C4Driver.pairing_target = "airplay"
+  Driver.AirPlay.pairing_active = true
+  Driver.AirPlay.pair_setup = { state = "M2_RECEIVED" }
+  Driver.C4Driver.begin_pairing("companion")
+
+  assert_eq(Driver.C4Driver.pairing_target, "companion", "Companion owns pairing PIN")
+  assert_eq(Driver.AirPlay.pairing_active, false, "AirPlay pairing cancelled")
+  assert_eq(Driver.AirPlay.pair_setup, nil, "AirPlay setup cleared")
+
+  Driver.C4Driver.pairing_target = old_target
+  Driver.AirPlay.pairing_active = old_airplay_active
+  Driver.AirPlay.pair_setup = old_airplay_setup
+end
+
 function tests.pair_verify_frames_match_pyatv_source_vectors()
   local public_key = bytes_range(0, 31)
   assert_eq(
@@ -3903,6 +3980,15 @@ function tests.opack_object_references_decode()
   local decoded = Driver.OPACK.decode(encoded)
   assert_eq(decoded._pd, "_pd", "short object reference")
   assert_eq(decoded.copy, "_pd", "second object reference")
+end
+
+function tests.opack_duplicate_literals_do_not_shift_object_references()
+  local encoded = "\xd4" .. "\x41a" .. "\x41a" .. "\x41b" .. "\xa1"
+  local decoded = Driver.OPACK.decode(encoded)
+  assert_eq(decoded[1], "a", "first literal")
+  assert_eq(decoded[2], "a", "duplicate literal")
+  assert_eq(decoded[3], "b", "second unique literal")
+  assert_eq(decoded[4], "b", "reference indexes unique object table")
 end
 
 function tests.opack_uuid_nil_and_endless_dict_decode()

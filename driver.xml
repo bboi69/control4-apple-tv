@@ -701,8 +701,8 @@
                 <command>PAIR_COMPANION</command>
             </action>
             <action>
-                <name>Pair AirPlay</name>
-                <command>PAIR_AIRPLAY</command>
+                <name>Retry AirPlay Credential Sharing</name>
+                <command>TRY_SHARED_AIRPLAY_CREDENTIALS</command>
             </action>
             <action>
                 <name>Prewarm Crypto</name>

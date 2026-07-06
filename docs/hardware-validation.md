@@ -38,8 +38,9 @@ Expected result:
 
 ## 4. AirPlay Pairing
 
-Run `Pair AirPlay`. When the Apple TV shows a PIN or the driver prompts for one,
-enter it in `Pairing PIN`.
+`Pair Apple TV` automatically verifies the resulting credentials with AirPlay after
+Companion pairing completes. Confirm the connection state reaches
+`Shared AirPlay Credentials Accepted`.
 
 AirPlay pairing powers the metadata monitor for Current App and Now Playing.
 

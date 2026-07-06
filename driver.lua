@@ -438,6 +438,18 @@ function Bytes.read_u16le(data, offset)
   return b1 + b2 * 0x100
 end
 
+function Bytes.read_uint_le(data, offset, length)
+  offset = offset or 1
+  length = length or (#data - offset + 1)
+  local value = 0
+  for i = length - 1, 0, -1 do
+    local b = data:byte(offset + i)
+    assert(b, "not enough bytes for little-endian uint")
+    value = value * 0x100 + b
+  end
+  return value
+end
+
 function Bytes.read_uint_be(data, offset, length)
   offset = offset or 1
   local value = 0
@@ -800,6 +812,22 @@ local function decode_float64_le(data, index)
   return decode_ieee754(sign, exponent, fraction, 11, 52, 1023)
 end
 
+local function opack_values_equal(a, b)
+  if type(a) ~= type(b) then return false end
+  if type(a) ~= "table" then return a == b end
+  if a.__opack_type == "bytes" and b.__opack_type == "bytes" then
+    return a.data == b.data
+  end
+  return a == b
+end
+
+local function opack_store_unique(object_list, value)
+  for _, existing in ipairs(object_list) do
+    if opack_values_equal(existing, value) then return end
+  end
+  object_list[#object_list + 1] = value
+end
+
 local function opack_decode_at(data, index, object_list)
   object_list = object_list or {}
   local marker = data:byte(index)
@@ -823,7 +851,7 @@ local function opack_decode_at(data, index, object_list)
       hex:sub(13, 16) .. "-" ..
       hex:sub(17, 20) .. "-" ..
       hex:sub(21, 32)
-    object_list[#object_list + 1] = uuid
+    opack_store_unique(object_list, uuid)
     return uuid, index + 17
   end
   if marker == 0x06 then
@@ -833,7 +861,7 @@ local function opack_decode_at(data, index, object_list)
       assert(byte, "truncated OPACK absolute time")
       value = value + byte * (0x100 ^ i)
     end
-    object_list[#object_list + 1] = value
+    opack_store_unique(object_list, value)
     return value, index + 9
   end
   if marker >= 0x08 and marker <= 0x2F then
@@ -841,12 +869,12 @@ local function opack_decode_at(data, index, object_list)
   end
   if marker == 0x35 then
     local value = decode_float32_le(data, index + 1)
-    object_list[#object_list + 1] = value
+    opack_store_unique(object_list, value)
     return value, index + 5
   end
   if marker == 0x36 then
     local value = decode_float64_le(data, index + 1)
-    object_list[#object_list + 1] = value
+    opack_store_unique(object_list, value)
     return value, index + 9
   end
   if marker >= 0x30 and marker <= 0x33 then
@@ -857,13 +885,14 @@ local function opack_decode_at(data, index, object_list)
       assert(byte, "truncated OPACK integer")
       value = value + byte * (0x100 ^ i)
     end
+    opack_store_unique(object_list, value)
     return value, index + 1 + length
   end
   if marker >= 0x40 and marker <= 0x60 then
     local length = marker - 0x40
     local value = data:sub(index + 1, index + length)
     assert(#value == length, "truncated OPACK string")
-    if value ~= "" then object_list[#object_list + 1] = value end
+    opack_store_unique(object_list, value)
     return value, index + 1 + length
   end
   if marker > 0x60 and marker <= 0x64 then
@@ -877,7 +906,7 @@ local function opack_decode_at(data, index, object_list)
     local value_start = index + 1 + length_bytes
     local value = data:sub(value_start, value_start + length - 1)
     assert(#value == length, "truncated OPACK string")
-    if value ~= "" then object_list[#object_list + 1] = value end
+    opack_store_unique(object_list, value)
     return value, value_start + length
   end
   if marker >= 0x70 and marker <= 0x90 then
@@ -885,7 +914,7 @@ local function opack_decode_at(data, index, object_list)
     local value = data:sub(index + 1, index + length)
     assert(#value == length, "truncated OPACK bytes")
     local wrapped = OPACK.bytes(value)
-    if #value > 0 then object_list[#object_list + 1] = wrapped end
+    opack_store_unique(object_list, wrapped)
     return wrapped, index + 1 + length
   end
   if marker >= 0x91 and marker <= 0x94 then
@@ -900,7 +929,7 @@ local function opack_decode_at(data, index, object_list)
     local value = data:sub(value_start, value_start + length - 1)
     assert(#value == length, "truncated OPACK bytes")
     local wrapped = OPACK.bytes(value)
-    object_list[#object_list + 1] = wrapped
+    opack_store_unique(object_list, wrapped)
     return wrapped, value_start + length
   end
   if marker >= 0xD0 and marker <= 0xDF then
@@ -3667,7 +3696,35 @@ function PairVerify.encode_hap_next(encrypted_data)
   })
 end
 
-function PairVerify.decode_hap_response(payload)
+local HAP_PAIRING_ERROR_NAMES = {
+  [1] = "Unknown",
+  [2] = "Authentication",
+  [3] = "BackOff",
+  [4] = "MaxPeers",
+  [5] = "MaxTries",
+  [6] = "Unavailable",
+  [7] = "Busy",
+}
+
+local function hap_pairing_error(tlv, context)
+  local raw_error = tlv[7]
+  if not raw_error then return nil end
+  local error_code = Bytes.read_uint_le(raw_error)
+  local error_name = HAP_PAIRING_ERROR_NAMES[error_code] or "Unknown"
+  local parts = {
+    tostring(context or "AirPlay Pair-Verify") .. " error " .. tostring(error_code) ..
+      " (" .. error_name .. ")",
+  }
+  if tlv[6] then
+    parts[#parts + 1] = "state=M" .. tostring(Bytes.read_uint_le(tlv[6]))
+  end
+  if tlv[8] then
+    parts[#parts + 1] = "backoff=" .. tostring(Bytes.read_uint_le(tlv[8])) .. "s"
+  end
+  return table.concat(parts, ", ")
+end
+
+function PairVerify.decode_hap_response(payload, context)
   local ok, tlv_or_err = pcall(TLV8.decode, payload)
   if not ok then
     Log.error("AirPlay Pair-Verify TLV decode failed: len=" .. tostring(#(payload or "")) ..
@@ -3675,11 +3732,12 @@ function PairVerify.decode_hap_response(payload)
     error(tlv_or_err, 2)
   end
   local tlv = tlv_or_err
-  assert(not tlv[7], "Apple TV returned AirPlay Pair-Verify error")
+  local pairing_error = hap_pairing_error(tlv, context)
+  assert(not pairing_error, "Apple TV returned " .. tostring(pairing_error))
   return tlv
 end
 
-function PairVerify.decode_pairing_data(payload)
+function PairVerify.decode_pairing_data(payload, context)
   local message = OPACK.decode(payload)
   assert(type(message) == "table" and message._pd and message._pd.__opack_type == "bytes", "no pairing data in Companion auth message")
   local ok, tlv_or_err = pcall(TLV8.decode, message._pd.data)
@@ -3690,7 +3748,8 @@ function PairVerify.decode_pairing_data(payload)
     error(tlv_or_err, 2)
   end
   local tlv = tlv_or_err
-  assert(not tlv[7], "Apple TV returned pairing error")
+  local pairing_error = hap_pairing_error(tlv, context or "Companion pairing")
+  assert(not pairing_error, "Apple TV returned " .. tostring(pairing_error))
   return tlv, message
 end
 
@@ -3760,7 +3819,7 @@ function PairVerify:finish(response_frame)
   end
   assert(frame and frame.frame_type == CompanionFrame.PV_NEXT, "expected Pair-Verify next frame")
 
-  local tlv = PairVerify.decode_pairing_data(frame.payload)
+  local tlv = PairVerify.decode_pairing_data(frame.payload, "Companion Pair-Verify M2")
   local server_public_key = tlv[3]
   local encrypted_data = tlv[5]
   assert(server_public_key and encrypted_data, "Pair-Verify response missing public key or encrypted data")
@@ -3847,7 +3906,7 @@ function PairSetup:handle_m2(frame)
   Log.debug("Pair-Setup M2 received: frame_type=" .. CompanionFrame.name(frame.frame_type) ..
     " payload_len=" .. tostring(#(frame.payload or "")))
   assert(self.state == "M1_SENT", "unexpected M2 in state " .. self.state)
-  local tlv = PairVerify.decode_pairing_data(frame.payload)
+  local tlv = PairVerify.decode_pairing_data(frame.payload, "Companion Pair-Setup M2")
   local salt = tlv[2]
   local B_bytes = tlv[3]
   assert(salt and #salt == 16, "SRP salt must be 16 bytes, got " .. tostring(salt and #salt))
@@ -3863,7 +3922,7 @@ end
 function PairSetup:handle_m2_hap(payload)
   Log.debug("AirPlay Pair-Setup M2 received: payload_len=" .. tostring(#(payload or "")))
   assert(self.state == "M1_SENT", "unexpected M2 in state " .. self.state)
-  local tlv = PairVerify.decode_hap_response(payload)
+  local tlv = PairVerify.decode_hap_response(payload, "AirPlay Pair-Setup M2")
   local salt = tlv[2]
   local B_bytes = tlv[3]
   assert(salt and #salt == 16, "SRP salt must be 16 bytes, got " .. tostring(salt and #salt))
@@ -3932,7 +3991,7 @@ function PairSetup:handle_m4(frame)
   Log.debug("Pair-Setup M4 received: frame_type=" .. CompanionFrame.name(frame.frame_type) ..
     " payload_len=" .. tostring(#(frame.payload or "")))
   assert(self.state == "M3_SENT", "unexpected M4 in state " .. self.state)
-  local tlv = PairVerify.decode_pairing_data(frame.payload)
+  local tlv = PairVerify.decode_pairing_data(frame.payload, "Companion Pair-Setup M4")
   local atv_M2 = tlv[4]
   assert(atv_M2 and #atv_M2 == 64, "server M4 proof must be 64 bytes")
   Log.debug("Pair-Setup M4 progress: verifying server proof")
@@ -3947,7 +4006,7 @@ end
 function PairSetup:handle_m4_hap(payload)
   Log.debug("AirPlay Pair-Setup M4 received: payload_len=" .. tostring(#(payload or "")))
   assert(self.state == "M3_SENT", "unexpected M4 in state " .. self.state)
-  local tlv = PairVerify.decode_hap_response(payload)
+  local tlv = PairVerify.decode_hap_response(payload, "AirPlay Pair-Setup M4")
   local atv_M2 = tlv[4]
   assert(atv_M2 and #atv_M2 == 64, "server M4 proof must be 64 bytes")
   Log.debug("AirPlay Pair-Setup M4 progress: verifying server proof")
@@ -4006,7 +4065,7 @@ function PairSetup:handle_m6(frame)
   Log.debug("Pair-Setup M6 received: frame_type=" .. CompanionFrame.name(frame.frame_type) ..
     " payload_len=" .. tostring(#(frame.payload or "")))
   assert(self.state == "M5_SENT", "unexpected M6 in state " .. self.state)
-  local tlv = PairVerify.decode_pairing_data(frame.payload)
+  local tlv = PairVerify.decode_pairing_data(frame.payload, "Companion Pair-Setup M6")
   local encrypted_data = tlv[5]
   assert(encrypted_data, "server M6 encrypted data missing")
   Log.debug("Pair-Setup M6 progress: encrypted_len=" .. tostring(#encrypted_data) .. ", decrypting")
@@ -4034,7 +4093,7 @@ end
 function PairSetup:handle_m6_hap(payload)
   Log.debug("AirPlay Pair-Setup M6 received: payload_len=" .. tostring(#(payload or "")))
   assert(self.state == "M5_SENT", "unexpected M6 in state " .. self.state)
-  local tlv = PairVerify.decode_hap_response(payload)
+  local tlv = PairVerify.decode_hap_response(payload, "AirPlay Pair-Setup M6")
   local encrypted_data = tlv[5]
   assert(encrypted_data, "server M6 encrypted data missing")
   Log.debug("AirPlay Pair-Setup M6 progress: encrypted_len=" .. tostring(#encrypted_data) .. ", decrypting")
@@ -7940,7 +7999,54 @@ function AirPlayControlClient:handle_encrypted_response(response)
     " code=" .. tostring(response.status))
 end
 
-C4Driver = {}
+C4Driver = {
+  pairing_target = nil,
+}
+
+function C4Driver.cancel_airplay_pairing(reason)
+  if AirPlay.pairing_active and reason then
+    Log.debug("AirPlay Pair-Setup cancelled: " .. tostring(reason))
+  end
+  AirPlay.pairing_active = false
+  AirPlay.pair_setup = nil
+  if C4Driver.pairing_target == "airplay" then
+    C4Driver.pairing_target = nil
+  end
+end
+
+function C4Driver.cancel_companion_pairing(reason)
+  local client = Companion.client
+  local state = client and tostring(client.state or "") or ""
+  if client and (state:match("^PAIR_SETUP_") or client.pending_pair_setup) then
+    if reason then
+      Log.debug("Companion Pair-Setup cancelled: " .. tostring(reason))
+    end
+    C4Driver.dispose_companion_client(client)
+    if Companion.client == client then
+      Companion.client = nil
+    end
+  end
+  if C4Driver.pairing_target == "companion" then
+    C4Driver.pairing_target = nil
+  end
+end
+
+function C4Driver.begin_pairing(target)
+  assert(target == "airplay" or target == "companion", "invalid pairing target")
+  if target == "airplay" then
+    C4Driver.cancel_companion_pairing("AirPlay pairing started")
+  else
+    C4Driver.cancel_airplay_pairing("Companion pairing started")
+  end
+  C4Driver.pairing_target = target
+  Log.debug("pairing PIN target set: " .. target)
+end
+
+function C4Driver.finish_pairing(target)
+  if C4Driver.pairing_target == target then
+    C4Driver.pairing_target = nil
+  end
+end
 
 function C4Driver.ensure_crypto_provider()
   if not Crypto.provider then
@@ -8305,6 +8411,7 @@ function C4Driver.pair_airplay()
     return nil, "Apple TV Address is required"
   end
 
+  C4Driver.begin_pairing("airplay")
   C4Driver.update_property("Pairing PIN", "")
   local function start_pairing(port)
     AirPlay.port = port or AirPlay.port or 7000
@@ -8314,6 +8421,7 @@ function C4Driver.pair_airplay()
 
     Log.debug("AirPlay Pair-Setup PIN start requested: port=" .. tostring(AirPlay.port))
     return C4Driver.airplay_post("/pair-pin-start", "", function(_, _, pin_code, _, pin_error)
+      if C4Driver.pairing_target ~= "airplay" then return end
       if pin_error ~= nil then
         Log.error("AirPlay Pair-Setup PIN start failed: " .. tostring(pin_error))
         C4Driver.update_property("Connection State", "AirPlay Pairing Failed")
@@ -8325,6 +8433,7 @@ function C4Driver.pair_airplay()
       local body = AirPlay.pair_setup:start_hap()
       Log.debug("AirPlay Pair-Setup M1 requested: payload_len=" .. tostring(#body))
       C4Driver.airplay_post("/pair-setup", body, function(_, response_body, response_code, response_headers, error_text)
+        if C4Driver.pairing_target ~= "airplay" then return end
         if error_text ~= nil then
           Log.error("AirPlay Pair-Setup M2 failed: " .. tostring(error_text))
           C4Driver.update_property("Connection State", "AirPlay Pairing Failed")
@@ -8378,7 +8487,7 @@ function C4Driver.pair_airplay()
 end
 
 function C4Driver.airplay_pairing_submit_pin(pin)
-  if not AirPlay.pair_setup or not AirPlay.pairing_active then
+  if C4Driver.pairing_target ~= "airplay" or not AirPlay.pair_setup or not AirPlay.pairing_active then
     return nil, "AirPlay pairing is not active"
   end
 
@@ -8393,6 +8502,7 @@ function C4Driver.airplay_pairing_submit_pin(pin)
   local m3_body = m3_body_or_err
   Log.debug("AirPlay Pair-Setup M3 requested: payload_len=" .. tostring(#m3_body))
   return C4Driver.airplay_post("/pair-setup", m3_body, function(_, m4_body, m4_code, _, m4_error)
+    if C4Driver.pairing_target ~= "airplay" then return end
     if m4_error ~= nil then
       Log.error("AirPlay Pair-Setup M4 failed: " .. tostring(m4_error))
       C4Driver.update_property("Connection State", "AirPlay Pairing Failed")
@@ -8411,12 +8521,21 @@ function C4Driver.airplay_pairing_submit_pin(pin)
       return
     end
 
-    local m5_ok, m5_body_or_err = pcall(function()
+    local m4_ok, m4_processing_error = pcall(function()
       AirPlay.pair_setup:handle_m4_hap(m4_body)
+    end)
+    if not m4_ok then
+      Log.error("AirPlay Pair-Setup M4 processing failed: " .. tostring(m4_processing_error))
+      C4Driver.update_property("Connection State", "AirPlay Pairing Failed")
+      AirPlay.pairing_active = false
+      return
+    end
+
+    local m5_ok, m5_body_or_err = pcall(function()
       return AirPlay.pair_setup:compute_m5_hap()
     end)
     if not m5_ok then
-      Log.error("AirPlay Pair-Setup M5 failed: " .. tostring(m5_body_or_err))
+      Log.error("AirPlay Pair-Setup M5 compute failed: " .. tostring(m5_body_or_err))
       C4Driver.update_property("Connection State", "AirPlay Pairing Failed")
       AirPlay.pairing_active = false
       return
@@ -8425,6 +8544,7 @@ function C4Driver.airplay_pairing_submit_pin(pin)
     local m5_body = m5_body_or_err
     Log.debug("AirPlay Pair-Setup M5 requested: payload_len=" .. tostring(#m5_body))
     C4Driver.airplay_post("/pair-setup", m5_body, function(_, m6_body, m6_code, _, m6_error)
+      if C4Driver.pairing_target ~= "airplay" then return end
       if m6_error ~= nil then
         Log.error("AirPlay Pair-Setup M6 failed: " .. tostring(m6_error))
         C4Driver.update_property("Connection State", "AirPlay Pairing Failed")
@@ -8458,6 +8578,7 @@ function C4Driver.airplay_pairing_submit_pin(pin)
       Driver.state.airplay_credentials = canonical
       AirPlay.credentials = credentials_or_err
       AirPlay.pairing_active = false
+      C4Driver.finish_pairing("airplay")
       OpenSSLCrypto.prune_ed25519_public_table_cache(credentials_or_err.ltpk)
       Storage.save(Driver.state)
       C4Driver.update_property("Pairing PIN", "")
@@ -8479,6 +8600,71 @@ function C4Driver.import_airplay_credentials(detail_string)
   Storage.save(Driver.state)
   C4Driver.set_connection_state("AirPlay Credentials Imported")
   return credentials
+end
+
+function C4Driver.try_companion_credentials_for_airplay()
+  C4Driver.ensure_pairing_crypto_ready()
+  local host = Properties and Properties["Apple TV Address"]
+  if not host or host == "" then
+    error("Apple TV Address is required")
+  end
+  local credentials = Companion.credentials or C4Driver.load_persisted_credentials()
+  if not credentials or credentials.type ~= "HAP" then
+    error("Pair Apple TV successfully before testing shared AirPlay credentials")
+  end
+
+  local candidate = Credentials.parse(Credentials.stringify(credentials))
+  local completed = false
+  C4Driver.cancel_airplay_pairing("testing Companion credentials for AirPlay")
+  C4Driver.close_airplay_control_client("starting shared credential probe")
+  C4Driver.set_connection_state("Testing Shared AirPlay Credentials")
+
+  local function start_probe(port)
+    AirPlay.port = port or AirPlay.port or 7000
+    local client
+    client = AirPlayControlClient.new({
+      host = host,
+      port = AirPlay.port,
+      credentials = candidate,
+      crypto = Crypto,
+      probe = "info",
+      on_info = function(response)
+        if response.status < 200 or response.status >= 300 then
+          error("AirPlay encrypted /info HTTP " .. tostring(response.status))
+        end
+        completed = true
+        C4Driver.import_airplay_credentials(Credentials.stringify(candidate))
+        C4Driver.set_connection_state("Shared AirPlay Credentials Accepted")
+        Log.debug("Companion credentials accepted by AirPlay Pair-Verify")
+      end,
+      on_error = function(err)
+        if completed then return end
+        Log.error("Companion credentials rejected by AirPlay: " .. tostring(err))
+        C4Driver.set_connection_state("Shared AirPlay Credentials Rejected")
+      end,
+      on_disconnect = function(err)
+        if completed then return end
+        Log.debug("shared AirPlay credential probe disconnected: " .. tostring(err))
+        C4Driver.set_connection_state("Shared AirPlay Credentials Rejected")
+      end,
+    })
+    AirPlay.control_client = client
+    client:connect()
+    return client
+  end
+
+  if AirPlay.port then
+    return start_probe(AirPlay.port)
+  end
+  C4Driver.set_connection_state("Discovering AirPlay for Shared Credentials")
+  return MDNS.discover_airplay_info(host, function(info)
+    if info and info.port then
+      AirPlay.txt = info.txt or {}
+      start_probe(info.port)
+    else
+      C4Driver.set_connection_state("AirPlay Not Found")
+    end
+  end)
 end
 
 function C4Driver.dispose_companion_client(client)
@@ -8560,6 +8746,8 @@ function C4Driver.reset_pairing()
   C4Driver.cancel_timer("AppleTV_companion_watchdog")
   OpenSSLCrypto._pregenerated_x25519_keypair = nil
   C4Driver.dispose_companion_client(Companion.client)
+  C4Driver.cancel_airplay_pairing("pairing reset")
+  C4Driver.pairing_target = nil
   Driver.state = Driver.state or {}
   Driver.state.companion_credentials = nil
   Driver.state.airplay_credentials = nil
@@ -8744,8 +8932,12 @@ function C4Driver.connect_companion()
     Log.error("pair this driver before connecting")
     error("pair this driver before connecting")
   end
-  if Companion.client and not (Companion.client.needs_reconnect and Companion.client:needs_reconnect()) then
-    Log.debug("Companion connect requested while client exists: state=" .. tostring(Companion.client.state))
+  if Companion.client then
+    if Companion.client.needs_reconnect and Companion.client:needs_reconnect() then
+      Companion.client:connect()
+    else
+      Log.debug("Companion connect requested while client exists: state=" .. tostring(Companion.client.state))
+    end
     return Companion.client
   end
 
@@ -8764,6 +8956,7 @@ function C4Driver.pair_companion()
     Log.error("set Apple TV Address before pairing")
     error("Apple TV Address is required for pairing")
   end
+  C4Driver.begin_pairing("companion")
   C4Driver.update_property("Pairing PIN", "")
   local client = C4Driver.build_companion_client(host, {
     label = "Pair-Setup",
@@ -8772,7 +8965,15 @@ function C4Driver.pair_companion()
     end,
     on_paired = function(credentials)
       C4Driver.import_credentials(Credentials.stringify(credentials))
+      C4Driver.finish_pairing("companion")
       Log.debug("Pair-Setup complete, credentials saved")
+      local ok, result_or_err = pcall(C4Driver.try_companion_credentials_for_airplay)
+      if not ok then
+        Log.error("automatic AirPlay credential sharing failed to start: " .. tostring(result_or_err))
+        C4Driver.set_connection_state("Apple TV Paired; AirPlay Setup Failed")
+      elseif result_or_err then
+        Log.debug("automatic AirPlay credential sharing started")
+      end
     end,
   })
   C4Driver.start_companion_client(client, host, "Pair-Setup")
@@ -8958,8 +9159,8 @@ end
 EC.STOP_AIRPLAY_MONITOR = function()
   return C4Driver.stop_airplay_monitor("manual")
 end
-EC.PAIR_AIRPLAY = function()
-  return C4Driver.pair_airplay()
+EC.TRY_SHARED_AIRPLAY_CREDENTIALS = function()
+  return C4Driver.try_companion_credentials_for_airplay()
 end
 EC.IMPORT_COMPANION_CREDENTIALS = function(params)
   return C4Driver.import_credentials(params.CREDENTIALS or params.credentials or "")
@@ -9009,16 +9210,15 @@ end
 -- OPC: Property change dispatch (DCP replaces spaces with underscores in the key)
 OPC.Pairing_PIN = function(value)
   if value and value ~= "" then
-    if AirPlay.pairing_active and AirPlay.pair_setup and AirPlay.pair_setup.state == "M2_RECEIVED" then
-      local ok, err = pcall(function() C4Driver.airplay_pairing_submit_pin(value) end)
-      if not ok then
-        Log.error("AirPlay PIN submission failed: " .. tostring(err))
-      end
-    elseif Companion.client and Companion.client.state == "PAIR_SETUP_AWAITING_PIN" then
+    if C4Driver.pairing_target == "companion" and Companion.client and
+        Companion.client.state == "PAIR_SETUP_AWAITING_PIN"
+    then
       local ok, err = pcall(function() Companion.client:pair_setup_submit_pin(value) end)
       if not ok then
         Log.error("PIN submission failed: " .. tostring(err))
       end
+    else
+      Log.error("Pairing PIN ignored: no matching active pairing target")
     end
   end
 end

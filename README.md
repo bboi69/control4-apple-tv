@@ -51,13 +51,13 @@ After native voice works, install and configure this driver:
 
 1. Add this driver to the project and set `Apple TV Address`.
 2. Run `Pair Apple TV`, enter the PIN in `Pairing PIN`, and wait for pairing to complete.
-3. Run `Pair AirPlay`, enter the AirPlay PIN when prompted, and wait for completion.
-4. Run `Prewarm Crypto` and wait for `Crypto Prewarm Status` to show `Complete`.
-5. Run `Connect Apple TV`; the expected connected state is `SESSION_ACTIVE`.
-6. Run `Refresh App List`.
-7. Run `Refresh Native Apple TV Drivers`.
-8. Set `After Mini App Launch = Select Native Apple TV Driver`.
-9. Set `Native Apple TV Driver` to the native `appleTV.c4z` driver for the same room/Apple TV.
+   The driver then verifies and saves the same credentials for AirPlay automatically.
+3. Run `Prewarm Crypto` and wait for `Crypto Prewarm Status` to show `Complete`.
+4. Run `Connect Apple TV`; the expected connected state is `SESSION_ACTIVE`.
+5. Run `Refresh App List`.
+6. Run `Refresh Native Apple TV Drivers`.
+7. Set `After Mini App Launch = Select Native Apple TV Driver`.
+8. Set `Native Apple TV Driver` to the native `appleTV.c4z` driver for the same room/Apple TV.
 
 Keep the native Apple TV source in the room's Watch menu. If it is removed,
 Halo may report that the room is not voice-capable after handoff.
@@ -88,8 +88,10 @@ and Prime Video are also aliased.
 
 ## Composer Actions
 
-- `Pair Apple TV`: pairs Companion remote control, app list, and app launch support.
-- `Pair AirPlay`: pairs the metadata monitor used for Current App and Now Playing.
+- `Pair Apple TV`: pairs Companion control, then automatically verifies and saves the
+  same credentials for the AirPlay metadata monitor.
+- `Retry AirPlay Credential Sharing`: retries AirPlay verification with already-saved
+  Apple TV credentials without repeating Companion pairing.
 - `Prewarm Crypto`: prepares cached crypto data after pairing so reconnects are faster.
 - `Connect Apple TV`: opens the connection, performs Pair-Verify, starts the Companion session, and subscribes to status events.
 - `Disconnect Apple TV`: closes the active Companion connection.
