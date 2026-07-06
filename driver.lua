@@ -3885,22 +3885,6 @@ function PairSetup:start()
   return CompanionFrame.encode(CompanionFrame.PS_START, payload)
 end
 
-function PairSetup:start_hap()
-  Log.debug("AirPlay Pair-Setup M1 start: generating controller Ed25519 key and pairing id")
-  local keypair = crypto_method(self.crypto, "generate_ed25519_keypair")()
-  self.auth_private = keypair.private_key
-  self.auth_public = keypair.public_key
-  local uuid_bytes = crypto_method(self.crypto, "random_bytes")(16)
-  local h = Bytes.hex(uuid_bytes)
-  self.pairing_id = h:sub(1,8).."-"..h:sub(9,12).."-"..h:sub(13,16).."-"..h:sub(17,20).."-"..h:sub(21,32)
-  self.state = "M1_SENT"
-  Log.debug("AirPlay Pair-Setup M1 sent: public_key_len=" .. tostring(#self.auth_public) ..
-    " pairing_id=" .. tostring(self.pairing_id))
-  return TLV8.encode_ordered({
-    { 0, string.char(0x00) },
-    { 6, string.char(0x01) },
-  })
-end
 
 function PairSetup:handle_m2(frame)
   Log.debug("Pair-Setup M2 received: frame_type=" .. CompanionFrame.name(frame.frame_type) ..
@@ -3919,21 +3903,6 @@ function PairSetup:handle_m2(frame)
   return salt, B_bytes
 end
 
-function PairSetup:handle_m2_hap(payload)
-  Log.debug("AirPlay Pair-Setup M2 received: payload_len=" .. tostring(#(payload or "")))
-  assert(self.state == "M1_SENT", "unexpected M2 in state " .. self.state)
-  local tlv = PairVerify.decode_hap_response(payload, "AirPlay Pair-Setup M2")
-  local salt = tlv[2]
-  local B_bytes = tlv[3]
-  assert(salt and #salt == 16, "SRP salt must be 16 bytes, got " .. tostring(salt and #salt))
-  assert(B_bytes and #B_bytes == 384, "SRP server public key must be 384 bytes")
-  self._salt = salt
-  self._B_bytes = B_bytes
-  self.state = "M2_RECEIVED"
-  Log.debug("AirPlay Pair-Setup M2 parsed: salt_len=" .. tostring(#salt) ..
-    " server_public_len=" .. tostring(#B_bytes))
-  return salt, B_bytes
-end
 
 function PairSetup:compute_m3(pin)
   Log.debug("Pair-Setup M3 compute started: deriving SRP proof from PIN")
@@ -3978,14 +3947,6 @@ function PairSetup:compute_m3(pin)
   return CompanionFrame.encode(CompanionFrame.PS_NEXT, payload)
 end
 
-function PairSetup:compute_m3_hap(pin)
-  self:compute_m3(pin)
-  return TLV8.encode_ordered({
-    { 6, string.char(0x03) },
-    { 3, self.A_bytes },
-    { 4, self._M1 },
-  })
-end
 
 function PairSetup:handle_m4(frame)
   Log.debug("Pair-Setup M4 received: frame_type=" .. CompanionFrame.name(frame.frame_type) ..
@@ -4003,20 +3964,6 @@ function PairSetup:handle_m4(frame)
   Log.debug("Pair-Setup M4 verified: encryption key derived")
 end
 
-function PairSetup:handle_m4_hap(payload)
-  Log.debug("AirPlay Pair-Setup M4 received: payload_len=" .. tostring(#(payload or "")))
-  assert(self.state == "M3_SENT", "unexpected M4 in state " .. self.state)
-  local tlv = PairVerify.decode_hap_response(payload, "AirPlay Pair-Setup M4")
-  local atv_M2 = tlv[4]
-  assert(atv_M2 and #atv_M2 == 64, "server M4 proof must be 64 bytes")
-  Log.debug("AirPlay Pair-Setup M4 progress: verifying server proof")
-  assert(SRP.verify_M2(self.A_bytes, self._M1, self.K, atv_M2), "SRP M2 proof verification failed")
-  Log.debug("AirPlay Pair-Setup M4 progress: server proof verified")
-  self.session_key = crypto_method(self.crypto, "hkdf_sha512")(
-    "Pair-Setup-Encrypt-Salt", "Pair-Setup-Encrypt-Info", self.K)
-  self.state = "M4_VERIFIED"
-  Log.debug("AirPlay Pair-Setup M4 verified: encryption key derived")
-end
 
 function PairSetup:compute_m5()
   Log.debug("Pair-Setup M5 compute started: signing controller identity")
@@ -4050,16 +3997,6 @@ function PairSetup:_compute_m5_encrypted()
   return crypto_method(self.crypto, "encrypt")(self.session_key, inner_tlv, "", nonce)
 end
 
-function PairSetup:compute_m5_hap()
-  assert(self.state == "M4_VERIFIED", "must verify M4 before computing M5")
-  local encrypted = self:_compute_m5_encrypted()
-  self.state = "M5_SENT"
-  Log.debug("AirPlay Pair-Setup M5 sent: encrypted_len=" .. tostring(#encrypted))
-  return TLV8.encode_ordered({
-    { 6, string.char(0x05) },
-    { 5, encrypted },
-  })
-end
 
 function PairSetup:handle_m6(frame)
   Log.debug("Pair-Setup M6 received: frame_type=" .. CompanionFrame.name(frame.frame_type) ..
@@ -4090,32 +4027,6 @@ function PairSetup:handle_m6(frame)
   return Credentials.parse(credentials_str)
 end
 
-function PairSetup:handle_m6_hap(payload)
-  Log.debug("AirPlay Pair-Setup M6 received: payload_len=" .. tostring(#(payload or "")))
-  assert(self.state == "M5_SENT", "unexpected M6 in state " .. self.state)
-  local tlv = PairVerify.decode_hap_response(payload, "AirPlay Pair-Setup M6")
-  local encrypted_data = tlv[5]
-  assert(encrypted_data, "server M6 encrypted data missing")
-  Log.debug("AirPlay Pair-Setup M6 progress: encrypted_len=" .. tostring(#encrypted_data) .. ", decrypting")
-  local nonce = string.rep("\0", 4) .. "PS-Msg06"
-  local decrypted = crypto_method(self.crypto, "decrypt")(self.session_key, encrypted_data, "", nonce)
-  assert(decrypted, "M6 decrypt failed")
-  Log.debug("AirPlay Pair-Setup M6 progress: decrypted_len=" .. tostring(#decrypted))
-  local inner = TLV8.decode(decrypted)
-  local atv_id = inner[1]
-  local atv_ltpk = inner[3]
-  assert(atv_id and atv_ltpk, "M6 response missing identifier or public key")
-  local credentials_str = table.concat({
-    Bytes.hex(atv_ltpk),
-    Bytes.hex(self.auth_private),
-    Bytes.hex(atv_id),
-    Bytes.hex(self.pairing_id),
-  }, ":")
-  self.state = "PAIRED"
-  Log.debug("AirPlay Pair-Setup M6 parsed: atv_id_len=" .. tostring(#atv_id) ..
-    " atv_public_key_len=" .. tostring(#atv_ltpk))
-  return Credentials.parse(credentials_str)
-end
 
 local CompanionSession = {}
 CompanionSession.AUTH_TAG_LENGTH = 16
@@ -4278,8 +4189,6 @@ local AirPlay = {
   port = nil,
   txt = {},
   credentials = nil,
-  pair_setup = nil,
-  pairing_active = false,
   control_client = nil,
   monitor_enabled = false,
   monitor_state = "Stopped",
@@ -8003,41 +7912,8 @@ C4Driver = {
   pairing_target = nil,
 }
 
-function C4Driver.cancel_airplay_pairing(reason)
-  if AirPlay.pairing_active and reason then
-    Log.debug("AirPlay Pair-Setup cancelled: " .. tostring(reason))
-  end
-  AirPlay.pairing_active = false
-  AirPlay.pair_setup = nil
-  if C4Driver.pairing_target == "airplay" then
-    C4Driver.pairing_target = nil
-  end
-end
-
-function C4Driver.cancel_companion_pairing(reason)
-  local client = Companion.client
-  local state = client and tostring(client.state or "") or ""
-  if client and (state:match("^PAIR_SETUP_") or client.pending_pair_setup) then
-    if reason then
-      Log.debug("Companion Pair-Setup cancelled: " .. tostring(reason))
-    end
-    C4Driver.dispose_companion_client(client)
-    if Companion.client == client then
-      Companion.client = nil
-    end
-  end
-  if C4Driver.pairing_target == "companion" then
-    C4Driver.pairing_target = nil
-  end
-end
-
 function C4Driver.begin_pairing(target)
-  assert(target == "airplay" or target == "companion", "invalid pairing target")
-  if target == "airplay" then
-    C4Driver.cancel_companion_pairing("AirPlay pairing started")
-  else
-    C4Driver.cancel_airplay_pairing("Companion pairing started")
-  end
+  assert(target == "companion", "invalid pairing target")
   C4Driver.pairing_target = target
   Log.debug("pairing PIN target set: " .. target)
 end
@@ -8199,22 +8075,6 @@ function C4Driver.refresh_app_list()
   return Companion.fetch_apps()
 end
 
-function C4Driver.airplay_post(path, body, callback)
-  local host = Properties and Properties["Apple TV Address"]
-  local port = AirPlay.port or 7000
-  local url = "http://" .. tostring(host) .. ":" .. tostring(port) .. tostring(path)
-  if not (has_c4() and C4.urlPost) then
-    Log.error("AirPlay HTTP POST requires Control4 HTTP client")
-    return nil, "Control4 HTTP client unavailable"
-  end
-  local headers = {
-    ["User-Agent"] = "AirPlay/320.20",
-    ["Connection"] = "keep-alive",
-    ["X-Apple-HKP"] = "3",
-    ["Content-Type"] = "application/octet-stream",
-  }
-  return C4:urlPost(url, body or "", headers, false, callback)
-end
 
 function C4Driver.schedule_airplay_monitor_retry(reason)
   if not AirPlay.monitor_enabled then return end
@@ -8403,190 +8263,6 @@ function C4Driver.schedule_airplay_monitor_start(reason)
   end
 end
 
-function C4Driver.pair_airplay()
-  C4Driver.ensure_pairing_crypto_ready()
-  local host = Properties and Properties["Apple TV Address"]
-  if not host or host == "" then
-    Log.error("Apple TV Address is required")
-    return nil, "Apple TV Address is required"
-  end
-
-  C4Driver.begin_pairing("airplay")
-  C4Driver.update_property("Pairing PIN", "")
-  local function start_pairing(port)
-    AirPlay.port = port or AirPlay.port or 7000
-    AirPlay.pair_setup = PairSetup.new(Crypto)
-    AirPlay.pairing_active = true
-    AirPlay.credentials = nil
-
-    Log.debug("AirPlay Pair-Setup PIN start requested: port=" .. tostring(AirPlay.port))
-    return C4Driver.airplay_post("/pair-pin-start", "", function(_, _, pin_code, _, pin_error)
-      if C4Driver.pairing_target ~= "airplay" then return end
-      if pin_error ~= nil then
-        Log.error("AirPlay Pair-Setup PIN start failed: " .. tostring(pin_error))
-        C4Driver.update_property("Connection State", "AirPlay Pairing Failed")
-        AirPlay.pairing_active = false
-        return
-      end
-      Log.debug("AirPlay Pair-Setup PIN start response: code=" .. tostring(pin_code))
-
-      local body = AirPlay.pair_setup:start_hap()
-      Log.debug("AirPlay Pair-Setup M1 requested: payload_len=" .. tostring(#body))
-      C4Driver.airplay_post("/pair-setup", body, function(_, response_body, response_code, response_headers, error_text)
-        if C4Driver.pairing_target ~= "airplay" then return end
-        if error_text ~= nil then
-          Log.error("AirPlay Pair-Setup M2 failed: " .. tostring(error_text))
-          C4Driver.update_property("Connection State", "AirPlay Pairing Failed")
-          AirPlay.pairing_active = false
-          return
-        end
-
-        response_body = response_body or ""
-        local content_type = ""
-        if type(response_headers) == "table" then
-          content_type = response_headers["Content-Type"] or response_headers["content-type"] or ""
-        end
-        Log.debug("AirPlay Pair-Setup M2 response: code=" .. tostring(response_code) ..
-          " content_type=" .. tostring(content_type) ..
-          " body_len=" .. tostring(#response_body) ..
-          " body_head=" .. Bytes.hex(response_body:sub(1, 32)))
-        local code = tonumber(response_code) or 0
-        if code < 200 or code >= 300 then
-          C4Driver.update_property("Connection State", "AirPlay Pairing " .. tostring(response_code))
-          AirPlay.pairing_active = false
-          return
-        end
-
-        local ok, err = pcall(function() AirPlay.pair_setup:handle_m2_hap(response_body) end)
-        if not ok then
-          Log.error("AirPlay Pair-Setup M2 processing failed: " .. tostring(err))
-          C4Driver.update_property("Connection State", "AirPlay Pairing Failed")
-          AirPlay.pairing_active = false
-          return
-        end
-        C4Driver.update_property("Connection State", "Enter AirPlay PIN")
-      end)
-    end)
-  end
-
-  if AirPlay.port then
-    return start_pairing(AirPlay.port)
-  end
-
-  Log.debug("AirPlay Pair-Setup waiting for AirPlay port discovery")
-  return MDNS.discover_airplay_info(host, function(info)
-    if info and info.port then
-      AirPlay.port = info.port
-      AirPlay.txt = info.txt or {}
-      start_pairing(info.port)
-    else
-      Log.debug("AirPlay Pair-Setup skipped: AirPlay service not discovered")
-      C4Driver.update_property("Connection State", "AirPlay Not Found")
-    end
-  end)
-end
-
-function C4Driver.airplay_pairing_submit_pin(pin)
-  if C4Driver.pairing_target ~= "airplay" or not AirPlay.pair_setup or not AirPlay.pairing_active then
-    return nil, "AirPlay pairing is not active"
-  end
-
-  local ok, m3_body_or_err = pcall(function() return AirPlay.pair_setup:compute_m3_hap(pin) end)
-  if not ok then
-    Log.error("AirPlay Pair-Setup M3 failed: " .. tostring(m3_body_or_err))
-    C4Driver.update_property("Connection State", "AirPlay Pairing Failed")
-    AirPlay.pairing_active = false
-    return nil, m3_body_or_err
-  end
-
-  local m3_body = m3_body_or_err
-  Log.debug("AirPlay Pair-Setup M3 requested: payload_len=" .. tostring(#m3_body))
-  return C4Driver.airplay_post("/pair-setup", m3_body, function(_, m4_body, m4_code, _, m4_error)
-    if C4Driver.pairing_target ~= "airplay" then return end
-    if m4_error ~= nil then
-      Log.error("AirPlay Pair-Setup M4 failed: " .. tostring(m4_error))
-      C4Driver.update_property("Connection State", "AirPlay Pairing Failed")
-      AirPlay.pairing_active = false
-      return
-    end
-
-    m4_body = m4_body or ""
-    Log.debug("AirPlay Pair-Setup M4 response: code=" .. tostring(m4_code) ..
-      " body_len=" .. tostring(#m4_body) ..
-      " body_head=" .. Bytes.hex(m4_body:sub(1, 32)))
-    local code = tonumber(m4_code) or 0
-    if code < 200 or code >= 300 then
-      C4Driver.update_property("Connection State", "AirPlay Pairing " .. tostring(m4_code))
-      AirPlay.pairing_active = false
-      return
-    end
-
-    local m4_ok, m4_processing_error = pcall(function()
-      AirPlay.pair_setup:handle_m4_hap(m4_body)
-    end)
-    if not m4_ok then
-      Log.error("AirPlay Pair-Setup M4 processing failed: " .. tostring(m4_processing_error))
-      C4Driver.update_property("Connection State", "AirPlay Pairing Failed")
-      AirPlay.pairing_active = false
-      return
-    end
-
-    local m5_ok, m5_body_or_err = pcall(function()
-      return AirPlay.pair_setup:compute_m5_hap()
-    end)
-    if not m5_ok then
-      Log.error("AirPlay Pair-Setup M5 compute failed: " .. tostring(m5_body_or_err))
-      C4Driver.update_property("Connection State", "AirPlay Pairing Failed")
-      AirPlay.pairing_active = false
-      return
-    end
-
-    local m5_body = m5_body_or_err
-    Log.debug("AirPlay Pair-Setup M5 requested: payload_len=" .. tostring(#m5_body))
-    C4Driver.airplay_post("/pair-setup", m5_body, function(_, m6_body, m6_code, _, m6_error)
-      if C4Driver.pairing_target ~= "airplay" then return end
-      if m6_error ~= nil then
-        Log.error("AirPlay Pair-Setup M6 failed: " .. tostring(m6_error))
-        C4Driver.update_property("Connection State", "AirPlay Pairing Failed")
-        AirPlay.pairing_active = false
-        return
-      end
-
-      m6_body = m6_body or ""
-      Log.debug("AirPlay Pair-Setup M6 response: code=" .. tostring(m6_code) ..
-        " body_len=" .. tostring(#m6_body) ..
-        " body_head=" .. Bytes.hex(m6_body:sub(1, 32)))
-      local final_code = tonumber(m6_code) or 0
-      if final_code < 200 or final_code >= 300 then
-        C4Driver.update_property("Connection State", "AirPlay Pairing " .. tostring(m6_code))
-        AirPlay.pairing_active = false
-        return
-      end
-
-      local credentials_ok, credentials_or_err = pcall(function()
-        return AirPlay.pair_setup:handle_m6_hap(m6_body)
-      end)
-      if not credentials_ok then
-        Log.error("AirPlay Pair-Setup M6 processing failed: " .. tostring(credentials_or_err))
-        C4Driver.update_property("Connection State", "AirPlay Pairing Failed")
-        AirPlay.pairing_active = false
-        return
-      end
-
-      local canonical = Credentials.stringify(credentials_or_err)
-      Driver.state = Driver.state or {}
-      Driver.state.airplay_credentials = canonical
-      AirPlay.credentials = credentials_or_err
-      AirPlay.pairing_active = false
-      C4Driver.finish_pairing("airplay")
-      OpenSSLCrypto.prune_ed25519_public_table_cache(credentials_or_err.ltpk)
-      Storage.save(Driver.state)
-      C4Driver.update_property("Pairing PIN", "")
-      C4Driver.update_property("Connection State", "AirPlay Pairing Complete")
-      Log.debug("AirPlay Pair-Setup complete, credentials saved")
-    end)
-  end)
-end
 
 function C4Driver.import_airplay_credentials(detail_string)
   assert(type(detail_string) == "string" and detail_string ~= "", "AirPlay credentials are required")
@@ -8615,7 +8291,6 @@ function C4Driver.try_companion_credentials_for_airplay()
 
   local candidate = Credentials.parse(Credentials.stringify(credentials))
   local completed = false
-  C4Driver.cancel_airplay_pairing("testing Companion credentials for AirPlay")
   C4Driver.close_airplay_control_client("starting shared credential probe")
   C4Driver.set_connection_state("Testing Shared AirPlay Credentials")
 
@@ -8746,7 +8421,6 @@ function C4Driver.reset_pairing()
   C4Driver.cancel_timer("AppleTV_companion_watchdog")
   OpenSSLCrypto._pregenerated_x25519_keypair = nil
   C4Driver.dispose_companion_client(Companion.client)
-  C4Driver.cancel_airplay_pairing("pairing reset")
   C4Driver.pairing_target = nil
   Driver.state = Driver.state or {}
   Driver.state.companion_credentials = nil
