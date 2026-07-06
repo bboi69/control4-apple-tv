@@ -5329,10 +5329,14 @@ function CompanionClient:start_session()
     sid_bytes:byte(2) * 0x100 +
     sid_bytes:byte(3) * 0x10000 +
     sid_bytes:byte(4) * 0x1000000
-  local request = self:send_opack("_sessionStart", {
+  local content = {
     _srvT = "com.apple.tvremoteservices",
     _sid = self.session_local_sid,
-  }, 2, function(message)
+  }
+  local request = Companion.build_request("_sessionStart", content, 2)
+  self.session_start_xid = request._x
+  self:set_state("SESSION_STARTING")
+  self:send_opack("_sessionStart", content, 2, function(message)
     if type(message._c) ~= "table" then
       error("_sessionStart response missing content")
     end
@@ -5342,9 +5346,8 @@ function CompanionClient:start_session()
     self.session_active_since_ms = self:now_ms()
     Log.debug("Companion session active, remote_sid=" .. tostring(self.session_remote_sid))
     self:send_next_startup_step()
-  end)
-  self.session_start_xid = request._x
-  self:set_state("SESSION_STARTING")
+  end, nil, request)
+  return request
 end
 
 function CompanionClient:finish_tv_remote_control_session(xid, reason)
@@ -5364,17 +5367,18 @@ function CompanionClient:finish_tv_remote_control_session(xid, reason)
 end
 
 function CompanionClient:start_tv_remote_control_session()
-  local request
-  request = self:send_opack("TVRCSessionStart", {
+  local content = {
     ProtocolVersionKey = "1.2",
-  }, 2, function(message)
+  }
+  local request = Companion.build_request("TVRCSessionStart", content, 2)
+  self.tv_rc_session_xid = request._x
+  self:send_opack("TVRCSessionStart", content, 2, function(message)
     Log.debug("Companion TV RC session started")
     self:finish_tv_remote_control_session(message._x or request._x, "response")
   end, function(message)
     Log.debug("Companion TV RC session start failed; continuing startup")
     self:finish_tv_remote_control_session(message._x or request._x, "error")
-  end)
-  self.tv_rc_session_xid = request._x
+  end, request)
 
   if has_c4() and type(SetTimer) == "function" then
     if C4Driver and C4Driver.cancel_timer then

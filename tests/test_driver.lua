@@ -2976,6 +2976,29 @@ function tests.session_start_response_advances_to_session_active()
   assert_eq(interest._t, 1, "interest is event message")
 end
 
+function tests.reentrant_session_start_response_cannot_regress_active_state()
+  local client
+  local transport = {
+    Write = function(_, frame)
+      local decoded = Driver.CompanionFrame.try_decode(frame)
+      local request = Driver.OPACK.decode(decoded.payload)
+      local pending = client.pending_responses[request._x]
+      assert(pending and pending.on_response, "session response registered before write")
+      client.pending_responses[request._x] = nil
+      pending.on_response({ _x = request._x, _c = { _sid = 12345 } })
+    end,
+  }
+  client = Driver.CompanionClient.new({
+    transport = transport,
+    crypto = { random_bytes = function() return "\x01\x02\x03\x04" end },
+  })
+  client.state = "READY"
+  client:start_session()
+  assert_eq(client.state, "SESSION_ACTIVE", "reentrant response leaves session active")
+  assert_eq(client.session_start_xid, nil, "completed session has no pending xid")
+  assert_eq(client.session_remote_sid, 12345, "reentrant response stores remote sid")
+end
+
 function tests.session_stop_sent_on_close()
   local public_key = bytes_range(0, 31)
   local server_public_key = bytes_range(32, 63)
