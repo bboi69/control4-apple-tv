@@ -6,7 +6,7 @@
     <model>Apple TV</model>
     <created>05/02/2026 12:00 AM</created>
     <modified>05/31/2026 12:00 AM</modified>
-    <version>61</version>
+    <version>62</version>
     <small image_source="c4z">icons/device_sm.png</small>
     <large image_source="c4z">icons/device_lg.png</large>
     <control>lua_gen</control>
@@ -688,12 +688,6 @@
                 <default>Off</default>
                 <readonly>false</readonly>
             </property>
-            <property>
-                <name>Crypto Prewarm Status</name>
-                <type>STRING</type>
-                <default>Idle</default>
-                <readonly>true</readonly>
-            </property>
         </properties>
         <actions>
             <action>
@@ -705,12 +699,12 @@
                 <command>TRY_SHARED_AIRPLAY_CREDENTIALS</command>
             </action>
             <action>
-                <name>Prewarm Crypto</name>
-                <command>PREWARM_CRYPTO</command>
-            </action>
-            <action>
                 <name>Check Crypto Provider</name>
                 <command>CHECK_CRYPTO_PROVIDER</command>
+            </action>
+            <action>
+                <name>Probe Native Crypto</name>
+                <command>PROBE_NATIVE_CRYPTO</command>
             </action>
             <action>
                 <name>Connect Apple TV</name>

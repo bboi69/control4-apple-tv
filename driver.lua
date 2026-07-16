@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.42-dev",
+  VERSION = "0.1.43-dev",
 }
 
 local function has_c4()
@@ -1007,253 +1007,6 @@ function OPACK.decode(data)
   return value
 end
 
--- BigInt: arbitrary-precision unsigned integers for SRP.
--- Base 2^16. Limbs stored little-endian. Montgomery multiplication for fast modpow.
-local BigInt = {}
-BigInt.BASE = 65536
-BigInt.BITS = 16
-
-function BigInt.from_number(n)
-  assert(type(n) == "number" and n >= 0 and n == math.floor(n))
-  if n == 0 then return {0} end
-  local B, limbs = BigInt.BASE, {}
-  while n > 0 do limbs[#limbs + 1] = n % B; n = math.floor(n / B) end
-  return limbs
-end
-
-function BigInt.from_bytes_be(s)
-  local n, limbs = #s, {}
-  local i = n
-  while i >= 2 do
-    limbs[#limbs + 1] = s:byte(i - 1) * 256 + s:byte(i)
-    i = i - 2
-  end
-  if i == 1 then limbs[#limbs + 1] = s:byte(1) end
-  while #limbs > 1 and limbs[#limbs] == 0 do limbs[#limbs] = nil end
-  if #limbs == 0 then return {0} end
-  return limbs
-end
-
-function BigInt.to_bytes_be(v, len)
-  local bytes = {}
-  for i = 1, #v do
-    bytes[2 * i - 1] = v[i] % 256
-    bytes[2 * i] = math.floor(v[i] / 256)
-  end
-  while #bytes > 0 and bytes[#bytes] == 0 do bytes[#bytes] = nil end
-  while #bytes < len do bytes[#bytes + 1] = 0 end
-  local out = {}
-  for i = len, 1, -1 do out[#out + 1] = string.char(bytes[i] or 0) end
-  return table.concat(out)
-end
-
-function BigInt.to_minimal_bytes_be(v)
-  if BigInt.is_zero(v) then
-    return string.char(0)
-  end
-
-  local bytes = {}
-  for i = 1, #v do
-    bytes[2 * i - 1] = v[i] % 256
-    bytes[2 * i] = math.floor(v[i] / 256)
-  end
-  while #bytes > 0 and bytes[#bytes] == 0 do bytes[#bytes] = nil end
-  local out = {}
-  for i = #bytes, 1, -1 do out[#out + 1] = string.char(bytes[i]) end
-  return table.concat(out)
-end
-
-local function bi_trim(v)
-  while #v > 1 and v[#v] == 0 do v[#v] = nil end
-end
-
-function BigInt.is_zero(v) return #v == 1 and v[1] == 0 end
-
-function BigInt.compare(a, b)
-  local na, nb = #a, #b
-  if na ~= nb then return na < nb and -1 or 1 end
-  for i = na, 1, -1 do
-    if a[i] ~= b[i] then return a[i] < b[i] and -1 or 1 end
-  end
-  return 0
-end
-
-function BigInt.add(a, b)
-  local B, result, carry = BigInt.BASE, {}, 0
-  local n = math.max(#a, #b)
-  for i = 1, n do
-    local s = (a[i] or 0) + (b[i] or 0) + carry
-    result[i] = s % B; carry = math.floor(s / B)
-  end
-  if carry > 0 then result[n + 1] = carry end
-  return result
-end
-
-function BigInt.sub(a, b)
-  local B, result, borrow = BigInt.BASE, {}, 0
-  for i = 1, #a do
-    local d = (a[i] or 0) - (b[i] or 0) - borrow
-    if d < 0 then d = d + B; borrow = 1 else borrow = 0 end
-    result[i] = d
-  end
-  bi_trim(result)
-  if #result == 0 then return {0} end
-  return result
-end
-
-function BigInt.mul(a, b)
-  local B = BigInt.BASE
-  local na, nb = #a, #b
-  local result = {}
-  for i = 1, na + nb do result[i] = 0 end
-  for i = 1, na do
-    local carry, ai = 0, a[i]
-    for j = 1, nb do
-      local p = ai * b[j] + result[i + j - 1] + carry
-      result[i + j - 1] = p % B; carry = math.floor(p / B)
-    end
-    local k = i + nb
-    while carry > 0 do
-      local v = result[k] + carry; result[k] = v % B; carry = math.floor(v / B); k = k + 1
-    end
-  end
-  bi_trim(result); return result
-end
-
-function BigInt.bit_length(v)
-  if #v == 1 and v[1] == 0 then return 0 end
-  local top = v[#v]
-  local bits = (#v - 1) * BigInt.BITS
-  while top > 0 do bits = bits + 1; top = math.floor(top / 2) end
-  return bits
-end
-
-function BigInt.bit_at(v, bit_index)
-  local limb = v[math.floor(bit_index / BigInt.BITS) + 1] or 0
-  local mask = 2 ^ (bit_index % BigInt.BITS)
-  return math.floor(limb / mask) % 2
-end
-
-local function bi_shr1(v)
-  local B, carry, result = BigInt.BASE, 0, {}
-  for i = #v, 1, -1 do
-    local val = v[i] + carry * B
-    result[i] = math.floor(val / 2); carry = val % 2
-  end
-  bi_trim(result)
-  if #result == 0 then return {0} end
-  return result
-end
-
--- Naive shift-and-subtract mod. O(bit_diff * limbs). Used for init only.
-function BigInt.mod(a, n)
-  if BigInt.compare(a, n) < 0 then return a end
-  local B = BigInt.BASE
-  local shift = BigInt.bit_length(a) - BigInt.bit_length(n)
-  if shift < 0 then return a end
-  local lshift, bshift = math.floor(shift / BigInt.BITS), shift % BigInt.BITS
-  local factor = 2 ^ bshift
-  local shifted = {}
-  for i = 1, lshift do shifted[i] = 0 end
-  local carry = 0
-  for i = 1, #n do
-    local val = n[i] * factor + carry
-    shifted[i + lshift] = val % B; carry = math.floor(val / B)
-  end
-  if carry > 0 then shifted[#shifted + 1] = carry end
-  local r = {}
-  for i = 1, #a do r[i] = a[i] end
-  for _ = 0, shift do
-    if BigInt.compare(r, shifted) >= 0 then r = BigInt.sub(r, shifted) end
-    carry = 0
-    for j = #shifted, 1, -1 do
-      local val = shifted[j] + carry * B
-      shifted[j] = math.floor(val / 2); carry = val % 2
-    end
-    bi_trim(shifted)
-    if #shifted == 0 then shifted = {0} end
-  end
-  return r
-end
-
--- Montgomery REDC: T * R^{-1} mod N where R = BASE^k.
--- n_prime = -N[1]^{-1} mod BASE. Requires T < N * R.
-local function mont_redc(T_in, N, k, n_prime)
-  local B = BigInt.BASE
-  local t = {}
-  for i = 1, 2 * k + 2 do t[i] = T_in[i] or 0 end
-  for i = 1, k do
-    local m = (t[i] * n_prime) % B
-    if m ~= 0 then
-      local c = 0
-      for j = 1, k do
-        local val = t[i + j - 1] + m * N[j] + c
-        t[i + j - 1] = val % B; c = math.floor(val / B)
-      end
-      local idx = i + k
-      while c > 0 do
-        local val = (t[idx] or 0) + c
-        t[idx] = val % B; c = math.floor(val / B); idx = idx + 1
-      end
-    end
-  end
-  local result = {}
-  for i = 1, k + 1 do result[i] = t[i + k] or 0 end
-  bi_trim(result)
-  if BigInt.compare(result, N) >= 0 then result = BigInt.sub(result, N) end
-  return result
-end
-
--- Montgomery multiply: a * b * R^{-1} mod N (both inputs already in Montgomery domain).
-local function mont_mul(a, b, N, k, n_prime)
-  return mont_redc(BigInt.mul(a, b), N, k, n_prime)
-end
-
--- Compute R^2 mod N by repeated doubling. R = BASE^k = 2^(BITS*k).
--- Called once per SRP session. Uses simple compare-and-subtract (at most 1 needed per step).
-local function compute_r2_mod_n(N, k)
-  local B, r = BigInt.BASE, {1}
-  for _ = 1, 2 * k * BigInt.BITS do
-    local carry, doubled = 0, {}
-    for i = 1, #r do
-      local val = r[i] * 2 + carry; doubled[i] = val % B; carry = math.floor(val / B)
-    end
-    if carry > 0 then doubled[#doubled + 1] = carry end
-    r = BigInt.compare(doubled, N) >= 0 and BigInt.sub(doubled, N) or doubled
-  end
-  return r
-end
-
--- Compute n_prime = -N[1]^{-1} mod BASE via Newton's method (Hensel lifting).
-local function compute_n_prime(n0)
-  local B = BigInt.BASE
-  assert(n0 % 2 == 1, "Montgomery requires odd modulus")
-  local x = 1
-  for _ = 1, 16 do x = x * (2 - n0 * x % B) % B; if x < 0 then x = x + B end end
-  assert(n0 * x % B == 1, "n_prime compute failed")
-  return (B - x) % B
-end
-
-BigInt.compute_n_prime = compute_n_prime
-BigInt.compute_r2_mod_n = compute_r2_mod_n
-
--- Montgomery modular exponentiation. base, exp, N are standard BigInt tables.
-function BigInt.mont_modpow(base, exp, N, R2, k, n_prime)
-  if BigInt.is_zero(exp) then return {1} end
-  local base_hat = mont_mul(base, R2, N, k, n_prime)
-  local result_hat = mont_mul({1}, R2, N, k, n_prime)
-  local exp_bits = BigInt.bit_length(exp)
-  for bit = 0, exp_bits - 1 do
-    if BigInt.bit_at(exp, bit) == 1 then
-      result_hat = mont_mul(result_hat, base_hat, N, k, n_prime)
-    end
-    base_hat = mont_mul(base_hat, base_hat, N, k, n_prime)
-  end
-  local padded = {}
-  for i = 1, #result_hat do padded[i] = result_hat[i] end
-  for i = #result_hat + 1, 2 * k do padded[i] = 0 end
-  return mont_redc(padded, N, k, n_prime)
-end
 
 local Bit32 = {}
 do
@@ -1574,596 +1327,129 @@ SRP.N_BYTES = Bytes.from_hex(
   "BBE117577A615D6C770988C0BAD946E208E24FA074E5AB31" ..
   "43DB5BFCE0FD108E4B82D120A93AD2CAFFFFFFFFFFFFFFFF"
 )
-SRP.N_LIMBS = 192  -- 3072 / 16
-SRP.N = BigInt.from_bytes_be(SRP.N_BYTES)
-SRP.g = BigInt.from_number(5)
+SRP.N = nil            -- bn, built lazily in SRP.init()
+SRP.g = nil            -- bn, built lazily in SRP.init()
 SRP._initialized = false
-SRP._n_prime = nil
-SRP._R2 = nil
 SRP._k_bytes = nil
-SRP._modpow = nil
 
 -- Pure-Lua X25519 (RFC 7748) over GF(2^255-19).
 -- Used because Control4's lua-openssl pkey.derive rejects Curve25519/OKP keys.
 local X25519Pure = {}
 
--- X25519 uses a separate 15-bit limb field engine instead of the generic
--- 16-bit BigInt path. Control4's Lua runtime appears to mis-handle 65535^2
--- sized products; 15-bit limbs keep every product under signed 32-bit range.
--- Since 255 = 17 * 15, reduction for p = 2^255 - 19 is also simple.
-local _FE_BASE = 32768
-local _FE_BITS = 15
-local _FE_LIMBS = 17
-local _FE_P = {
-  32749, 32767, 32767, 32767, 32767, 32767, 32767, 32767, 32767,
-  32767, 32767, 32767, 32767, 32767, 32767, 32767, 32767,
-}
-local _FE_P_MINUS_2 = {
-  32747, 32767, 32767, 32767, 32767, 32767, 32767, 32767, 32767,
-  32767, 32767, 32767, 32767, 32767, 32767, 32767, 32767,
-}
+-- 25519 field arithmetic on native openssl.bn (p = 2^255-19). Replaces the
+-- former pure-Lua 15-bit/16-bit limb engines. Native bignum modular ops
+-- (mulmod/sqrmod/addmod/submod/invmod/sqrtmod) are fast enough that Ed25519
+-- needs no precomputed fixed-base tables, which removes multi-MB of resident
+-- Lua tables from the controller.
+local _bn                              -- openssl.bn (lazy)
+local _P, _L, _D, _D2, _A24            -- curve constants (bn)
+local _F0, _F1                         -- field 0/1 (bn)
+local _B, _IDENT                       -- Ed25519 base point / identity (extended)
+local _POW2B = { [0] = 1, 2, 4, 8, 16, 32, 64, 128 }
 
-local function _fe_from_number(n)
-  local out = {}
-  for i = 1, _FE_LIMBS do
-    out[i] = n % _FE_BASE
-    n = math.floor(n / _FE_BASE)
+local function _hexbytes(h)
+  return (h:gsub("..", function(cc) return string.char(tonumber(cc, 16)) end))
+end
+
+local function fadd(a, b) return _bn.addmod(a, b, _P) end
+local function fsub(a, b) return _bn.submod(a, b, _P) end
+local function fmul(a, b) return _bn.mulmod(a, b, _P) end
+local function fsqr(a) return _bn.sqrmod(a, _P) end
+local function finv(a) return _bn.invmod(a, _P) end
+
+-- 32-byte little-endian <-> bn
+local function le_to_bn(s) return _bn.text((s:reverse())) end
+local function bn_to_le(v, len)
+  len = len or 32
+  local be = _bn.totext(v)
+  if #be > len then be = be:sub(#be - len + 1) end
+  if #be < len then be = string.rep("\0", len - #be) .. be end
+  return (be:reverse())
+end
+
+-- Recover x from y with the given low-bit sign. Returns a bn, or nil.
+local function _recover_x(y, sign)
+  local y2 = fsqr(y)
+  local u = fsub(y2, _F1)
+  local v = fadd(fmul(_D, y2), _F1)
+  local x2 = fmul(u, finv(v))
+  if _bn.iszero(x2) then
+    if sign == 1 then return nil end
+    return _F0
   end
-  return out
+  local ok, x = pcall(_bn.sqrtmod, x2, _P)
+  if not ok or x == nil then return nil end
+  if not _bn.iszero(fsub(fsqr(x), x2)) then return nil end
+  local isodd = _bn.isodd(x) and 1 or 0
+  if isodd ~= sign then x = fsub(_P, x) end
+  return x
 end
 
-local _A24 = 121665 -- (486662-2)/4 for Curve25519 ladder
-
-local floor = math.floor  -- localize for hot-loop performance
-local _POW2 = {}
-for _i = 0, 30 do _POW2[_i] = 2 ^ _i end
-
-local function _fe_carry(c)
-  local carry = 0
-  local n = #c
-  if n < _FE_LIMBS then n = _FE_LIMBS end
-  for i = 1, n do
-    local value = (c[i] or 0) + carry
-    c[i] = value % _FE_BASE
-    carry = floor(value / _FE_BASE)
-  end
-  while carry > 0 do
-    n = n + 1
-    c[n] = carry % _FE_BASE
-    carry = floor(carry / _FE_BASE)
-  end
-  while #c > 1 and c[#c] == 0 do c[#c] = nil end
-  return c
+-- Build all bn constants once (needs openssl; controller always has it).
+local function _ensure_curve()
+  if _P then return end
+  local ok, ossl = pcall(require, "openssl")
+  assert(ok and ossl and ossl.bn, "openssl.bn is required for X25519/Ed25519 arithmetic")
+  _bn = ossl.bn
+  _P = _bn.text(_hexbytes("7f" .. ("ff"):rep(30) .. "ed"))
+  _L = _bn.text(_hexbytes("10" .. ("00"):rep(15) .. "14def9dea2f79cd65812631a5cf5d3ed"))
+  _F0 = _bn.number(0)
+  _F1 = _bn.number(1)
+  _A24 = _bn.number(121665)
+  _D = fmul(fsub(_F0, _bn.number(121665)), finv(_bn.number(121666)))
+  _D2 = fadd(_D, _D)
+  local by = fmul(_bn.number(4), finv(_bn.number(5)))
+  local bx = _recover_x(by, 0)
+  _B = { X = bx, Y = by, Z = _F1, T = fmul(bx, by) }
+  _IDENT = { X = _F0, Y = _F1, Z = _F1, T = _F0 }
 end
 
-local function _fe_compare(a, b)
-  for i = _FE_LIMBS, 1, -1 do
-    local av, bv = a[i] or 0, b[i] or 0
-    if av ~= bv then return av < bv and -1 or 1 end
-  end
-  return 0
+-- Bit t of a 32-byte little-endian scalar.
+local function _le_bit(bytes, t)
+  return math.floor((bytes[math.floor(t / 8) + 1] or 0) / _POW2B[t % 8]) % 2
 end
 
-local function _fe_sub_raw(a, b)
-  local out, borrow = {}, 0
-  for i = 1, _FE_LIMBS do
-    local value = (a[i] or 0) - (b[i] or 0) - borrow
-    if value < 0 then
-      value = value + _FE_BASE
-      borrow = 1
-    else
-      borrow = 0
-    end
-    out[i] = value
-  end
-  return out, borrow
-end
-
-local function _fe_sub_p_in_place(c)
-  local borrow = 0
-  for i = 1, _FE_LIMBS do
-    local value = (c[i] or 0) - _FE_P[i] - borrow
-    if value < 0 then
-      value = value + _FE_BASE
-      borrow = 1
-    else
-      borrow = 0
-    end
-    c[i] = value
-  end
-  return c
-end
-
-local function _fe_reduce(c)
-  for _ = 1, 4 do
-    _fe_carry(c)
-    if #c <= _FE_LIMBS then break end
-    for i = #c, _FE_LIMBS + 1, -1 do
-      local value = c[i] or 0
-      if value ~= 0 then
-        c[i] = 0
-        c[i - _FE_LIMBS] = (c[i - _FE_LIMBS] or 0) + value * 19
-      end
-    end
-  end
-  _fe_carry(c)
-  for i = #c, _FE_LIMBS + 1, -1 do c[i] = nil end
-  while _fe_compare(c, _FE_P) >= 0 do
-    _fe_sub_p_in_place(c)
-  end
-  for i = 1, _FE_LIMBS do c[i] = c[i] or 0 end
-  return c
-end
-
-local function _fp_add(a, b)
-  local out = {}
-  for i = 1, _FE_LIMBS do out[i] = (a[i] or 0) + (b[i] or 0) end
-  return _fe_reduce(out)
-end
-
-local function _fp_add_into(out, a, b)
-  for i = 1, _FE_LIMBS do out[i] = (a[i] or 0) + (b[i] or 0) end
-  return out
-end
-
-local function _fp_sub(a, b)
-  local out
-  if _fe_compare(a, b) >= 0 then
-    out = _fe_sub_raw(a, b)
-  else
-    local with_p = {}
-    for i = 1, _FE_LIMBS do with_p[i] = (a[i] or 0) + _FE_P[i] end
-    _fe_carry(with_p)
-    out = _fe_sub_raw(with_p, b)
-  end
-  return _fe_reduce(out)
-end
-
-local function _fp_sub_into(out, a, b)
-  local borrow = 0
-  for i = 1, _FE_LIMBS do
-    local value = (a[i] or 0) + _FE_P[i] - (b[i] or 0) - borrow
-    if value < 0 then
-      value = value + _FE_BASE
-      borrow = 1
-    else
-      borrow = 0
-    end
-    out[i] = value
-  end
-  return out
-end
-
-local _fp_mul_into
-local function _fp_mul(a, b)
-  local out = {}
-  return _fp_mul_into(out, a, b)
-end
-
-function _fp_mul_into(out, a, b)
-  local a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,a16,a17 =
-    a[1] or 0,a[2] or 0,a[3] or 0,a[4] or 0,a[5] or 0,a[6] or 0,a[7] or 0,a[8] or 0,a[9] or 0,a[10] or 0,a[11] or 0,a[12] or 0,a[13] or 0,a[14] or 0,a[15] or 0,a[16] or 0,a[17] or 0
-  local b1,b2,b3,b4,b5,b6,b7,b8,b9,b10,b11,b12,b13,b14,b15,b16,b17 =
-    b[1] or 0,b[2] or 0,b[3] or 0,b[4] or 0,b[5] or 0,b[6] or 0,b[7] or 0,b[8] or 0,b[9] or 0,b[10] or 0,b[11] or 0,b[12] or 0,b[13] or 0,b[14] or 0,b[15] or 0,b[16] or 0,b[17] or 0
-  local c1  = a1*b1
-  local c2  = a1*b2+a2*b1
-  local c3  = a1*b3+a2*b2+a3*b1
-  local c4  = a1*b4+a2*b3+a3*b2+a4*b1
-  local c5  = a1*b5+a2*b4+a3*b3+a4*b2+a5*b1
-  local c6  = a1*b6+a2*b5+a3*b4+a4*b3+a5*b2+a6*b1
-  local c7  = a1*b7+a2*b6+a3*b5+a4*b4+a5*b3+a6*b2+a7*b1
-  local c8  = a1*b8+a2*b7+a3*b6+a4*b5+a5*b4+a6*b3+a7*b2+a8*b1
-  local c9  = a1*b9+a2*b8+a3*b7+a4*b6+a5*b5+a6*b4+a7*b3+a8*b2+a9*b1
-  local c10 = a1*b10+a2*b9+a3*b8+a4*b7+a5*b6+a6*b5+a7*b4+a8*b3+a9*b2+a10*b1
-  local c11 = a1*b11+a2*b10+a3*b9+a4*b8+a5*b7+a6*b6+a7*b5+a8*b4+a9*b3+a10*b2+a11*b1
-  local c12 = a1*b12+a2*b11+a3*b10+a4*b9+a5*b8+a6*b7+a7*b6+a8*b5+a9*b4+a10*b3+a11*b2+a12*b1
-  local c13 = a1*b13+a2*b12+a3*b11+a4*b10+a5*b9+a6*b8+a7*b7+a8*b6+a9*b5+a10*b4+a11*b3+a12*b2+a13*b1
-  local c14 = a1*b14+a2*b13+a3*b12+a4*b11+a5*b10+a6*b9+a7*b8+a8*b7+a9*b6+a10*b5+a11*b4+a12*b3+a13*b2+a14*b1
-  local c15 = a1*b15+a2*b14+a3*b13+a4*b12+a5*b11+a6*b10+a7*b9+a8*b8+a9*b7+a10*b6+a11*b5+a12*b4+a13*b3+a14*b2+a15*b1
-  local c16 = a1*b16+a2*b15+a3*b14+a4*b13+a5*b12+a6*b11+a7*b10+a8*b9+a9*b8+a10*b7+a11*b6+a12*b5+a13*b4+a14*b3+a15*b2+a16*b1
-  local c17 = a1*b17+a2*b16+a3*b15+a4*b14+a5*b13+a6*b12+a7*b11+a8*b10+a9*b9+a10*b8+a11*b7+a12*b6+a13*b5+a14*b4+a15*b3+a16*b2+a17*b1
-  local c18 = a2*b17+a3*b16+a4*b15+a5*b14+a6*b13+a7*b12+a8*b11+a9*b10+a10*b9+a11*b8+a12*b7+a13*b6+a14*b5+a15*b4+a16*b3+a17*b2
-  local c19 = a3*b17+a4*b16+a5*b15+a6*b14+a7*b13+a8*b12+a9*b11+a10*b10+a11*b9+a12*b8+a13*b7+a14*b6+a15*b5+a16*b4+a17*b3
-  local c20 = a4*b17+a5*b16+a6*b15+a7*b14+a8*b13+a9*b12+a10*b11+a11*b10+a12*b9+a13*b8+a14*b7+a15*b6+a16*b5+a17*b4
-  local c21 = a5*b17+a6*b16+a7*b15+a8*b14+a9*b13+a10*b12+a11*b11+a12*b10+a13*b9+a14*b8+a15*b7+a16*b6+a17*b5
-  local c22 = a6*b17+a7*b16+a8*b15+a9*b14+a10*b13+a11*b12+a12*b11+a13*b10+a14*b9+a15*b8+a16*b7+a17*b6
-  local c23 = a7*b17+a8*b16+a9*b15+a10*b14+a11*b13+a12*b12+a13*b11+a14*b10+a15*b9+a16*b8+a17*b7
-  local c24 = a8*b17+a9*b16+a10*b15+a11*b14+a12*b13+a13*b12+a14*b11+a15*b10+a16*b9+a17*b8
-  local c25 = a9*b17+a10*b16+a11*b15+a12*b14+a13*b13+a14*b12+a15*b11+a16*b10+a17*b9
-  local c26 = a10*b17+a11*b16+a12*b15+a13*b14+a14*b13+a15*b12+a16*b11+a17*b10
-  local c27 = a11*b17+a12*b16+a13*b15+a14*b14+a15*b13+a16*b12+a17*b11
-  local c28 = a12*b17+a13*b16+a14*b15+a15*b14+a16*b13+a17*b12
-  local c29 = a13*b17+a14*b16+a15*b15+a16*b14+a17*b13
-  local c30 = a14*b17+a15*b16+a16*b15+a17*b14
-  local c31 = a15*b17+a16*b16+a17*b15
-  local c32 = a16*b17+a17*b16
-  local c33 = a17*b17
-  out[1]=c1; out[2]=c2; out[3]=c3; out[4]=c4; out[5]=c5; out[6]=c6; out[7]=c7; out[8]=c8; out[9]=c9; out[10]=c10; out[11]=c11; out[12]=c12; out[13]=c13; out[14]=c14; out[15]=c15; out[16]=c16; out[17]=c17; out[18]=c18; out[19]=c19; out[20]=c20; out[21]=c21; out[22]=c22; out[23]=c23; out[24]=c24; out[25]=c25; out[26]=c26; out[27]=c27; out[28]=c28; out[29]=c29; out[30]=c30; out[31]=c31; out[32]=c32; out[33]=c33; out[34]=0
-  return _fe_reduce(out)
-end
-
-local _fp_mul_small_into
-local function _fp_mul_small(a, n)
-  local out = {}
-  return _fp_mul_small_into(out, a, n)
-end
-
-function _fp_mul_small_into(out, a, n)
-  for i = 1, _FE_LIMBS do
-    out[i] = (a[i] or 0) * n
-  end
-  for i = _FE_LIMBS + 1, #out do out[i] = nil end
-  return _fe_reduce(out)
-end
-
-local _fp_sq_into
-local function _fp_sq(a)
-  local out = {}
-  return _fp_sq_into(out, a)
-end
-
-function _fp_sq_into(out, a)
-  local a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,a16,a17 =
-    a[1] or 0,a[2] or 0,a[3] or 0,a[4] or 0,a[5] or 0,a[6] or 0,a[7] or 0,a[8] or 0,a[9] or 0,a[10] or 0,a[11] or 0,a[12] or 0,a[13] or 0,a[14] or 0,a[15] or 0,a[16] or 0,a[17] or 0
-  local c1  = a1*a1
-  local c2  = 2*(a1*a2)
-  local c3  = a2*a2+2*(a1*a3)
-  local c4  = 2*(a1*a4+a2*a3)
-  local c5  = a3*a3+2*(a1*a5+a2*a4)
-  local c6  = 2*(a1*a6+a2*a5+a3*a4)
-  local c7  = a4*a4+2*(a1*a7+a2*a6+a3*a5)
-  local c8  = 2*(a1*a8+a2*a7+a3*a6+a4*a5)
-  local c9  = a5*a5+2*(a1*a9+a2*a8+a3*a7+a4*a6)
-  local c10 = 2*(a1*a10+a2*a9+a3*a8+a4*a7+a5*a6)
-  local c11 = a6*a6+2*(a1*a11+a2*a10+a3*a9+a4*a8+a5*a7)
-  local c12 = 2*(a1*a12+a2*a11+a3*a10+a4*a9+a5*a8+a6*a7)
-  local c13 = a7*a7+2*(a1*a13+a2*a12+a3*a11+a4*a10+a5*a9+a6*a8)
-  local c14 = 2*(a1*a14+a2*a13+a3*a12+a4*a11+a5*a10+a6*a9+a7*a8)
-  local c15 = a8*a8+2*(a1*a15+a2*a14+a3*a13+a4*a12+a5*a11+a6*a10+a7*a9)
-  local c16 = 2*(a1*a16+a2*a15+a3*a14+a4*a13+a5*a12+a6*a11+a7*a10+a8*a9)
-  local c17 = a9*a9+2*(a1*a17+a2*a16+a3*a15+a4*a14+a5*a13+a6*a12+a7*a11+a8*a10)
-  local c18 = 2*(a2*a17+a3*a16+a4*a15+a5*a14+a6*a13+a7*a12+a8*a11+a9*a10)
-  local c19 = a10*a10+2*(a3*a17+a4*a16+a5*a15+a6*a14+a7*a13+a8*a12+a9*a11)
-  local c20 = 2*(a4*a17+a5*a16+a6*a15+a7*a14+a8*a13+a9*a12+a10*a11)
-  local c21 = a11*a11+2*(a5*a17+a6*a16+a7*a15+a8*a14+a9*a13+a10*a12)
-  local c22 = 2*(a6*a17+a7*a16+a8*a15+a9*a14+a10*a13+a11*a12)
-  local c23 = a12*a12+2*(a7*a17+a8*a16+a9*a15+a10*a14+a11*a13)
-  local c24 = 2*(a8*a17+a9*a16+a10*a15+a11*a14+a12*a13)
-  local c25 = a13*a13+2*(a9*a17+a10*a16+a11*a15+a12*a14)
-  local c26 = 2*(a10*a17+a11*a16+a12*a15+a13*a14)
-  local c27 = a14*a14+2*(a11*a17+a12*a16+a13*a15)
-  local c28 = 2*(a12*a17+a13*a16+a14*a15)
-  local c29 = a15*a15+2*(a13*a17+a14*a16)
-  local c30 = 2*(a14*a17+a15*a16)
-  local c31 = a16*a16+2*(a15*a17)
-  local c32 = 2*(a16*a17)
-  local c33 = a17*a17
-  out[1]=c1; out[2]=c2; out[3]=c3; out[4]=c4; out[5]=c5; out[6]=c6; out[7]=c7; out[8]=c8; out[9]=c9; out[10]=c10; out[11]=c11; out[12]=c12; out[13]=c13; out[14]=c14; out[15]=c15; out[16]=c16; out[17]=c17; out[18]=c18; out[19]=c19; out[20]=c20; out[21]=c21; out[22]=c22; out[23]=c23; out[24]=c24; out[25]=c25; out[26]=c26; out[27]=c27; out[28]=c28; out[29]=c29; out[30]=c30; out[31]=c31; out[32]=c32; out[33]=c33; out[34]=0
-  return _fe_reduce(out)
-end
-
-local function _fe_bit(v, bit_index)
-  local limb = v[floor(bit_index / _FE_BITS) + 1] or 0
-  return floor(limb / _POW2[bit_index % _FE_BITS]) % 2
-end
-
-local function _fp_inv(a)
-  -- a^(p-2) where p-2 = 2^255-21, using addition chain: 254 sq + 11 mul
-  -- instead of the naive 254 sq + 253 mul bit-by-bit approach.
-  -- Key identity: 2^255-21 = 32*(2^250-1) + 11, so
-  --   a^(p-2) = (a^(2^250-1))^32 * a^11
-  local a2  = _fp_sq(a)             -- a^2
-  local a4  = _fp_sq(a2)            -- a^4
-  local a8  = _fp_sq(a4)            -- a^8
-  local a9  = _fp_mul(a8, a)        -- a^9
-  local a11 = _fp_mul(a9, a2)       -- a^11
-  local a22 = _fp_sq(a11)           -- a^22
-  local a31 = _fp_mul(a22, a9)      -- a^31 = a^(2^5-1)
-
-  local t = _fp_sq(a31)             -- a^(2^6-2)
-  t = _fp_sq(t); t = _fp_sq(t); t = _fp_sq(t); t = _fp_sq(t)
-  local a10 = _fp_mul(t, a31)       -- a^(2^10-1)
-
-  t = _fp_sq(a10)
-  for _ = 1,  9 do t = _fp_sq(t) end
-  local a20 = _fp_mul(t, a10)       -- a^(2^20-1)
-
-  t = _fp_sq(a20)
-  for _ = 1, 19 do t = _fp_sq(t) end
-  local a40 = _fp_mul(t, a20)       -- a^(2^40-1)
-
-  t = _fp_sq(a40)
-  for _ = 1,  9 do t = _fp_sq(t) end
-  local a50 = _fp_mul(t, a10)       -- a^(2^50-1)
-
-  t = _fp_sq(a50)
-  for _ = 1, 49 do t = _fp_sq(t) end
-  local a100 = _fp_mul(t, a50)      -- a^(2^100-1)
-
-  t = _fp_sq(a100)
-  for _ = 1, 99 do t = _fp_sq(t) end
-  local a200 = _fp_mul(t, a100)     -- a^(2^200-1)
-
-  t = _fp_sq(a200)
-  for _ = 1, 49 do t = _fp_sq(t) end
-  t = _fp_mul(t, a50)               -- a^(2^250-1)
-
-  -- Five more squarings: a^(2^255-32)
-  t = _fp_sq(t); t = _fp_sq(t); t = _fp_sq(t); t = _fp_sq(t); t = _fp_sq(t)
-
-  return _fp_mul(t, a11)            -- a^(2^255-32+11) = a^(2^255-21) = a^(p-2)
-end
-
-local function _fp_pow22523(z)
-  -- z^(2^252-3), used by Ed25519 sqrt_ratio.
-  local t0 = _fp_sq(z)
-  local t1 = _fp_sq(t0)
-  t1 = _fp_sq(t1)
-  t1 = _fp_mul(z, t1)
-  t0 = _fp_mul(t0, t1)
-  t0 = _fp_sq(t0)
-  t0 = _fp_mul(t1, t0)
-
-  t1 = _fp_sq(t0)
-  for _ = 1, 4 do t1 = _fp_sq(t1) end
-  t0 = _fp_mul(t1, t0)
-
-  t1 = _fp_sq(t0)
-  for _ = 1, 9 do t1 = _fp_sq(t1) end
-  t1 = _fp_mul(t1, t0)
-
-  local t2 = _fp_sq(t1)
-  for _ = 1, 19 do t2 = _fp_sq(t2) end
-  t1 = _fp_mul(t2, t1)
-
-  t1 = _fp_sq(t1)
-  for _ = 1, 9 do t1 = _fp_sq(t1) end
-  t0 = _fp_mul(t1, t0)
-
-  t1 = _fp_sq(t0)
-  for _ = 1, 49 do t1 = _fp_sq(t1) end
-  t1 = _fp_mul(t1, t0)
-
-  t2 = _fp_sq(t1)
-  for _ = 1, 99 do t2 = _fp_sq(t2) end
-  t1 = _fp_mul(t2, t1)
-
-  t1 = _fp_sq(t1)
-  for _ = 1, 49 do t1 = _fp_sq(t1) end
-  t0 = _fp_mul(t1, t0)
-
-  t0 = _fp_sq(t0)
-  t0 = _fp_sq(t0)
-  return _fp_mul(t0, z)
-end
-
-local function _le32_to_fe(s)
-  local b = {s:byte(1, 32)}
-  local out, acc, acc_bits, bi = {}, 0, 0, 1
-  for i = 1, _FE_LIMBS do
-    while acc_bits < _FE_BITS and bi <= 32 do
-      acc = acc + (b[bi] or 0) * _POW2[acc_bits]
-      acc_bits = acc_bits + 8
-      bi = bi + 1
-    end
-    out[i] = acc % _FE_BASE
-    acc = floor(acc / _FE_BASE)
-    acc_bits = acc_bits - _FE_BITS
-  end
-  return _fe_reduce(out)
-end
-
-local function _fe_to_le32(v)
-  local reduced = {}
-  for i = 1, #v do reduced[i] = v[i] end
-  v = _fe_reduce(reduced)
-  local bytes, acc, acc_bits, bi = {}, 0, 0, 1
-  for i = 1, _FE_LIMBS do
-    acc = acc + (v[i] or 0) * _POW2[acc_bits]
-    acc_bits = acc_bits + _FE_BITS
-    while acc_bits >= 8 and bi <= 32 do
-      bytes[bi] = string.char(acc % 256)
-      acc = floor(acc / 256)
-      acc_bits = acc_bits - 8
-      bi = bi + 1
-    end
-  end
-  while bi <= 32 do
-    bytes[bi] = string.char(acc % 256)
-    acc = floor(acc / 256)
-    bi = bi + 1
-  end
-  return table.concat(bytes)
-end
-
-local function _clamp32(k)
-  local b = {k:byte(1, 32)}
-  b[1]  = b[1] - (b[1] % 8)           -- clear bits 0-2
-  local top = b[32] % 128             -- clear bit 7
-  if top < 64 then top = top + 64 end -- set bit 6
-  b[32] = top
-  local out = {}
-  for i = 1, 32 do out[i] = string.char(b[i]) end
-  return table.concat(out)
-end
-
-local _X16_PRIME = {
-  [0] = 0xffed, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
-  0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0x7fff,
-}
-local _X16_CURVE_CONST = { [0] = 0xdb41, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
-
-local function _x16_carry(out)
-  for i = 0, 15 do
-    out[i] = out[i] + 0x10000
-    local c = floor(out[i] / 0x10000)
-    if i < 15 then
-      out[i + 1] = out[i + 1] + c - 1
-    else
-      out[0] = out[0] + 38 * (c - 1)
-    end
-    out[i] = out[i] % 0x10000
-  end
-end
-
-local function _x16_swap(a, b, bit)
-  local inv = 1 - bit
-  for i = 0, 15 do
-    local ai, bi = a[i], b[i]
-    a[i] = ai * inv + bi * bit
-    b[i] = bi * inv + ai * bit
-  end
-end
-
-local function _x16_unpack(out, s)
-  local bytes = { s:byte(1, 32) }
-  for i = 0, 15 do
-    out[i] = (bytes[2 * i + 1] or 0) + (bytes[2 * i + 2] or 0) * 0x100
-  end
-  out[15] = out[15] % 0x8000
-end
-
-local function _x16_pack(a)
-  local out, t, m = {}, {}, {}
-  for i = 0, 15 do t[i] = a[i] end
-  _x16_carry(t); _x16_carry(t); _x16_carry(t)
-  for _ = 0, 1 do
-    m[0] = t[0] - _X16_PRIME[0]
-    for i = 1, 15 do
-      m[i] = t[i] - _X16_PRIME[i] - (floor(m[i - 1] / 0x10000) % 2)
-      m[i - 1] = m[i - 1] % 0x10000
-    end
-    local c = floor(m[15] / 0x10000) % 2
-    _x16_swap(t, m, 1 - c)
-  end
-  for i = 0, 15 do
-    out[2 * i + 1] = string.char(t[i] % 0x100)
-    out[2 * i + 2] = string.char(floor(t[i] / 0x100))
-  end
-  return table.concat(out)
-end
-
-local function _x16_add(out, a, b)
-  for i = 0, 15 do out[i] = a[i] + b[i] end
-end
-
-local function _x16_sub(out, a, b)
-  for i = 0, 15 do out[i] = a[i] - b[i] end
-end
-
-local function _x16_mul(out, a, b, prod)
-  prod = prod or {}
-  for i = 0, 31 do prod[i] = 0 end
-  for i = 0, 15 do
-    local ai = a[i]
-    for j = 0, 15 do
-      prod[i + j] = prod[i + j] + ai * b[j]
-    end
-  end
-  for i = 0, 14 do
-    prod[i] = prod[i] + 38 * prod[i + 16]
-  end
-  for i = 0, 15 do out[i] = prod[i] end
-  _x16_carry(out); _x16_carry(out)
-end
-
-local function _x16_inv(out, a)
-  local prod = {}
-  local a2, a4, a8, a9, a11, a22, a31 = {}, {}, {}, {}, {}, {}, {}
-  local a10, a20, a40, a50, a100, a200, t = {}, {}, {}, {}, {}, {}, {}
-
-  _x16_mul(a2, a, a, prod)
-  _x16_mul(a4, a2, a2, prod)
-  _x16_mul(a8, a4, a4, prod)
-  _x16_mul(a9, a8, a, prod)
-  _x16_mul(a11, a9, a2, prod)
-  _x16_mul(a22, a11, a11, prod)
-  _x16_mul(a31, a22, a9, prod)
-
-  _x16_mul(t, a31, a31, prod)
-  for _ = 1, 4 do _x16_mul(t, t, t, prod) end
-  _x16_mul(a10, t, a31, prod)
-
-  _x16_mul(t, a10, a10, prod)
-  for _ = 1, 9 do _x16_mul(t, t, t, prod) end
-  _x16_mul(a20, t, a10, prod)
-
-  _x16_mul(t, a20, a20, prod)
-  for _ = 1, 19 do _x16_mul(t, t, t, prod) end
-  _x16_mul(a40, t, a20, prod)
-
-  _x16_mul(t, a40, a40, prod)
-  for _ = 1, 9 do _x16_mul(t, t, t, prod) end
-  _x16_mul(a50, t, a10, prod)
-
-  _x16_mul(t, a50, a50, prod)
-  for _ = 1, 49 do _x16_mul(t, t, t, prod) end
-  _x16_mul(a100, t, a50, prod)
-
-  _x16_mul(t, a100, a100, prod)
-  for _ = 1, 99 do _x16_mul(t, t, t, prod) end
-  _x16_mul(a200, t, a100, prod)
-
-  _x16_mul(t, a200, a200, prod)
-  for _ = 1, 49 do _x16_mul(t, t, t, prod) end
-  _x16_mul(t, t, a50, prod)
-
-  for _ = 1, 5 do _x16_mul(t, t, t, prod) end
-  _x16_mul(out, t, a11, prod)
-end
-
--- Experimental 16-limb TweetNaCl-style X25519 backend.
+-- ===== X25519 (Montgomery ladder, RFC 7748) =====
 function X25519Pure.mul(k_bytes, u_bytes)
-  local x, a, b, c, d, e, f, scalar = {}, {}, {}, {}, {}, {}, {}, {}
-  local prod = {}
-  _x16_unpack(x, u_bytes)
-  for i = 0, 15 do
-    a[i], b[i], c[i], d[i] = 0, x[i], 0, 0
-  end
-  a[0], d[0] = 1, 1
+  _ensure_curve()
+  local ub = { u_bytes:byte(1, 32) }
+  ub[32] = ub[32] % 128
+  local ustr = {}
+  for i = 1, 32 do ustr[i] = string.char(ub[i]) end
+  local x1 = le_to_bn(table.concat(ustr))
 
   local kb = { k_bytes:byte(1, 32) }
-  for i = 0, 30 do scalar[i] = kb[i + 1] end
-  scalar[0] = scalar[0] - scalar[0] % 8
-  scalar[31] = (kb[32] or 0) % 64 + 64
+  kb[1] = kb[1] - (kb[1] % 8)
+  kb[32] = kb[32] % 64 + 64
 
-  for i = 254, 0, -1 do
-    local bit = floor(scalar[floor(i / 8)] / _POW2[i % 8]) % 2
-    _x16_swap(a, b, bit)
-    _x16_swap(c, d, bit)
-    _x16_add(e, a, c)
-    _x16_sub(a, a, c)
-    _x16_add(c, b, d)
-    _x16_sub(b, b, d)
-    _x16_mul(d, e, e, prod)
-    _x16_mul(f, a, a, prod)
-    _x16_mul(a, c, a, prod)
-    _x16_mul(c, b, e, prod)
-    _x16_add(e, a, c)
-    _x16_sub(a, a, c)
-    _x16_mul(b, a, a, prod)
-    _x16_sub(c, d, f)
-    _x16_mul(a, c, _X16_CURVE_CONST, prod)
-    _x16_add(a, a, d)
-    _x16_mul(c, c, a, prod)
-    _x16_mul(a, d, f, prod)
-    _x16_mul(d, b, x, prod)
-    _x16_mul(b, e, e, prod)
-    _x16_swap(a, b, bit)
-    _x16_swap(c, d, bit)
+  local x2, z2 = _F1, _F0
+  local x3, z3 = x1, _F1
+  local swap = 0
+  for t = 254, 0, -1 do
+    local kt = _le_bit(kb, t)
+    swap = (swap + kt) % 2
+    if swap == 1 then x2, x3 = x3, x2; z2, z3 = z3, z2 end
+    swap = kt
+    local a = fadd(x2, z2)
+    local aa = fsqr(a)
+    local b = fsub(x2, z2)
+    local bb = fsqr(b)
+    local e = fsub(aa, bb)
+    local c = fadd(x3, z3)
+    local d = fsub(x3, z3)
+    local da = fmul(d, a)
+    local cb = fmul(c, b)
+    x3 = fsqr(fadd(da, cb))
+    z3 = fmul(x1, fsqr(fsub(da, cb)))
+    x2 = fmul(aa, bb)
+    z2 = fmul(e, fadd(aa, fmul(_A24, e)))
   end
-
-  _x16_inv(c, c)
-  _x16_mul(a, a, c, prod)
-  return _x16_pack(a)
+  if swap == 1 then x2, x3 = x3, x2; z2, z3 = z3, z2 end
+  return bn_to_le(fmul(x2, finv(z2)), 32)
 end
 
 -- Base point u=9 in little-endian
 X25519Pure.BASE_POINT = string.char(9) .. string.rep("\0", 31)
-
--- Pure-Lua Ed25519 (RFC 8032). Used because Control4's lua-openssl binding
--- exposes Ed25519 keys but routes signing through a digest API that OpenSSL
--- rejects for PureEdDSA.
 local Ed25519Pure = {}
 
 local function _sha512_bytes(data)
@@ -2185,634 +1471,167 @@ local function _sha512_bytes(data)
   local ctx = openssl.digest.new("sha512")
   assert(ctx, "SHA-512 not available in openssl.digest")
   ctx:update(data)
-  return ctx:final()
-end
-
-local _ED_L = {
-  21485, 14827, 3177, 16531, 19813, 24307, 30632, 28540, 20,
-  0, 0, 0, 0, 0, 0, 0, 4096, 0,
-}
-local _ED_D = {
-  30883, 9906, 14120, 12122, 2743, 10299, 4944, 14341, 6144,
-  29649, 26077, 14851, 14540, 32718, 2779, 13943, 20995,
-}
-local _ED_2D = {
-  29017, 19813, 28240, 24244, 5486, 20598, 9888, 28682, 12288,
-  26530, 19387, 29703, 29080, 32668, 5559, 27886, 9222,
-}
-local _ED_SQRT_M1 = {
-  8368, 5149, 27805, 10096, 18316, 9724, 427, 8588, 10031,
-  30639, 25847, 26628, 12980, 15329, 5104, 4672, 11139,
-}
-local _ED_BASE = {
-  X = {21786, 7755, 13698, 19121, 31532, 9396, 22565, 5731, 23657, 11704, 18423, 10001, 27658, 19071, 29531, 7017, 8553},
-  Y = {26200, 19660, 6553, 13107, 26214, 19660, 6553, 13107, 26214, 19660, 6553, 13107, 26214, 19660, 6553, 13107, 26214},
-  Z = _fe_from_number(1),
-  T = nil,
-}
-_ED_BASE.T = _fp_mul(_ED_BASE.X, _ED_BASE.Y)
-local _ED_ZERO_FE = _fe_from_number(0)
-
-local function _limb_copy(v, n)
-  local out = {}
-  for i = 1, n or #v do out[i] = v[i] or 0 end
-  return out
-end
-
-local function _scalar_trim(v)
-  while #v > 1 and v[#v] == 0 do v[#v] = nil end
-  if #v == 0 then v[1] = 0 end
-  return v
-end
-
-local function _scalar_compare(a, b)
-  _scalar_trim(a); _scalar_trim(b)
-  if #a ~= #b then return #a < #b and -1 or 1 end
-  for i = #a, 1, -1 do
-    if (a[i] or 0) ~= (b[i] or 0) then return (a[i] or 0) < (b[i] or 0) and -1 or 1 end
+  local digest = ctx:final()
+  -- Some lua-openssl builds return the digest as a hex string; normalize to raw.
+  if type(digest) == "string" and #digest == 128 then
+    digest = (digest:gsub("..", function(cc) return string.char(tonumber(cc, 16)) end))
   end
-  return 0
+  return digest
 end
 
-local function _scalar_sub(a, b)
-  local out, borrow = {}, 0
-  for i = 1, #a do
-    local value = (a[i] or 0) - (b[i] or 0) - borrow
-    if value < 0 then
-      value = value + _FE_BASE
-      borrow = 1
-    else
-      borrow = 0
-    end
-    out[i] = value
+-- Ed25519 (RFC 8032) on native openssl.bn. Extended twisted-Edwards coordinates,
+-- variable-base double-and-add scalar multiplication (no precomputed tables),
+-- point decompression via bn.sqrtmod. SHA-512 stays native via _sha512_bytes.
+local function _point_add(pp, qp)
+  local a = fmul(fsub(pp.Y, pp.X), fsub(qp.Y, qp.X))
+  local b = fmul(fadd(pp.Y, pp.X), fadd(qp.Y, qp.X))
+  local c = fmul(fmul(pp.T, qp.T), _D2)
+  local zz = fmul(pp.Z, qp.Z)
+  local d = fadd(zz, zz)
+  local e = fsub(b, a)
+  local f = fsub(d, c)
+  local g = fadd(d, c)
+  local h = fadd(b, a)
+  return { X = fmul(e, f), Y = fmul(g, h), Z = fmul(f, g), T = fmul(e, h) }
+end
+
+local function _point_double(pp)
+  local a = fsqr(pp.X)
+  local b = fsqr(pp.Y)
+  local z2 = fsqr(pp.Z)
+  local c = fadd(z2, z2)
+  local d = fsub(_F0, a)
+  local e = fsub(fsub(fsqr(fadd(pp.X, pp.Y)), a), b)
+  local g = fadd(d, b)
+  local f = fsub(g, c)
+  local h = fsub(d, b)
+  return { X = fmul(e, f), Y = fmul(g, h), Z = fmul(f, g), T = fmul(e, h) }
+end
+
+-- scalar mult over a 32-byte little-endian scalar (double-and-add, no table)
+local function _scalar_mult(point, scalar_le)
+  _ensure_curve()
+  local r = _IDENT
+  local bytes = { scalar_le:byte(1, 32) }
+  for i = 255, 0, -1 do
+    r = _point_double(r)
+    if _le_bit(bytes, i) == 1 then r = _point_add(r, point) end
   end
-  return _scalar_trim(out)
+  return r
 end
 
-local function _scalar_bit_length(v)
-  _scalar_trim(v)
-  local top = v[#v]
-  local bits = (#v - 1) * _FE_BITS
-  while top > 0 do bits = bits + 1; top = math.floor(top / 2) end
-  return bits
+local function _point_equal(pp, qp)
+  return _bn.iszero(fsub(fmul(pp.X, qp.Z), fmul(qp.X, pp.Z)))
+     and _bn.iszero(fsub(fmul(pp.Y, qp.Z), fmul(qp.Y, pp.Z)))
 end
 
-local function _scalar_shift_left(v, bits)
-  local limb_shift = math.floor(bits / _FE_BITS)
-  local bit_shift = bits % _FE_BITS
-  local factor = 2 ^ bit_shift
-  local out = {}
-  for i = 1, limb_shift do out[i] = 0 end
-  local carry = 0
-  for i = 1, #v do
-    local value = v[i] * factor + carry
-    out[i + limb_shift] = value % _FE_BASE
-    carry = math.floor(value / _FE_BASE)
-  end
-  if carry > 0 then out[#out + 1] = carry end
-  return _scalar_trim(out)
+local function _encode_point(pt)
+  local zi = finv(pt.Z)
+  local x = fmul(pt.X, zi)
+  local y = fmul(pt.Y, zi)
+  local s = bn_to_le(y, 32)
+  local b = { s:byte(1, 32) }
+  b[32] = b[32] % 128 + (_bn.isodd(x) and 128 or 0)
+  local o = {}
+  for i = 1, 32 do o[i] = string.char(b[i]) end
+  return table.concat(o)
 end
 
-local function _scalar_shift_right_one(v)
-  local out, carry = {}, 0
-  for i = #v, 1, -1 do
-    local value = v[i] + carry * _FE_BASE
-    out[i] = math.floor(value / 2)
-    carry = value % 2
-  end
-  return _scalar_trim(out)
-end
-
-local function _scalar_reduce(v)
-  v = _scalar_trim(_limb_copy(v))
-  local shift = _scalar_bit_length(v) - _scalar_bit_length(_ED_L)
-  if shift < 0 then return v end
-  local shifted = _scalar_shift_left(_ED_L, shift)
-  for _ = 0, shift do
-    if _scalar_compare(v, shifted) >= 0 then
-      v = _scalar_sub(v, shifted)
-    end
-    shifted = _scalar_shift_right_one(shifted)
-  end
-  return _scalar_trim(v)
-end
-
-local function _scalar_from_le_bytes_mod(s)
-  local b = {s:byte(1, #s)}
-  local v, acc, acc_bits, bi = {}, 0, 0, 1
-  local limb = 1
-  while bi <= #b do
-    while acc_bits < _FE_BITS and bi <= #b do
-      acc = acc + (b[bi] or 0) * _POW2[acc_bits]
-      acc_bits = acc_bits + 8
-      bi = bi + 1
-    end
-    v[limb] = acc % _FE_BASE
-    acc = floor(acc / _FE_BASE)
-    acc_bits = acc_bits - _FE_BITS
-    limb = limb + 1
-  end
-  if acc > 0 then v[limb] = acc end
-  return _scalar_reduce(_fe_carry(v))
-end
-
-local function _scalar_to_le32(v)
-  v = _scalar_reduce(v)
-  local bytes, acc, acc_bits, bi = {}, 0, 0, 1
-  for i = 1, #v do
-    acc = acc + (v[i] or 0) * _POW2[acc_bits]
-    acc_bits = acc_bits + _FE_BITS
-    while acc_bits >= 8 and bi <= 32 do
-      bytes[bi] = string.char(acc % 256)
-      acc = floor(acc / 256)
-      acc_bits = acc_bits - 8
-      bi = bi + 1
-    end
-  end
-  while bi <= 32 do
-    bytes[bi] = string.char(acc % 256)
-    acc = floor(acc / 256)
-    bi = bi + 1
-  end
-  return table.concat(bytes)
-end
-
-local function _scalar_add(a, b)
-  local out = {}
-  local n = math.max(#a, #b)
-  for i = 1, n do out[i] = (a[i] or 0) + (b[i] or 0) end
-  return _scalar_reduce(_fe_carry(out))
-end
-
-local function _scalar_mul(a, b)
-  local out = {}
-  for i = 1, #a + #b do out[i] = 0 end
-  for i = 1, #a do
-    local carry = 0
-    for j = 1, #b do
-      local k = i + j - 1
-      local value = out[k] + (a[i] or 0) * (b[j] or 0) + carry
-      out[k] = value % _FE_BASE
-      carry = math.floor(value / _FE_BASE)
-    end
-    local k = i + #b
-    while carry > 0 do
-      local value = (out[k] or 0) + carry
-      out[k] = value % _FE_BASE
-      carry = math.floor(value / _FE_BASE)
-      k = k + 1
-    end
-  end
-  return _scalar_reduce(out)
-end
-
-local function _ed_identity()
-  return { X = _fe_from_number(0), Y = _fe_from_number(1), Z = _fe_from_number(1), T = _fe_from_number(0) }
-end
-
-local function _ed_point_add(P, Q)
-  local T1, T2 = {}, {}
-  local A = _fp_mul(_fp_sub_into(T1, P.Y, P.X), _fp_sub_into(T2, Q.Y, Q.X))
-  local B = _fp_mul(_fp_add_into(T1, P.Y, P.X), _fp_add_into(T2, Q.Y, Q.X))
-  local C = _fp_mul(_fp_mul(P.T, Q.T), _ED_2D)
-  local ZZ = _fp_mul(P.Z, Q.Z)
-  local D = _fp_add_into({}, ZZ, ZZ)
-  local E = _fp_sub_into({}, B, A)
-  local F = _fp_sub_into({}, D, C)
-  local G = _fp_add_into({}, D, C)
-  local H = _fp_add_into({}, B, A)
-  return {
-    X = _fp_mul(E, F),
-    Y = _fp_mul(G, H),
-    Z = _fp_mul(F, G),
-    T = _fp_mul(E, H),
-  }
-end
-
-local function _ed_point_double(P)
-  local A = _fp_sq(P.X)
-  local B = _fp_sq(P.Y)
-  local Z2 = _fp_sq(P.Z)
-  local C = _fp_add(Z2, Z2)
-  local D = _fp_sub(_ED_ZERO_FE, A)
-  local E = _fp_sub(_fp_sub(_fp_sq(_fp_add(P.X, P.Y)), A), B)
-  local G = _fp_add(D, B)
-  local F = _fp_sub(G, C)
-  local H = _fp_sub(D, B)
-  return {
-    X = _fp_mul(E, F),
-    Y = _fp_mul(G, H),
-    Z = _fp_mul(F, G),
-    T = _fp_mul(E, H),
-  }
-end
-
-local function _ed_scalar_bit(s, bit_index)
-  return _fe_bit(s, bit_index)
-end
-
-local function _ed_scalar_mult(point, scalar)
-  local result = _ed_identity()
-  for bit = _scalar_bit_length(scalar) - 1, 0, -1 do
-    result = _ed_point_double(result)
-    if _ed_scalar_bit(scalar, bit) == 1 then
-      result = _ed_point_add(result, point)
-    end
-  end
-  return result
-end
-
-local _ED_BASE_WINDOW = 5
-local _ED_BASE_WINDOW_SIZE = 2 ^ _ED_BASE_WINDOW
-local _ED_FIXED_TABLE_WINDOWS = math.ceil(256 / _ED_BASE_WINDOW)
-local _ED_FIXED_TABLE_HEX_LEN = _ED_FIXED_TABLE_WINDOWS * _ED_BASE_WINDOW_SIZE * 4 * _FE_LIMBS * 4
-local _ED_POINT_COORDS = { "X", "Y", "Z", "T" }
-local _ED_BASE_TABLE = nil
-local _ED_BASE_TABLE_PREWARMED = false
-
-local function _ed_build_base_table()
-  local table_by_window = {}
-  local base = _ED_BASE
-  for window = 1, _ED_FIXED_TABLE_WINDOWS do
-    local multiples = {}
-    multiples[0] = _ed_identity()
-    multiples[1] = base
-    for digit = 2, _ED_BASE_WINDOW_SIZE - 1 do
-      multiples[digit] = _ed_point_add(multiples[digit - 1], base)
-    end
-    table_by_window[window] = multiples
-    for _ = 1, _ED_BASE_WINDOW do
-      base = _ed_point_double(base)
-    end
-  end
-  return table_by_window
-end
-
-local function _ed_build_fixed_point_table(point)
-  local table_by_window = {}
-  local base = point
-  for window = 1, _ED_FIXED_TABLE_WINDOWS do
-    local multiples = {}
-    multiples[0] = _ed_identity()
-    multiples[1] = base
-    for digit = 2, _ED_BASE_WINDOW_SIZE - 1 do
-      multiples[digit] = _ed_point_add(multiples[digit - 1], base)
-    end
-    table_by_window[window] = multiples
-    for _ = 1, _ED_BASE_WINDOW do
-      base = _ed_point_double(base)
-    end
-  end
-  return table_by_window
-end
-
-local function _ed_serialize_fixed_point_table(fixed_table)
-  assert(type(fixed_table) == "table", "fixed point table is required")
-  local out = {}
-  for window = 1, _ED_FIXED_TABLE_WINDOWS do
-    local multiples = assert(fixed_table[window], "fixed point table window missing")
-    for digit = 0, _ED_BASE_WINDOW_SIZE - 1 do
-      local point = assert(multiples[digit], "fixed point table digit missing")
-      for _, coord_name in ipairs(_ED_POINT_COORDS) do
-        local coord = assert(point[coord_name], "fixed point table coordinate missing")
-        for limb = 1, _FE_LIMBS do
-          out[#out + 1] = string.format("%04x", coord[limb] or 0)
-        end
-      end
-    end
-  end
-  return table.concat(out)
-end
-
-local function _ed_deserialize_fixed_point_table(encoded)
-  if type(encoded) ~= "string" or #encoded ~= _ED_FIXED_TABLE_HEX_LEN then
-    return nil, "invalid Ed25519 fixed table length"
-  end
-  local pos = 1
-  local table_by_window = {}
-  for window = 1, _ED_FIXED_TABLE_WINDOWS do
-    local multiples = {}
-    for digit = 0, _ED_BASE_WINDOW_SIZE - 1 do
-      local point = {}
-      for _, coord_name in ipairs(_ED_POINT_COORDS) do
-        local coord = {}
-        for limb = 1, _FE_LIMBS do
-          local chunk = encoded:sub(pos, pos + 3)
-          local value = tonumber(chunk, 16)
-          if value == nil or value >= _FE_BASE then
-            return nil, "invalid Ed25519 fixed table limb"
-          end
-          coord[limb] = value
-          pos = pos + 4
-        end
-        point[coord_name] = coord
-      end
-      multiples[digit] = point
-    end
-    table_by_window[window] = multiples
-  end
-  return table_by_window
-end
-
-local function _ed_point_neg(P)
-  return {
-    X = _fp_sub(_ED_ZERO_FE, P.X),
-    Y = P.Y,
-    Z = P.Z,
-    T = _fp_sub(_ED_ZERO_FE, P.T),
-  }
-end
-
-local function _ed_negate_fixed_point_table(fixed_table)
-  local negated = {}
-  for window = 1, #fixed_table do
-    local src = fixed_table[window]
-    local dst = {}
-    for digit = 0, _ED_BASE_WINDOW_SIZE - 1 do
-      dst[digit] = _ed_point_neg(src[digit])
-    end
-    negated[window] = dst
-  end
-  return negated
-end
-
-local function _ed_base_window_digit(scalar, window_index)
-  local digit = 0
-  local first_bit = (window_index - 1) * _ED_BASE_WINDOW
-  for bit = 0, _ED_BASE_WINDOW - 1 do
-    if _ed_scalar_bit(scalar, first_bit + bit) == 1 then
-      digit = digit + 2 ^ bit
-    end
-  end
-  return digit
-end
-
-local _ed_scalar_mult_fixed_table
-
-local function _ed_scalar_mult_base(scalar)
-  if not _ED_BASE_TABLE then
-    _ED_BASE_TABLE = _ed_build_base_table()
-    _ED_BASE_TABLE_PREWARMED = true
-  end
-  return _ed_scalar_mult_fixed_table(_ED_BASE_TABLE, scalar)
-end
-
-function _ed_scalar_mult_fixed_table(fixed_table, scalar)
-  local result = _ed_identity()
-  for window = 1, #fixed_table do
-    local digit = _ed_base_window_digit(scalar, window)
-    if digit ~= 0 then
-      result = _ed_point_add(result, fixed_table[window][digit])
-    end
-  end
-  return result
-end
-
-local function _ed_double_scalar_base_plus_fixed(base_scalar, fixed_table, fixed_scalar)
-  if not _ED_BASE_TABLE then
-    _ED_BASE_TABLE = _ed_build_base_table()
-    _ED_BASE_TABLE_PREWARMED = true
-  end
-  local result = _ed_identity()
-  local window_count = math.max(#_ED_BASE_TABLE, #fixed_table)
-  for window = 1, window_count do
-    local base_digit = _ed_base_window_digit(base_scalar, window)
-    if base_digit ~= 0 then
-      result = _ed_point_add(result, _ED_BASE_TABLE[window][base_digit])
-    end
-    local fixed_digit = _ed_base_window_digit(fixed_scalar, window)
-    if fixed_digit ~= 0 then
-      result = _ed_point_add(result, fixed_table[window][fixed_digit])
-    end
-  end
-  return result
-end
-
-local function _ed_scalar_mult_window(point, scalar)
-  local multiples = {}
-  multiples[0] = _ed_identity()
-  multiples[1] = point
-  for digit = 2, _ED_BASE_WINDOW_SIZE - 1 do
-    multiples[digit] = _ed_point_add(multiples[digit - 1], point)
-  end
-
-  local result = _ed_identity()
-  local window_count = math.ceil(math.max(1, _scalar_bit_length(scalar)) / _ED_BASE_WINDOW)
-  for window = window_count, 1, -1 do
-    for _ = 1, _ED_BASE_WINDOW do
-      result = _ed_point_double(result)
-    end
-    local digit = _ed_base_window_digit(scalar, window)
-    if digit ~= 0 then
-      result = _ed_point_add(result, multiples[digit])
-    end
-  end
-  return result
-end
-
-local function _ed_point_equal(P, Q)
-  return _fe_compare(_fp_mul(P.X, Q.Z), _fp_mul(Q.X, P.Z)) == 0 and
-    _fe_compare(_fp_mul(P.Y, Q.Z), _fp_mul(Q.Y, P.Z)) == 0
-end
-
-local function _ed_sqrt_ratio(u, v)
-  local v2 = _fp_sq(v)
-  local v3 = _fp_mul(v2, v)
-  local v7 = _fp_mul(_fp_sq(v2), v3)
-  local x = _fp_mul(_fp_mul(u, v3), _fp_pow22523(_fp_mul(u, v7)))
-  local check = _fp_mul(v, _fp_sq(x))
-  if _fe_compare(check, u) ~= 0 then
-    x = _fp_mul(x, _ED_SQRT_M1)
-    check = _fp_mul(v, _fp_sq(x))
-  end
-  if _fe_compare(check, u) ~= 0 then
-    return nil
-  end
-  return x
-end
-
-local function _ed_encode_point(P)
-  local iz = _fp_inv(P.Z)
-  local x = _fp_mul(P.X, iz)
-  local y = _fp_mul(P.Y, iz)
-  local out = { _fe_to_le32(y):byte(1, 32) }
-  out[32] = out[32] + (_fe_bit(x, 0) * 128)
-  local bytes = {}
-  for i = 1, 32 do bytes[i] = string.char(out[i]) end
-  return table.concat(bytes)
-end
-
-local function _ed_decode_point(s)
+local function _decode_point(s)
   if type(s) ~= "string" or #s ~= 32 then return nil end
-  local bytes = { s:byte(1, 32) }
-  local sign = math.floor(bytes[32] / 128)
-  bytes[32] = bytes[32] % 128
-  local y_parts = {}
-  for i = 1, 32 do y_parts[i] = string.char(bytes[i]) end
-  local y = _le32_to_fe(table.concat(y_parts))
-  local y2 = _fp_sq(y)
-  local u = _fp_sub(y2, _fe_from_number(1))
-  local v = _fp_add(_fp_mul(_ED_D, y2), _fe_from_number(1))
-  local x = _ed_sqrt_ratio(u, v)
-  if not x then return nil end
-  if _fe_bit(x, 0) ~= sign then
-    x = _fp_sub(_fe_from_number(0), x)
-  end
-  return { X = x, Y = y, Z = _fe_from_number(1), T = _fp_mul(x, y) }
+  local b = { s:byte(1, 32) }
+  local sign = math.floor(b[32] / 128)
+  b[32] = b[32] % 128
+  local yb = {}
+  for i = 1, 32 do yb[i] = string.char(b[i]) end
+  local y = le_to_bn(table.concat(yb))
+  if _bn.compare(y, _P) >= 0 then return nil end
+  local x = _recover_x(y, sign)
+  if x == nil then return nil end
+  return { X = x, Y = y, Z = _F1, T = fmul(x, y) }
 end
 
-local function _ed_clamped_scalar_from_hash(h)
-  local b = { h:byte(1, 32) }
+local function _clamp(h32)
+  local b = { h32:byte(1, 32) }
   b[1] = b[1] - (b[1] % 8)
-  b[32] = (b[32] % 64) + 64
-  local s = {}
-  for i = 1, 32 do s[i] = string.char(b[i]) end
-  return _scalar_from_le_bytes_mod(table.concat(s))
+  b[32] = b[32] % 64 + 64
+  local o = {}
+  for i = 1, 32 do o[i] = string.char(b[i]) end
+  return table.concat(o)
+end
+
+-- hash (64-byte LE) reduced mod L
+local function _hash_scalar(bytes64)
+  return _bn.mod(le_to_bn(bytes64), _L)
 end
 
 function Ed25519Pure.public_key_from_private(private_key)
+  _ensure_curve()
   local h = _sha512_bytes(private_key)
-  local a = _ed_clamped_scalar_from_hash(h)
-  return _ed_encode_point(_ed_scalar_mult_base(a))
+  local a_le = _clamp(h:sub(1, 32))
+  return _encode_point(_scalar_mult(_B, a_le))
 end
 
 function Ed25519Pure.expand_private_key(private_key)
   assert(type(private_key) == "string" and #private_key == 32, "Ed25519 private key must be 32 bytes")
+  _ensure_curve()
   local h = _sha512_bytes(private_key)
-  local a = _ed_clamped_scalar_from_hash(h)
+  local a_le = _clamp(h:sub(1, 32))
   return {
     private_key = private_key,
-    scalar = a,
+    scalar = le_to_bn(a_le),
+    scalar_le = a_le,
     prefix = h:sub(33, 64),
-    public_key = _ed_encode_point(_ed_scalar_mult_base(a)),
+    public_key = _encode_point(_scalar_mult(_B, a_le)),
   }
 end
 
-function Ed25519Pure.prewarm()
-  if _ED_BASE_TABLE_PREWARMED and _ED_BASE_TABLE then
-    return false
-  end
-  _ED_BASE_TABLE = _ed_build_base_table()
-  _ED_BASE_TABLE_PREWARMED = true
-  return true
-end
-
-function Ed25519Pure.base_table_ready()
-  return _ED_BASE_TABLE_PREWARMED and _ED_BASE_TABLE ~= nil
-end
-
-function Ed25519Pure.serialize_base_table()
-  if not _ED_BASE_TABLE then
-    Ed25519Pure.prewarm()
-  end
-  return _ed_serialize_fixed_point_table(_ED_BASE_TABLE)
-end
-
-function Ed25519Pure.restore_base_table(encoded)
-  local fixed_table, err = _ed_deserialize_fixed_point_table(encoded)
-  if not fixed_table then
-    return false, err
-  end
-  local base = fixed_table[1] and fixed_table[1][1]
-  if not base or _fe_compare(base.X, _ED_BASE.X) ~= 0 or _fe_compare(base.Y, _ED_BASE.Y) ~= 0 then
-    return false, "Ed25519 fixed-base cache does not match base point"
-  end
-  _ED_BASE_TABLE = fixed_table
-  _ED_BASE_TABLE_PREWARMED = true
-  return true
-end
-
 function Ed25519Pure.sign(private_key, public_key, message)
+  _ensure_curve()
   local h = _sha512_bytes(private_key)
-  local a = _ed_clamped_scalar_from_hash(h)
+  local a_le = _clamp(h:sub(1, 32))
+  local a = le_to_bn(a_le)
   local prefix = h:sub(33, 64)
-  local r = _scalar_from_le_bytes_mod(_sha512_bytes(prefix .. message))
-  local R = _ed_encode_point(_ed_scalar_mult_base(r))
-  local k = _scalar_from_le_bytes_mod(_sha512_bytes(R .. public_key .. message))
-  local S = _scalar_add(r, _scalar_mul(k, a))
-  return R .. _scalar_to_le32(S)
+  local r = _hash_scalar(_sha512_bytes(prefix .. message))
+  local R = _encode_point(_scalar_mult(_B, bn_to_le(r, 32)))
+  local k = _hash_scalar(_sha512_bytes(R .. public_key .. message))
+  local S = _bn.addmod(r, _bn.mulmod(k, a, _L), _L)
+  return R .. bn_to_le(S, 32)
 end
 
 function Ed25519Pure.sign_expanded(expanded, message)
   assert(type(expanded) == "table", "expanded Ed25519 private key is required")
   assert(type(expanded.public_key) == "string" and #expanded.public_key == 32, "expanded Ed25519 public key is invalid")
   assert(type(expanded.prefix) == "string" and #expanded.prefix == 32, "expanded Ed25519 prefix is invalid")
-  assert(type(expanded.scalar) == "table", "expanded Ed25519 scalar is invalid")
-  local r = _scalar_from_le_bytes_mod(_sha512_bytes(expanded.prefix .. message))
-  local R = _ed_encode_point(_ed_scalar_mult_base(r))
-  local k = _scalar_from_le_bytes_mod(_sha512_bytes(R .. expanded.public_key .. message))
-  local S = _scalar_add(r, _scalar_mul(k, expanded.scalar))
-  return R .. _scalar_to_le32(S)
-end
-
-local function _ed_verify_internal(public_key, signature, message, collect_profile, decoded_public_key, fixed_public_table, negative_fixed_public_table)
-  local profile = collect_profile and {} or nil
-  if type(signature) ~= "string" or #signature ~= 64 then
-    return false, profile
-  end
-  local A = decoded_public_key or _ed_decode_point(public_key)
-  local R = _ed_decode_point(signature:sub(1, 32))
-  if not A or not R then return false, profile end
-
-  local S = _scalar_from_le_bytes_mod(signature:sub(33, 64))
-  if _scalar_to_le32(S) ~= signature:sub(33, 64) then
-    return false, profile
-  end
-  local k = _scalar_from_le_bytes_mod(_sha512_bytes(signature:sub(1, 32) .. public_key .. message))
-
-  local ok
-  if negative_fixed_public_table then
-    local combined = _ed_double_scalar_base_plus_fixed(S, negative_fixed_public_table, k)
-    ok = _ed_point_equal(combined, R)
-  else
-    local left = _ed_scalar_mult_base(S)
-
-    local kA
-    if fixed_public_table then
-      kA = _ed_scalar_mult_fixed_table(fixed_public_table, k)
-    else
-      kA = _ed_scalar_mult_window(A, k)
-    end
-    local right = _ed_point_add(R, kA)
-
-    ok = _ed_point_equal(left, right)
-  end
-  return ok, profile
+  _ensure_curve()
+  local a = expanded.scalar or le_to_bn(expanded.scalar_le)
+  local r = _hash_scalar(_sha512_bytes(expanded.prefix .. message))
+  local R = _encode_point(_scalar_mult(_B, bn_to_le(r, 32)))
+  local k = _hash_scalar(_sha512_bytes(R .. expanded.public_key .. message))
+  local S = _bn.addmod(r, _bn.mulmod(k, a, _L), _L)
+  return R .. bn_to_le(S, 32)
 end
 
 function Ed25519Pure.verify(public_key, signature, message)
-  local ok = _ed_verify_internal(public_key, signature, message, false)
-  return ok
-end
-
-function Ed25519Pure.verify_profile(public_key, signature, message, decoded_public_key, fixed_public_table, negative_fixed_public_table)
-  return _ed_verify_internal(public_key, signature, message, true, decoded_public_key, fixed_public_table, negative_fixed_public_table)
-end
-
-function Ed25519Pure.verify_cached(public_key, signature, message, decoded_public_key, fixed_public_table, negative_fixed_public_table)
-  return _ed_verify_internal(public_key, signature, message, false, decoded_public_key, fixed_public_table, negative_fixed_public_table)
+  _ensure_curve()
+  if type(signature) ~= "string" or #signature ~= 64 then return false end
+  local R = signature:sub(1, 32)
+  local Rpt = _decode_point(R)
+  if not Rpt then return false end
+  local A = _decode_point(public_key)
+  if not A then return false end
+  local S = le_to_bn(signature:sub(33, 64))
+  if _bn.compare(S, _L) >= 0 then return false end
+  local k = _hash_scalar(_sha512_bytes(R .. public_key .. message))
+  local lhs = _scalar_mult(_B, bn_to_le(S, 32))
+  local rhs = _point_add(Rpt, _scalar_mult(A, bn_to_le(k, 32)))
+  return _point_equal(lhs, rhs)
 end
 
 function Ed25519Pure.decode_public_key(public_key)
-  return _ed_decode_point(public_key)
+  _ensure_curve()
+  return _decode_point(public_key)
 end
-
-function Ed25519Pure.fixed_point_table(point)
-  return _ed_build_fixed_point_table(point)
-end
-
-function Ed25519Pure.serialize_fixed_point_table(fixed_table)
-  return _ed_serialize_fixed_point_table(fixed_table)
-end
-
-function Ed25519Pure.restore_fixed_point_table(encoded)
-  return _ed_deserialize_fixed_point_table(encoded)
-end
-
-function Ed25519Pure.negate_fixed_point_table(fixed_table)
-  return _ed_negate_fixed_point_table(fixed_table)
-end
-
 function SRP.sha512(data)
   return _sha512_bytes(data)
 end
@@ -2826,79 +1645,66 @@ local function srp_xor_bytes(a, b)
   return table.concat(out)
 end
 
+-- SRP-3072 bignums run on native openssl.bn (powmod / mulmod / submod).
+local function _srp_bn()
+  _ensure_curve()
+  return _bn
+end
+local function _srp_to_bytes(v, len)
+  local be = _bn.totext(v)
+  if #be > len then be = be:sub(#be - len + 1) end
+  if #be < len then be = string.rep("\0", len - #be) .. be end
+  return be
+end
+
 function SRP.init()
   if SRP._initialized then return end
-  SRP._n_prime = compute_n_prime(SRP.N[1])
-  SRP._R2 = compute_r2_mod_n(SRP.N, SRP.N_LIMBS)
-  SRP._k_bytes = SRP.sha512(SRP.N_BYTES .. BigInt.to_bytes_be(SRP.g, 384))
+  local bn = _srp_bn()
+  SRP.N = bn.text(SRP.N_BYTES)
+  SRP.g = bn.number(5)
+  SRP._k_bytes = SRP.sha512(SRP.N_BYTES .. _srp_to_bytes(SRP.g, 384))
   SRP._initialized = true
 end
 
 function SRP.compute_x(salt, pin)
   local inner = SRP.sha512("Pair-Setup:" .. tostring(pin))
-  return BigInt.from_bytes_be(SRP.sha512(salt .. inner))
+  return _srp_bn().text(SRP.sha512(salt .. inner))
 end
 
 function SRP.compute_A(a_bytes)
   SRP.init()
-  if SRP._modpow then
-    return SRP._modpow(BigInt.to_minimal_bytes_be(SRP.g), a_bytes, 384)
-  end
-  local a = BigInt.from_bytes_be(a_bytes)
-  local A = BigInt.mont_modpow(SRP.g, a, SRP.N, SRP._R2, SRP.N_LIMBS, SRP._n_prime)
-  return BigInt.to_bytes_be(A, 384)
+  local bn = _srp_bn()
+  return _srp_to_bytes(bn.powmod(SRP.g, bn.text(a_bytes), SRP.N), 384)
 end
 
 function SRP.compute_u(A_bytes, B_bytes)
-  return BigInt.from_bytes_be(SRP.sha512(A_bytes .. B_bytes))
+  return _srp_bn().text(SRP.sha512(A_bytes .. B_bytes))
 end
 
 function SRP.compute_session_key(B_bytes, a_bytes, x, u)
   SRP.init()
-  local B_big = BigInt.from_bytes_be(B_bytes)
-  local a = BigInt.from_bytes_be(a_bytes)
-  local k_big = BigInt.from_bytes_be(SRP._k_bytes)
+  local bn = _srp_bn()
+  local N = SRP.N
+  local B_big = bn.text(B_bytes)
+  local a = bn.text(a_bytes)
+  local k_big = bn.text(SRP._k_bytes)
   Log.debug("Pair-Setup M3 progress: SRP g^x started")
-  local gx
-  if SRP._modpow then
-    gx = BigInt.from_bytes_be(SRP._modpow(
-      BigInt.to_minimal_bytes_be(SRP.g),
-      BigInt.to_minimal_bytes_be(x),
-      384
-    ))
-  else
-    gx = BigInt.mont_modpow(SRP.g, x, SRP.N, SRP._R2, SRP.N_LIMBS, SRP._n_prime)
-  end
+  local gx = bn.powmod(SRP.g, x, N)
   Log.debug("Pair-Setup M3 progress: SRP g^x computed")
-  local kgx = BigInt.mod(BigInt.mul(k_big, gx), SRP.N)
-  local Bkgx
-  if BigInt.compare(B_big, kgx) >= 0 then
-    Bkgx = BigInt.sub(B_big, kgx)
-  else
-    Bkgx = BigInt.sub(BigInt.add(B_big, SRP.N), kgx)
-    if BigInt.compare(Bkgx, SRP.N) >= 0 then Bkgx = BigInt.sub(Bkgx, SRP.N) end
-  end
-  local exp = BigInt.add(a, BigInt.mul(u, x))
+  local kgx = bn.mulmod(k_big, gx, N)
+  local Bkgx = bn.submod(B_big, kgx, N)
+  local exp = bn.add(a, bn.mul(u, x))
   Log.debug("Pair-Setup M3 progress: SRP shared secret started")
-  local S
-  if SRP._modpow then
-    S = BigInt.from_bytes_be(SRP._modpow(
-      BigInt.to_minimal_bytes_be(Bkgx),
-      BigInt.to_minimal_bytes_be(exp),
-      384
-    ))
-  else
-    S = BigInt.mont_modpow(Bkgx, exp, SRP.N, SRP._R2, SRP.N_LIMBS, SRP._n_prime)
-  end
+  local S = bn.powmod(Bkgx, exp, N)
   Log.debug("Pair-Setup M3 progress: SRP shared secret computed")
-  local K = SRP.sha512(BigInt.to_minimal_bytes_be(S))
-  return K
+  return SRP.sha512(bn.totext(S))
 end
 
 function SRP.compute_M1(A_bytes, B_bytes, K, salt)
   SRP.init()
+  local bn = _srp_bn()
   local H_N = SRP.sha512(SRP.N_BYTES)
-  local H_g = SRP.sha512(BigInt.to_minimal_bytes_be(SRP.g))
+  local H_g = SRP.sha512(bn.totext(SRP.g))
   local H_I = SRP.sha512("Pair-Setup")
   return SRP.sha512(srp_xor_bytes(H_N, H_g) .. H_I .. salt .. A_bytes .. B_bytes .. K)
 end
@@ -3067,11 +1873,8 @@ local OpenSSLCrypto = {
   out_counter = 0,
   in_counter = 0,
   self_tested = false,
-  ed25519_public_point_cache = {},
   ed25519_private_key_cache = {},
 }
-
-OpenSSLCrypto.ED25519_TABLE_CACHE_VERSION = "ed25519-fixed-v2-window5-limb15"
 
 function OpenSSLCrypto.load_openssl()
   if OpenSSLCrypto.openssl then
@@ -3169,216 +1972,29 @@ function OpenSSLCrypto._sign_ed25519(private_key_bytes, data, public_key)
   return Ed25519Pure.sign_expanded(expanded, data)
 end
 
-function OpenSSLCrypto._crypto_cache_state()
-  Driver.state = Driver.state or Storage.load() or {}
-  local cache = Driver.state.crypto_cache
-  if type(cache) ~= "table" or cache.version ~= OpenSSLCrypto.ED25519_TABLE_CACHE_VERSION then
-    cache = {
-      version = OpenSSLCrypto.ED25519_TABLE_CACHE_VERSION,
-      ed25519_public_tables = {},
-      ed25519_private_keys = {},
-    }
-    Driver.state.crypto_cache = cache
-  elseif type(cache.ed25519_public_tables) ~= "table" then
-    cache.ed25519_public_tables = {}
-  end
-  if type(cache.ed25519_private_keys) ~= "table" then
-    cache.ed25519_private_keys = {}
-  end
-  return cache
-end
-
-function OpenSSLCrypto._save_crypto_cache()
-  if Driver.state and Driver.state.crypto_cache then
-    Storage.save(Driver.state)
-  end
-end
-
-function OpenSSLCrypto.prune_ed25519_public_table_cache(public_key_bytes)
-  local cache = OpenSSLCrypto._crypto_cache_state()
-  local keep_key = public_key_bytes and Bytes.hex(public_key_bytes) or nil
-  local pruned = {}
-  if keep_key and cache.ed25519_public_tables[keep_key] then
-    pruned[keep_key] = cache.ed25519_public_tables[keep_key]
-  end
-  cache.ed25519_public_tables = pruned
-  OpenSSLCrypto.ed25519_public_point_cache = {}
-  OpenSSLCrypto._save_crypto_cache()
-end
-
-function OpenSSLCrypto.prune_ed25519_private_key_cache(private_key_bytes)
-  local cache = OpenSSLCrypto._crypto_cache_state()
-  local keep_key = private_key_bytes and Bytes.hex(private_key_bytes) or nil
-  local pruned = {}
-  if keep_key and cache.ed25519_private_keys[keep_key] then
-    pruned[keep_key] = cache.ed25519_private_keys[keep_key]
-  end
-  cache.ed25519_private_keys = pruned
-  OpenSSLCrypto.ed25519_private_key_cache = {}
-  OpenSSLCrypto._save_crypto_cache()
-end
-
-function OpenSSLCrypto.restore_ed25519_base_table_cache()
-  if Ed25519Pure.base_table_ready() then
-    return true, "ready"
-  end
-  local cache = OpenSSLCrypto._crypto_cache_state()
-  if type(cache.ed25519_base_table) ~= "string" then
-    return false, "missing"
-  end
-  local ok, err = Ed25519Pure.restore_base_table(cache.ed25519_base_table)
-  if not ok then
-    Log.debug("crypto cache ignored: Ed25519 base table " .. tostring(err))
-    cache.ed25519_base_table = nil
-    OpenSSLCrypto._save_crypto_cache()
-    return false, err
-  end
-  return true, "restored"
-end
-
-function OpenSSLCrypto.ensure_ed25519_base_table()
-  local restored, restored_reason = OpenSSLCrypto.restore_ed25519_base_table_cache()
-  if restored then
-    return restored_reason
-  end
-  local built = Ed25519Pure.prewarm()
-  local cache = OpenSSLCrypto._crypto_cache_state()
-  if built or type(cache.ed25519_base_table) ~= "string" then
-    cache.ed25519_base_table = Ed25519Pure.serialize_base_table()
-    OpenSSLCrypto._save_crypto_cache()
-    return built and "built" or "stored"
-  end
-  return "ready"
-end
-
-function OpenSSLCrypto._restore_ed25519_public_table_from_cache(public_key_bytes, key)
-  local cache = OpenSSLCrypto._crypto_cache_state()
-  local encoded = cache.ed25519_public_tables[key]
-  if type(encoded) ~= "string" then
-    return nil
-  end
-
-  local fixed_table, err = Ed25519Pure.restore_fixed_point_table(encoded)
-  if not fixed_table then
-    Log.debug("crypto cache ignored: Apple TV public key table " .. tostring(err))
-    cache.ed25519_public_tables[key] = nil
-    OpenSSLCrypto._save_crypto_cache()
-    return nil
-  end
-
-  local point = fixed_table[1] and fixed_table[1][1]
-  if not point or _ed_encode_point(point) ~= public_key_bytes then
-    Log.debug("crypto cache ignored: Apple TV public key table key mismatch")
-    cache.ed25519_public_tables[key] = nil
-    OpenSSLCrypto._save_crypto_cache()
-    return nil
-  end
-
-  return {
-    point = point,
-    fixed_table = fixed_table,
-    negative_fixed_table = Ed25519Pure.negate_fixed_point_table(fixed_table),
-    restored_from_cache = true,
-  }
-end
-
-function OpenSSLCrypto.ensure_ed25519_public_table(public_key_bytes)
-  assert(type(public_key_bytes) == "string" and #public_key_bytes == 32, "Ed25519 public key must be 32 bytes")
-  local key = Bytes.hex(public_key_bytes)
-  local entry = OpenSSLCrypto.ed25519_public_point_cache[key]
-  if entry and entry.fixed_table and entry.negative_fixed_table then
-    return "ready", entry
-  end
-  entry = OpenSSLCrypto._restore_ed25519_public_table_from_cache(public_key_bytes, key)
-  if entry then
-    OpenSSLCrypto.ed25519_public_point_cache[key] = entry
-    return "restored", entry
-  end
-  local point = assert(Ed25519Pure.decode_public_key(public_key_bytes), "invalid Ed25519 public key")
-  local fixed_table = Ed25519Pure.fixed_point_table(point)
-  entry = {
-    point = point,
-    fixed_table = fixed_table,
-    negative_fixed_table = Ed25519Pure.negate_fixed_point_table(fixed_table),
-  }
-  local cache = OpenSSLCrypto._crypto_cache_state()
-  cache.ed25519_public_tables[key] = Ed25519Pure.serialize_fixed_point_table(fixed_table)
-  OpenSSLCrypto._save_crypto_cache()
-  OpenSSLCrypto.ed25519_public_point_cache[key] = entry
-  return "built", entry
-end
-
+-- Ed25519 now runs entirely on native bn (no precomputed fixed-base tables and
+-- no persisted crypto cache). Expanded signing keys are memoized in-process only.
 function OpenSSLCrypto._expanded_ed25519_private_key(private_key_bytes)
   assert(type(private_key_bytes) == "string" and #private_key_bytes == 32, "Ed25519 private key must be 32 bytes")
   local key = Bytes.hex(private_key_bytes)
   local expanded = OpenSSLCrypto.ed25519_private_key_cache[key]
   if not expanded then
-    local cache = OpenSSLCrypto._crypto_cache_state()
-    local persisted = cache.ed25519_private_keys[key]
-    if type(persisted) == "table" and
-      type(persisted.scalar) == "string" and #persisted.scalar == 64 and
-      type(persisted.prefix) == "string" and #persisted.prefix == 64 and
-      type(persisted.public_key) == "string" and #persisted.public_key == 64 then
-      local ok, restored_or_err = pcall(function()
-        return {
-          private_key = private_key_bytes,
-          scalar = _scalar_from_le_bytes_mod(Bytes.from_hex(persisted.scalar)),
-          prefix = Bytes.from_hex(persisted.prefix),
-          public_key = Bytes.from_hex(persisted.public_key),
-        }
-      end)
-      if ok then
-        expanded = restored_or_err
-      else
-        Log.debug("crypto cache ignored: controller Ed25519 signing key " .. tostring(restored_or_err))
-        cache.ed25519_private_keys[key] = nil
-      end
-    end
-    if not expanded then
-      expanded = Ed25519Pure.expand_private_key(private_key_bytes)
-      cache.ed25519_private_keys[key] = {
-        scalar = Bytes.hex(_scalar_to_le32(expanded.scalar)),
-        prefix = Bytes.hex(expanded.prefix),
-        public_key = Bytes.hex(expanded.public_key),
-      }
-      OpenSSLCrypto._save_crypto_cache()
-    end
+    expanded = Ed25519Pure.expand_private_key(private_key_bytes)
     OpenSSLCrypto.ed25519_private_key_cache[key] = expanded
   end
   return expanded
 end
 
 function OpenSSLCrypto.ensure_ed25519_private_key(private_key_bytes)
-  assert(type(private_key_bytes) == "string" and #private_key_bytes == 32, "Ed25519 private key must be 32 bytes")
-  local key = Bytes.hex(private_key_bytes)
-  if OpenSSLCrypto.ed25519_private_key_cache[key] then
-    return "ready", OpenSSLCrypto.ed25519_private_key_cache[key]
-  end
-  local cache = OpenSSLCrypto._crypto_cache_state()
-  local had_persisted = type(cache.ed25519_private_keys[key]) == "table"
-  local expanded = OpenSSLCrypto._expanded_ed25519_private_key(private_key_bytes)
-  return had_persisted and "restored" or "built", expanded
-end
-
-function OpenSSLCrypto._ed25519_public_key_cache_entry(public_key_bytes)
-  assert(type(public_key_bytes) == "string" and #public_key_bytes == 32, "Ed25519 public key must be 32 bytes")
-  local key = Bytes.hex(public_key_bytes)
-  local entry = OpenSSLCrypto.ed25519_public_point_cache[key]
-  if not entry then
-    local _
-    _, entry = OpenSSLCrypto.ensure_ed25519_public_table(public_key_bytes)
-  end
-  return entry
+  return "ready", OpenSSLCrypto._expanded_ed25519_private_key(private_key_bytes)
 end
 
 function OpenSSLCrypto._decoded_ed25519_public_key(public_key_bytes)
-  return OpenSSLCrypto._ed25519_public_key_cache_entry(public_key_bytes).point
+  return assert(Ed25519Pure.decode_public_key(public_key_bytes), "invalid Ed25519 public key")
 end
 
 function OpenSSLCrypto._default_verify_ed25519(public_key_bytes, signature, data)
-  local entry = OpenSSLCrypto._ed25519_public_key_cache_entry(public_key_bytes)
-  return Ed25519Pure.verify_cached(public_key_bytes, signature, data,
-    entry.point, entry.fixed_table, entry.negative_fixed_table)
+  return Ed25519Pure.verify(public_key_bytes, signature, data)
 end
 
 OpenSSLCrypto._verify_ed25519 = OpenSSLCrypto._default_verify_ed25519
@@ -3598,12 +2214,8 @@ function OpenSSLCrypto.self_test(progress)
   progress("crypto self-test: HKDF-SHA512 passed")
 
   progress("crypto self-test: native SRP BN modpow started")
-  local srp_native = OpenSSLCrypto.srp_modpow(
-    BigInt.to_minimal_bytes_be(SRP.g),
-    string.char(3),
-    384
-  )
-  assert(BigInt.from_bytes_be(srp_native)[1] == 125, "native SRP BN modpow failed")
+  local srp_native = OpenSSLCrypto.srp_modpow(string.char(5), string.char(3), 384)
+  assert(srp_native == string.rep("\0", 383) .. string.char(125), "native SRP BN modpow failed")
   progress("crypto self-test: native SRP BN modpow passed")
 
   progress("crypto self-test: ChaCha20-Poly1305 started")
@@ -3843,7 +2455,7 @@ function PairVerify:finish(response_frame)
 end
 
 -- PairSetup: Companion Pair-Setup M1-M6 state machine (SRP-6a / HAP).
--- Depends on BigInt and SRP modules above.
+-- Depends on the SRP module above.
 local PairSetup = {}
 
 function PairSetup.new(crypto)
@@ -3907,13 +2519,6 @@ end
 function PairSetup:compute_m3(pin)
   Log.debug("Pair-Setup M3 compute started: deriving SRP proof from PIN")
   assert(self.state == "M2_RECEIVED", "must receive M2 before computing M3")
-  local old_modpow = SRP._modpow
-  SRP._modpow = optional_crypto_method(self.crypto, "srp_modpow")
-  if SRP._modpow then
-    Log.debug("Pair-Setup M3 using native SRP BN modpow")
-  else
-    Log.debug("Pair-Setup M3 using pure Lua SRP modpow")
-  end
   self.a_bytes = crypto_method(self.crypto, "random_bytes")(32)
   Log.debug("Pair-Setup M3 progress: random SRP secret generated")
   local ok, err = pcall(function()
@@ -3926,7 +2531,6 @@ function PairSetup:compute_m3(pin)
     self.K = SRP.compute_session_key(self._B_bytes, self.a_bytes, x, u)
     Log.debug("Pair-Setup M3 progress: SRP session key computed")
   end)
-  SRP._modpow = old_modpow
   if not ok then
     error(err, 2)
   end
@@ -8276,7 +6880,6 @@ function C4Driver.import_airplay_credentials(detail_string)
   Driver.state = Driver.state or {}
   Driver.state.airplay_credentials = canonical
   AirPlay.credentials = credentials
-  OpenSSLCrypto.prune_ed25519_public_table_cache(credentials.ltpk)
   Storage.save(Driver.state)
   C4Driver.set_connection_state("AirPlay Credentials Imported")
   return credentials
@@ -8394,11 +6997,10 @@ function C4Driver.import_credentials(detail_string)
   Driver.state.companion_credentials = canonical
   Companion.credentials = credentials
   Companion.client = nil
-  OpenSSLCrypto.prune_ed25519_private_key_cache(credentials.ltsk)
+  OpenSSLCrypto.ed25519_private_key_cache = {}
   Storage.save(Driver.state)
   C4Driver.set_connection_state("Credentials Imported")
   C4Driver.update_property("Pairing PIN", "")
-  C4Driver.schedule_crypto_prewarm()
   return credentials
 end
 
@@ -8430,11 +7032,7 @@ function C4Driver.reset_pairing()
   Driver.state.companion_credentials = nil
   Driver.state.airplay_credentials = nil
   Driver.state.app_list = nil
-  if type(Driver.state.crypto_cache) == "table" then
-    Driver.state.crypto_cache.ed25519_public_tables = {}
-    Driver.state.crypto_cache.ed25519_private_keys = {}
-  end
-  OpenSSLCrypto.ed25519_public_point_cache = {}
+  Driver.state.crypto_cache = nil
   OpenSSLCrypto.ed25519_private_key_cache = {}
   Companion.credentials = nil
   AirPlay.credentials = nil
@@ -8677,97 +7275,209 @@ function C4Driver.check_crypto_provider()
   return false, err
 end
 
-local CRYPTO_PREWARM_STAGE_LABELS = {
-  all = "All",
-  base = "Ed25519 Base Table",
-  controller = "Controller Signing Key",
-  atv = "Apple TV Verify Table",
-  x25519 = "X25519 Keypair",
-}
-
-function C4Driver.set_crypto_prewarm_status(value)
-  C4Driver.update_property("Crypto Prewarm Status", value)
-end
-
-function C4Driver.prewarm_crypto_stage(stage)
-  local stage_key = stage or "all"
-  local label = CRYPTO_PREWARM_STAGE_LABELS[stage_key] or tostring(stage_key)
-  Driver.crypto_prewarm_in_progress = Driver.crypto_prewarm_in_progress or {}
-  for running_stage, running in pairs(Driver.crypto_prewarm_in_progress) do
-    if running then
-      local running_label = CRYPTO_PREWARM_STAGE_LABELS[running_stage] or tostring(running_stage)
-      local status = "Skipped: " .. running_label .. " already running"
-      C4Driver.set_crypto_prewarm_status(status)
-      Log.output("Prewarm Crypto skipped: " .. tostring(running_label) .. " already running")
-      return false, "already running"
+-- Phase 0 diagnostic: probe whether Control4's embedded lua-openssl exposes the
+-- native primitives we would use to delete the pure-Lua Ed25519/X25519/ChaCha20
+-- paths (and their multi-MB precompute tables). Read-only; each check is isolated
+-- so a failure never aborts the rest. Prints to the Lua output window.
+function C4Driver.probe_native_crypto()
+  local function line(msg) Log.output(msg) end
+  local function check(label, fn)
+    local ok, res = pcall(fn)
+    if ok then
+      line(string.format("  [PASS] %-26s %s", label, res and tostring(res) or ""))
+    else
+      line(string.format("  [FAIL] %-26s %s", label, tostring(res)))
     end
+    return ok, res
   end
 
-  local credentials = Companion.credentials or C4Driver.load_persisted_credentials()
-  if not credentials then
-    local status = "Skipped: no pairing credentials"
-    C4Driver.set_crypto_prewarm_status(status)
-    Log.output("Prewarm Crypto skipped: pair Apple TV first")
-    return false, "no pairing credentials"
+  line("==== native crypto probe start ====")
+
+  local ok_req, openssl = pcall(require, "openssl")
+  if not ok_req then
+    line("  require('openssl') FAILED: " .. tostring(openssl))
+    line("  Native crypto unavailable in this runtime; pure-Lua path stays required.")
+    line("==== native crypto probe end ====")
+    return false
   end
-  Driver.crypto_prewarm_in_progress[stage_key] = true
-  C4Driver.set_crypto_prewarm_status("Running: " .. label)
-  Log.output("Prewarm Crypto started: " .. tostring(label))
-  local results = {}
-  local ok, err = pcall(function()
-    if stage == nil or stage == "base" then
-      Log.output("Prewarm Crypto: Ed25519 base table")
-      local status = OpenSSLCrypto.ensure_ed25519_base_table()
-      results[#results + 1] = "base=" .. tostring(status)
-    end
+  line("  require('openssl') OK")
+  if type(openssl.version) == "function" then
+    local vok, v = pcall(openssl.version, true)
+    line("  openssl.version: " .. (vok and tostring(v) or "unavailable"))
+  end
 
-    if stage == nil or stage == "controller" then
-      Log.output("Prewarm Crypto: controller signing key")
-      local status, expanded = OpenSSLCrypto.ensure_ed25519_private_key(credentials.ltsk)
-      credentials.controller_ltpk = expanded.public_key
-      results[#results + 1] = "controller=" .. tostring(status)
-    end
+  -- Module presence (definitive; no API-shape risk).
+  line("-- module presence --")
+  for _, mod in ipairs({ "pkey", "cipher", "digest", "hmac", "kdf", "bn", "rand" }) do
+    line(string.format("  %-8s %s", mod .. ":", tostring(openssl[mod] ~= nil)))
+  end
 
-    if stage == nil or stage == "atv" then
-      Log.output("Prewarm Crypto: Apple TV verify table")
-      local status = OpenSSLCrypto.ensure_ed25519_public_table(credentials.ltpk)
-      results[#results + 1] = "atv=" .. tostring(status)
-    end
-
-    if stage == nil or stage == "x25519" then
-      Log.output("Prewarm Crypto: X25519 keypair")
-      local status = OpenSSLCrypto.ensure_x25519_keypair()
-      results[#results + 1] = "x25519=" .. tostring(status)
-    end
+  -- Algorithm availability -- the real Phase 1 (AEAD) / Phase 2 (curves) gates.
+  line("-- algorithm availability --")
+  check("cipher chacha20-poly1305", function()
+    assert(openssl.cipher and openssl.cipher.get, "openssl.cipher.get missing")
+    assert(openssl.cipher.get("chacha20-poly1305"), "cipher not found")
+    return "available"
   end)
-  Driver.crypto_prewarm_in_progress[stage_key] = nil
-  if not ok then
-    local status = "Failed: " .. label .. " - " .. tostring(err)
-    C4Driver.set_crypto_prewarm_status(status)
-    Log.output("Prewarm Crypto failed: " .. tostring(err))
-    Log.error("crypto prewarm " .. tostring(stage_key) .. " failed: " .. tostring(err))
-    return false, err
+  check("pkey ed25519", function()
+    assert(openssl.pkey and openssl.pkey.new, "openssl.pkey.new missing")
+    assert(openssl.pkey.new("ed25519"), "pkey.new returned nil")
+    return "available"
+  end)
+  check("pkey x25519", function()
+    assert(openssl.pkey and openssl.pkey.new, "openssl.pkey.new missing")
+    assert(openssl.pkey.new("x25519"), "pkey.new returned nil")
+    return "available"
+  end)
+
+  -- Functional cross-checks for the primitives we CAN use natively (Phase 1).
+  line("-- functional cross-checks vs pure-Lua --")
+
+  check("sha512 == reference", function()
+    local msg = "control4-apple-tv-probe"
+    local ctx = openssl.digest.new("sha512")
+    ctx:update(msg)
+    local native = ctx:final()
+    if type(native) == "string" and #native == 128 then native = Bytes.from_hex(native) end
+    assert(native == _sha512_bytes(msg), "digest mismatch (len " .. tostring(#native) .. ")")
+    return "match"
+  end)
+
+  check("hmac-sha512 == reference", function()
+    assert(openssl.hmac and openssl.hmac.hmac, "openssl.hmac.hmac missing")
+    local key, data = string.rep(string.char(0x2b), 32), "hmac-probe-data"
+    local native = openssl.hmac.hmac("sha512", data, key, true)
+    if type(native) == "string" and #native == 128 then native = Bytes.from_hex(native) end
+    assert(native == OpenSSLCrypto.hmac_sha512(key, data), "hmac mismatch (len " .. tostring(#native) .. ")")
+    return "match"
+  end)
+
+  -- Phase 2' gate: native EVP curves are blocked, so the fallback is to move
+  -- 25519 field arithmetic onto native bignums. If modular multiply + inverse
+  -- work here, plain double-and-add scalar-mult needs NO precompute table, which
+  -- lets us delete the multi-MB Ed25519 fixed-base tables. Enumerate the surface
+  -- (method names differ across builds) and test against known values.
+  line("-- openssl.bn capability (Phase 2' gate) --")
+
+  check("bn module functions", function()
+    local names = {}
+    for k, v in pairs(openssl.bn) do names[#names + 1] = k .. ":" .. type(v) end
+    table.sort(names)
+    return table.concat(names, " ")
+  end)
+
+  check("bn instance methods", function()
+    local mt = getmetatable(openssl.bn.text(string.char(7)))
+    local idx = mt and mt.__index
+    if type(idx) ~= "table" then return "(__index is " .. type(idx) .. ")" end
+    local names = {}
+    for k in pairs(idx) do names[#names + 1] = k end
+    table.sort(names)
+    return table.concat(names, " ")
+  end)
+
+  local function bnum(n) return openssl.bn.text(string.char(n)) end
+  local function bn_bytes(v) return openssl.bn.totext(v) end
+
+  check("bn multiply+mod (7*13 mod 100 = 91)", function()
+    local a, b, m = bnum(7), bnum(13), bnum(100)
+    local prod = (type(openssl.bn.mul) == "function") and openssl.bn.mul(a, b) or (a * b)
+    local r = (type(openssl.bn.mod) == "function") and openssl.bn.mod(prod, m) or (prod % m)
+    assert(bn_bytes(r) == string.char(91), "got 0x" .. Bytes.hex(bn_bytes(r)))
+    return "91 ok"
+  end)
+
+  check("bn modular inverse (3^-1 mod 11 = 4)", function()
+    local a, m = bnum(3), bnum(11)
+    local inv
+    for _, name in ipairs({ "invmod", "mod_inverse", "modinv", "inverse" }) do
+      if type(openssl.bn[name]) == "function" then inv = openssl.bn[name](a, m); break end
+    end
+    assert(inv, "no modular-inverse function found on openssl.bn")
+    assert(bn_bytes(inv) == string.char(4), "got 0x" .. Bytes.hex(bn_bytes(inv)))
+    return "4 ok"
+  end)
+
+  check("bn add/sub (200+99-255 = 44)", function()
+    local a, b, c = bnum(200), bnum(99), bnum(255)
+    local sum = (type(openssl.bn.add) == "function") and openssl.bn.add(a, b) or (a + b)
+    local r = (type(openssl.bn.sub) == "function") and openssl.bn.sub(sum, c) or (sum - c)
+    assert(bn_bytes(r) == string.char(44), "got 0x" .. Bytes.hex(bn_bytes(r)))
+    return "44 ok"
+  end)
+
+  -- Phase 1: pin down the native ChaCha20-Poly1305 AEAD API so we can wire it and
+  -- delete ChaCha20Poly1305Pure/Poly1305/Bit32. Enumerate the cipher + cipher_ctx
+  -- surface (method names vary by build) and attempt a roundtrip cross-checked
+  -- against the pure-Lua AEAD (which produces ciphertext .. 16-byte tag).
+  line("-- openssl.cipher AEAD capability (Phase 1) --")
+
+  local function keys_of(tbl, with_type)
+    local names = {}
+    for k, v in pairs(tbl) do names[#names + 1] = with_type and (k .. ":" .. type(v)) or k end
+    table.sort(names)
+    return table.concat(names, " ")
   end
-  local result_text = table.concat(results, ", ")
-  C4Driver.set_crypto_prewarm_status("Complete: " .. label ..
-    " (" .. result_text .. ")")
-  Log.output("Prewarm Crypto complete: " .. result_text)
+  local function index_keys(obj)
+    local mt = getmetatable(obj)
+    local idx = mt and mt.__index
+    if type(idx) ~= "table" then return "(__index is " .. type(idx) .. ")" end
+    return keys_of(idx, false)
+  end
+
+  check("openssl.cipher functions", function() return keys_of(openssl.cipher, true) end)
+  check("evp_cipher methods", function()
+    return index_keys(openssl.cipher.get("chacha20-poly1305"))
+  end)
+  check("evp_cipher_ctx methods", function()
+    local c = openssl.cipher.get("chacha20-poly1305")
+    local ctx = c:new(true, string.rep(string.char(0), 32), string.rep(string.char(0), 12))
+    return index_keys(ctx)
+  end)
+
+  check("chacha20-poly1305 AAD-feed diagnostics", function()
+    local key = string.rep(string.char(0x2b), 32)
+    local nonce = string.rep(string.char(0), 12)
+    local pt = "chacha-probe-plaintext"
+    local GET_TAG = openssl.cipher.EVP_CTRL_GCM_GET_TAG or 0x10
+
+    -- Encrypt via a given constructor + AAD-feed convention; return ct .. tag.
+    local function native_enc(ctor, aad, feed)
+      local c = openssl.cipher.get("chacha20-poly1305")
+      local ctx = (ctor == "encrypt_new") and c:encrypt_new(key, nonce) or c:new(true, key, nonce)
+      ctx:padding(false)
+      if #aad > 0 then
+        if feed == "flag" then ctx:update(aad, true)
+        elseif feed == "plain" then ctx:update(aad) end
+      end
+      local ct = (ctx:update(pt) or "") .. (ctx:final() or "")
+      return ct .. (ctx:ctrl(GET_TAG, 16) or "")
+    end
+    local function try(label, ctor, aad, feed, oracle)
+      local ok, out = pcall(native_enc, ctor, aad, feed)
+      if not ok then return label .. "=ERR(" .. tostring(out):sub(1, 40) .. ")" end
+      if out == oracle then return label .. "=MATCH" end
+      return label .. "=diff"
+    end
+
+    local pure0 = ChaCha20Poly1305Pure.encrypt(key, nonce, pt, "")
+    local pureA = ChaCha20Poly1305Pure.encrypt(key, nonce, pt, "hap-aad")
+    local r = {
+      try("empty/new", "new", "", "none", pure0),
+      try("empty/encrypt_new", "encrypt_new", "", "none", pure0),
+      try("aad/new/flag", "new", "hap-aad", "flag", pureA),
+      try("aad/new/plain", "new", "hap-aad", "plain", pureA),
+    }
+    -- Show one concrete diff to diagnose if the core (empty-aad) doesn't match.
+    local nat0 = select(2, pcall(native_enc, "new", "", "none"))
+    if type(nat0) == "string" and nat0 ~= pure0 then
+      r[#r + 1] = "\n      nat0=" .. Bytes.hex(nat0) .. "\n      pur0=" .. Bytes.hex(pure0)
+    end
+    return table.concat(r, "  ")
+  end)
+
+  line("==== native crypto probe end ====")
   return true
-end
-
-function C4Driver.prewarm_crypto()
-  local ok, err = C4Driver.prewarm_crypto_stage(nil)
-  return ok, err
-end
-
-function C4Driver.schedule_crypto_prewarm()
-  -- Crypto prewarm is intentionally installer-driven from Composer actions.
-  -- The slow Ed25519 table builds can otherwise make driver upload/pairing feel hung.
-  C4Driver.cancel_timer("AppleTV_crypto_prewarm_all")
-  C4Driver.cancel_timer("AppleTV_crypto_prewarm_base")
-  C4Driver.cancel_timer("AppleTV_crypto_prewarm_controller")
-  C4Driver.cancel_timer("AppleTV_crypto_prewarm_atv")
-  C4Driver.cancel_timer("AppleTV_crypto_prewarm_x25519")
 end
 
 function C4Driver.cancel_timer(name)
@@ -8779,10 +7489,6 @@ function C4Driver.cancel_timer(name)
 end
 
 function C4Driver.cancel_driver_timers()
-  C4Driver.cancel_timer("AppleTV_crypto_prewarm_all")
-  C4Driver.cancel_timer("AppleTV_crypto_prewarm_base")
-  C4Driver.cancel_timer("AppleTV_crypto_prewarm_controller")
-  C4Driver.cancel_timer("AppleTV_crypto_prewarm_atv")
   C4Driver.cancel_timer("AppleTV_crypto_prewarm_x25519")
   C4Driver.cancel_timer("AppleTV_reselect_passthrough")
   C4Driver.cancel_timer(C4MiniApps.native_handoff_timer)
@@ -8828,8 +7534,8 @@ end
 EC.CHECK_CRYPTO_PROVIDER = function()
   return C4Driver.check_crypto_provider()
 end
-EC.PREWARM_CRYPTO = function()
-  return C4Driver.prewarm_crypto()
+EC.PROBE_NATIVE_CRYPTO = function()
+  return C4Driver.probe_native_crypto()
 end
 EC.START_AIRPLAY_MONITOR = function()
   return C4Driver.start_airplay_monitor("manual")
@@ -8858,7 +7564,6 @@ function C4Driver.init()
   local _, rows = Companion.parse_app_list(Companion.app_list)
   Companion.app_list_rows = rows
   C4Driver.update_property("Pairing PIN", "")
-  C4Driver.set_crypto_prewarm_status("Idle")
   C4Driver.publish_app_list()
   C4MiniApps.refresh_native_apple_tv_drivers()
   C4Driver.load_persisted_credentials()
@@ -8871,7 +7576,6 @@ function C4Driver.late_init()
     C4MiniApps.hide_proxy_in_all_rooms(C4MiniApps.SWITCHER_PROXY)
   end
   C4MiniApps.register_rooms()
-  C4Driver.schedule_crypto_prewarm()
   Log.debug("driver late init")
 end
 
@@ -8957,7 +7661,6 @@ Driver.Bytes = Bytes
 Driver.MDNS = MDNS
 Driver.TLV8 = TLV8
 Driver.OPACK = OPACK
-Driver.BigInt = BigInt
 Driver.SRP = SRP
 Driver.CompanionFrame = CompanionFrame
 Driver.CompanionSession = CompanionSession

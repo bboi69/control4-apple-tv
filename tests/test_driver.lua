@@ -733,44 +733,6 @@ function tests.ed25519_matches_rfc8032_signature_vector()
   end)
 end
 
-function tests.ed25519_public_table_cache_persists_and_restores()
-  with_ed25519_vector_sha512(function()
-    local old_state = Driver.state
-    local old_storage = Driver._test_storage
-    local old_public_cache = Driver.OpenSSLCrypto.ed25519_public_point_cache
-    local old_private_cache = Driver.OpenSSLCrypto.ed25519_private_key_cache
-
-    Driver.state = {}
-    Driver._test_storage = {}
-    Driver.OpenSSLCrypto.ed25519_public_point_cache = {}
-    Driver.OpenSSLCrypto.ed25519_private_key_cache = {}
-
-    local expanded = Driver.OpenSSLCrypto._expanded_ed25519_private_key(ED25519_VECTOR_SEED)
-    local private_key = Driver.Bytes.hex(ED25519_VECTOR_SEED)
-    assert(type(Driver.state.crypto_cache.ed25519_private_keys[private_key]) == "table", "private key expansion persisted")
-    Driver.OpenSSLCrypto.ed25519_private_key_cache = {}
-    local restored_expanded = Driver.OpenSSLCrypto._expanded_ed25519_private_key(ED25519_VECTOR_SEED)
-    assert_eq(restored_expanded.public_key, expanded.public_key, "private key expansion restored")
-
-    local first = Driver.OpenSSLCrypto._ed25519_public_key_cache_entry(ED25519_VECTOR_PUBLIC)
-    local cache = Driver.state.crypto_cache
-    local cache_key = Driver.Bytes.hex(ED25519_VECTOR_PUBLIC)
-    assert(type(first.fixed_table) == "table", "public key table built")
-    assert(type(cache.ed25519_public_tables[cache_key]) == "string", "public key table persisted")
-
-    Driver.OpenSSLCrypto.ed25519_public_point_cache = {}
-    local restored = Driver.OpenSSLCrypto._ed25519_public_key_cache_entry(ED25519_VECTOR_PUBLIC)
-    assert_eq(restored.restored_from_cache, true, "public key table restored from cache")
-    assert_eq(Driver.Ed25519Pure.verify_profile(ED25519_VECTOR_PUBLIC, ED25519_VECTOR_SIGNATURE, "",
-      restored.point, restored.fixed_table), true, "restored table verifies signature")
-
-    Driver.state = old_state
-    Driver._test_storage = old_storage
-    Driver.OpenSSLCrypto.ed25519_public_point_cache = old_public_cache
-    Driver.OpenSSLCrypto.ed25519_private_key_cache = old_private_cache
-  end)
-end
-
 function tests.openssl_crypto_pair_verify_response_uses_pure_x25519_and_ed25519_hooks()
   local private_key = Driver.Bytes.from_hex(
     "77076d0a7318a57d3c16c17251b26645" ..
@@ -1740,10 +1702,6 @@ function tests.driver_destroy_closes_client_and_cancels_timers()
   assert_eq(Driver.Companion.client, nil, "destroy clears client")
   assert_eq(Driver.AirPlay.control_client, nil, "destroy clears AirPlay client")
   assert_eq(Driver.AirPlay.monitor_enabled, false, "destroy disables AirPlay monitor")
-  assert_contains(cancelled, "AppleTV_crypto_prewarm_all", "all prewarm timer cancelled")
-  assert_contains(cancelled, "AppleTV_crypto_prewarm_base", "base prewarm timer cancelled")
-  assert_contains(cancelled, "AppleTV_crypto_prewarm_controller", "controller prewarm timer cancelled")
-  assert_contains(cancelled, "AppleTV_crypto_prewarm_atv", "atv prewarm timer cancelled")
   assert_contains(cancelled, "AppleTV_crypto_prewarm_x25519", "x25519 prewarm timer cancelled")
   assert_contains(cancelled, "AppleTV_reselect_passthrough", "passthrough timer cancelled")
   assert_contains(cancelled, "AppleTV_companion_watchdog", "Companion watchdog timer cancelled")
@@ -1952,42 +1910,6 @@ function tests.airplay_control_close_releases_nested_channels_and_callbacks()
   assert_eq(client.on_disconnect, nil, "AirPlay close clears disconnect callback")
   assert_eq(client.credentials, nil, "AirPlay close clears credentials")
   assert_eq(client.crypto, nil, "AirPlay close clears crypto")
-end
-
-function tests.crypto_prewarm_schedule_is_manual_only()
-  local old_c4 = C4
-  local old_set_timer = SetTimer
-  local old_cancel_timer = CancelTimer
-  local old_state = Driver.state
-  local old_credentials = Driver.Companion.credentials
-  local scheduled = {}
-  local cancelled = {}
-
-  C4 = { GetDeviceID = function() return 42 end }
-  SetTimer = function(name, delay, fn)
-    scheduled[#scheduled + 1] = { name = name, delay = delay, fn = fn }
-    return name
-  end
-  CancelTimer = function(name)
-    cancelled[#cancelled + 1] = name
-  end
-  Driver.state = { companion_credentials = "present" }
-  Driver.Companion.credentials = { type = "HAP" }
-
-  Driver.C4Driver.schedule_crypto_prewarm()
-
-  assert_eq(#scheduled, 0, "no automatic prewarm timer scheduled")
-  assert_contains(cancelled, "AppleTV_crypto_prewarm_all", "all prewarm timer cancelled")
-  assert_contains(cancelled, "AppleTV_crypto_prewarm_base", "legacy base timer cancelled")
-  assert_contains(cancelled, "AppleTV_crypto_prewarm_controller", "legacy controller timer cancelled")
-  assert_contains(cancelled, "AppleTV_crypto_prewarm_atv", "legacy atv timer cancelled")
-  assert_contains(cancelled, "AppleTV_crypto_prewarm_x25519", "legacy x25519 timer cancelled")
-
-  C4 = old_c4
-  SetTimer = old_set_timer
-  CancelTimer = old_cancel_timer
-  Driver.state = old_state
-  Driver.Companion.credentials = old_credentials
 end
 
 function tests.opack_launch_request_roundtrip()
@@ -3650,71 +3572,6 @@ function tests.airplay_monitor_watchdog_restarts_stale_channel()
   Driver.C4Driver.now_ms = old_now
 end
 
-function tests.bigint_arithmetic()
-  local BI = Driver.BigInt
-
-  -- from/to bytes roundtrip
-  local n_bytes = string.rep("\0", 3) .. "\x01\x02\x03\x04"  -- = 0x01020304
-  local v = BI.from_bytes_be(n_bytes)
-  local back = BI.to_bytes_be(v, 4)
-  assert_eq(Driver.Bytes.hex(back), "01020304", "from/to bytes roundtrip")
-
-  -- from_number
-  local v_100 = BI.from_number(100)
-  assert_eq(BI.compare(v_100, BI.from_number(100)), 0, "compare equal")
-  assert_eq(BI.compare(v_100, BI.from_number(99)), 1, "compare greater")
-  assert_eq(BI.compare(v_100, BI.from_number(101)), -1, "compare less")
-
-  -- add
-  local sum = BI.add(BI.from_number(65535), BI.from_number(1))
-  assert_eq(BI.compare(sum, BI.from_number(65536)), 0, "add across limb boundary")
-
-  -- mul
-  local prod = BI.mul(BI.from_number(15), BI.from_number(17))
-  assert_eq(BI.compare(prod, BI.from_number(255)), 0, "mul 15*17=255")
-
-  -- sub
-  local diff = BI.sub(BI.from_number(1000), BI.from_number(1))
-  assert_eq(BI.compare(diff, BI.from_number(999)), 0, "sub 1000-1=999")
-
-  -- mod
-  local r = BI.mod(BI.from_number(100), BI.from_number(7))
-  assert_eq(BI.compare(r, BI.from_number(2)), 0, "100 mod 7 = 2")
-
-  local r2 = BI.mod(BI.from_number(2187), BI.from_number(13))
-  assert_eq(BI.compare(r2, BI.from_number(3)), 0, "2187 mod 13 = 3")
-
-  -- bit_length
-  assert_eq(BI.bit_length(BI.from_number(255)), 8, "bit_length 255 = 8")
-  assert_eq(BI.bit_length(BI.from_number(256)), 9, "bit_length 256 = 9")
-  assert_eq(BI.bit_length(BI.from_number(0)), 0, "bit_length 0 = 0")
-end
-
-function tests.bigint_mont_modpow_small()
-  local BI = Driver.BigInt
-
-  -- Use small odd primes as modulus for Montgomery
-  -- 3^7 mod 13 = 3 (since 3^6 = 729 = 56*13+1, 3^7 = 2187 = 3 mod 13)
-  local N = BI.from_number(13)
-  local k = 1
-  local n_prime = BI.compute_n_prime(N[1])
-  local R2 = BI.compute_r2_mod_n(N, k)
-
-  local result = BI.mont_modpow(
-    BI.from_number(3), BI.from_number(7), N, R2, k, n_prime
-  )
-  assert_eq(BI.compare(result, BI.from_number(3)), 0, "3^7 mod 13 = 3")
-
-  -- mont_modpow(2, 10, 997) = 1024 mod 997 = 27
-  local N2 = BI.from_number(997)
-  local n_prime2 = BI.compute_n_prime(N2[1])
-  local R2_mod_997 = BI.compute_r2_mod_n(N2, 1)
-  local result2 = BI.mont_modpow(
-    BI.from_number(2), BI.from_number(10), N2, R2_mod_997, 1, n_prime2
-  )
-  assert_eq(BI.compare(result2, BI.from_number(27)), 0, "2^10 mod 997 = 27")
-end
-
 function tests.srp_vectors_match_pyatv_srptools()
   local vectors = {
     pin = "1234",
@@ -3750,7 +3607,7 @@ function tests.srp_vectors_match_pyatv_srptools()
   local map = {}
   map[Driver.Bytes.hex("Pair-Setup:" .. vectors.pin)] = sha_vectors.inner
   map[Driver.Bytes.hex(salt .. Driver.Bytes.from_hex(sha_vectors.inner))] = vectors.x
-  map[Driver.Bytes.hex(Driver.SRP.N_BYTES .. Driver.BigInt.to_bytes_be(Driver.SRP.g, 384))] = sha_vectors.k
+  map[Driver.Bytes.hex(Driver.SRP.N_BYTES .. string.rep("\0", 383) .. string.char(5))] = sha_vectors.k
   map[Driver.Bytes.hex(A_bytes .. B_bytes)] = vectors.u
   map[sha_vectors.s_input] = vectors.K
   map[Driver.Bytes.hex(Driver.SRP.N_BYTES)] = sha_vectors.h_n
@@ -3759,15 +3616,17 @@ function tests.srp_vectors_match_pyatv_srptools()
   map[Driver.Bytes.hex(xor_bytes(h_n, h_g) .. h_user .. salt .. A_bytes .. B_bytes .. K)] = vectors.M1
   map[Driver.Bytes.hex(A_bytes .. M1 .. K)] = vectors.M2
 
+  local ossl_bn = require("openssl").bn
+  local function bn_be(v, len)
+    local b = ossl_bn.totext(v)
+    return string.rep("\0", len - #b) .. b
+  end
+
   local old_sha512 = Driver.SRP.sha512
   local old_initialized = Driver.SRP._initialized
   local old_k = Driver.SRP._k_bytes
-  local old_r2 = Driver.SRP._R2
-  local old_n_prime = Driver.SRP._n_prime
   Driver.SRP._initialized = false
   Driver.SRP._k_bytes = nil
-  Driver.SRP._R2 = nil
-  Driver.SRP._n_prime = nil
   Driver.SRP.sha512 = function(data)
     local digest = map[Driver.Bytes.hex(data)]
     assert(digest, "unexpected SRP SHA-512 input: " .. Driver.Bytes.hex(data))
@@ -3776,13 +3635,13 @@ function tests.srp_vectors_match_pyatv_srptools()
 
   local ok, err = pcall(function()
     local x = Driver.SRP.compute_x(salt, vectors.pin)
-    assert_eq(Driver.Bytes.hex(Driver.BigInt.to_bytes_be(x, 64)), vectors.x, "SRP x")
+    assert_eq(Driver.Bytes.hex(bn_be(x, 64)), vectors.x, "SRP x")
 
     local A = Driver.SRP.compute_A(a_bytes)
     assert_eq(Driver.Bytes.hex(A), vectors.A, "SRP A")
 
     local u = Driver.SRP.compute_u(A, B_bytes)
-    assert_eq(Driver.Bytes.hex(Driver.BigInt.to_bytes_be(u, 64)), vectors.u, "SRP u")
+    assert_eq(Driver.Bytes.hex(bn_be(u, 64)), vectors.u, "SRP u")
 
     local computed_K = Driver.SRP.compute_session_key(B_bytes, a_bytes, x, u)
     assert_eq(Driver.Bytes.hex(computed_K), vectors.K, "SRP K")
@@ -3795,8 +3654,6 @@ function tests.srp_vectors_match_pyatv_srptools()
   Driver.SRP.sha512 = old_sha512
   Driver.SRP._initialized = old_initialized
   Driver.SRP._k_bytes = old_k
-  Driver.SRP._R2 = old_r2
-  Driver.SRP._n_prime = old_n_prime
 
   if not ok then
     error(err, 2)
@@ -3904,9 +3761,9 @@ function tests.pair_setup_m1_to_m6_with_mock_crypto()
   local orig_compute_session_key  = Driver.SRP.compute_session_key
   local orig_compute_M1           = Driver.SRP.compute_M1
   local orig_verify_M2            = Driver.SRP.verify_M2
-  Driver.SRP.compute_x            = function() return Driver.BigInt.from_bytes_be(string.rep("\x42", 64)) end
+  Driver.SRP.compute_x            = function() return require("openssl").bn.text(string.rep("\x42", 64)) end
   Driver.SRP.compute_A            = function() return FAKE_A end
-  Driver.SRP.compute_u            = function() return Driver.BigInt.from_bytes_be(string.rep("\x43", 64)) end
+  Driver.SRP.compute_u            = function() return require("openssl").bn.text(string.rep("\x43", 64)) end
   Driver.SRP.compute_session_key  = function() return FAKE_K end
   Driver.SRP.compute_M1           = function() return FAKE_M1 end
   Driver.SRP.verify_M2            = function() return true end

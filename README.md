@@ -52,11 +52,10 @@ After native voice works, install and configure this driver:
 1. Add this driver to the project and set `Apple TV Address`.
 2. Run `Pair Apple TV`, enter the PIN in `Pairing PIN`, and wait for pairing to complete.
    The driver then verifies and saves the same credentials for AirPlay automatically.
-3. Run `Prewarm Crypto` and wait for `Crypto Prewarm Status` to show `Complete`.
-4. Run `Connect Apple TV`; the expected connected state is `SESSION_ACTIVE`.
-5. Run `Refresh App List`.
-6. Run `Refresh Native Apple TV Drivers`.
-7. Set `After Mini App Launch = Select Native Apple TV Driver`.
+3. Run `Connect Apple TV`; the expected connected state is `SESSION_ACTIVE`.
+4. Run `Refresh App List`.
+5. Run `Refresh Native Apple TV Drivers`.
+6. Set `After Mini App Launch = Select Native Apple TV Driver`.
 8. Set `Native Apple TV Driver` to the native `appleTV.c4z` driver for the same room/Apple TV.
 
 Keep the native Apple TV source in the room's Watch menu. If it is removed,
@@ -92,7 +91,6 @@ and Prime Video are also aliased.
   same credentials for the AirPlay metadata monitor.
 - `Retry AirPlay Credential Sharing`: retries AirPlay verification with already-saved
   Apple TV credentials without repeating Companion pairing.
-- `Prewarm Crypto`: prepares cached crypto data after pairing so reconnects are faster.
 - `Connect Apple TV`: opens the connection, performs Pair-Verify, starts the Companion session, and subscribes to status events.
 - `Disconnect Apple TV`: closes the active Companion connection.
 - `Refresh App List`: requests launchable apps from the Apple TV and updates the `Launch App` list.
@@ -107,7 +105,6 @@ and Prime Video are also aliased.
 - `Native Apple TV Driver`: native `appleTV.c4z` driver to select after a Mini App launch.
 - `Launch App`: dynamic app selector populated by `Refresh App List`.
 - `Pairing PIN`: enter Apple TV pairing PINs here.
-- `Crypto Prewarm Status`: progress/result of `Prewarm Crypto`.
 - `Debug Mode`: prints diagnostic logs to Lua output.
 
 ## Files
@@ -132,8 +129,9 @@ The driver has real Apple TV frame and TLV8 helpers, a pyatv-vector-tested
 OPACK subset, native Pair-Setup credential persistence, Pair-Verify, encrypted
 protocol frame wrapping, driver command dispatch, app-list state publishing,
 now-playing metadata, AirPlay monitor support, and Control4 mini-app routing.
-It also has manual Composer crypto prewarm so commissioning can pair first and
-then prepare cached crypto data before handoff.
+Curve, signature, and SRP math run on Control4's native `lua-openssl` bignum
+(`openssl.bn`), so no precomputed crypto tables are kept resident and pairing
+needs no prewarm step.
 
 Covered pyatv-derived fixtures:
 
