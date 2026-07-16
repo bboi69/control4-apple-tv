@@ -1335,25 +1335,6 @@ function tests.airplay_control_client_runs_rtsp_tunnel_setup_probe()
 end
 
 
-function tests.crypto_provider_failure_logs_without_last_error_property()
-  local old_properties = Properties
-  local old_provider = Driver.Crypto.provider
-  local old_openssl = Driver.OpenSSLCrypto.openssl
-  Properties = { ["Launch App"] = "", ["Current App"] = "" }
-  Driver.Crypto.provider = nil
-  Driver.OpenSSLCrypto.openssl = {}
-
-  local ok, err = Driver.C4Driver.check_crypto_provider()
-  assert_eq(ok, false, "crypto check result")
-  assert(err, "crypto check should return error detail")
-  assert_eq(Properties["Connection State"], "Crypto Provider Failed", "crypto failure state")
-  assert_eq(Properties["Last Error"], nil, "last error property is not used")
-
-  Driver.Crypto.provider = old_provider
-  Driver.OpenSSLCrypto.openssl = old_openssl
-  Properties = old_properties
-end
-
 function tests.execute_command_routes_driver_commands()
   local old_properties = Properties
   Properties = { ["Launch App"] = "", ["Current App"] = "" }
@@ -1671,7 +1652,6 @@ function tests.driver_destroy_closes_client_and_cancels_timers()
   local old_client = Driver.Companion.client
   local old_airplay_client = Driver.AirPlay.control_client
   local old_monitor_enabled = Driver.AirPlay.monitor_enabled
-  local old_pregen = Driver.OpenSSLCrypto._pregenerated_x25519_keypair
   local cancelled = {}
   local closed = false
   local airplay_closed = false
@@ -1690,10 +1670,6 @@ function tests.driver_destroy_closes_client_and_cancels_timers()
     end,
   }
   Driver.AirPlay.monitor_enabled = true
-  Driver.OpenSSLCrypto._pregenerated_x25519_keypair = {
-    private_key = "cached",
-    public_key = "cached",
-  }
 
   Driver.C4Driver.destroy()
 
@@ -1702,19 +1678,16 @@ function tests.driver_destroy_closes_client_and_cancels_timers()
   assert_eq(Driver.Companion.client, nil, "destroy clears client")
   assert_eq(Driver.AirPlay.control_client, nil, "destroy clears AirPlay client")
   assert_eq(Driver.AirPlay.monitor_enabled, false, "destroy disables AirPlay monitor")
-  assert_contains(cancelled, "AppleTV_crypto_prewarm_x25519", "x25519 prewarm timer cancelled")
   assert_contains(cancelled, "AppleTV_reselect_passthrough", "passthrough timer cancelled")
   assert_contains(cancelled, "AppleTV_companion_watchdog", "Companion watchdog timer cancelled")
   assert_contains(cancelled, "AppleTV_airplay_monitor_start", "AirPlay monitor start timer cancelled")
   assert_contains(cancelled, "AppleTV_airplay_monitor_retry", "AirPlay monitor retry timer cancelled")
   assert_contains(cancelled, "AppleTV_airplay_monitor_watchdog", "AirPlay monitor watchdog timer cancelled")
-  assert_eq(Driver.OpenSSLCrypto._pregenerated_x25519_keypair, nil, "destroy clears pregenerated x25519 keypair")
 
   CancelTimer = old_cancel_timer
   Driver.Companion.client = old_client
   Driver.AirPlay.control_client = old_airplay_client
   Driver.AirPlay.monitor_enabled = old_monitor_enabled
-  Driver.OpenSSLCrypto._pregenerated_x25519_keypair = old_pregen
 end
 
 function tests.import_credentials_closes_existing_companion_client()
@@ -3356,7 +3329,6 @@ end
 
 function tests.disconnect_companion_keeps_credentials()
   local old_properties = Properties
-  local old_pregen = Driver.OpenSSLCrypto._pregenerated_x25519_keypair
   Properties = {}
   local closed = false
   local credentials = { type = "HAP" }
@@ -3366,21 +3338,15 @@ function tests.disconnect_companion_keeps_credentials()
       closed = true
     end,
   }
-  Driver.OpenSSLCrypto._pregenerated_x25519_keypair = {
-    private_key = "cached",
-    public_key = "cached",
-  }
 
   Driver.C4Driver.disconnect_companion()
   assert_eq(closed, true, "client close called")
   assert_eq(Driver.Companion.credentials, credentials, "credentials retained")
   assert_eq(Driver.Companion.client, nil, "client cleared")
-  assert_eq(Driver.OpenSSLCrypto._pregenerated_x25519_keypair, nil, "disconnect clears pregenerated x25519 keypair")
   assert_eq(Properties["Connection State"], "Disconnected", "disconnect state")
   assert_eq(Driver.Companion.state, "Disconnected", "disconnect companion state")
   assert_eq(Driver.AirPlay.monitor_state, "STOPPED", "disconnect stops AirPlay monitor")
   Properties = old_properties
-  Driver.OpenSSLCrypto._pregenerated_x25519_keypair = old_pregen
 end
 
 function tests.connection_state_also_publishes_companion_state()

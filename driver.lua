@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.43-dev",
+  VERSION = "0.1.44-dev",
 }
 
 local function has_c4()
@@ -1010,6 +1010,9 @@ end
 
 local Bit32 = {}
 do
+  -- Lua 5.1 (the controller) has no bit32 (5.2+) and no native bitwise operators
+  -- (5.3+), so ChaCha20 relies on whichever bit module Director exposes; the
+  -- pure-Lua bitop loop below is the fallback when neither is present.
   if bit32 then
     Bit32.band = bit32.band
     Bit32.bor = bit32.bor
@@ -1105,22 +1108,16 @@ function ChaCha20Poly1305Pure.block(key, counter, nonce)
   return table.concat(out)
 end
 
-local function _store_bytes(out, ...)
-  local count = select("#", ...)
-  for i = 1, count do
-    out[i] = select(i, ...)
-  end
-  return count
-end
-
 function ChaCha20Poly1305Pure.chacha20_xor(key, nonce, initial_counter, data)
   local out, pos, counter = {}, 1, initial_counter
-  local chunk, data_bytes, block_bytes = {}, {}, {}
+  local chunk = {}
   while pos <= #data do
     local block = ChaCha20Poly1305Pure.block(key, counter, nonce)
     local n = math.min(64, #data - pos + 1)
-    _store_bytes(data_bytes, data:byte(pos, pos + n - 1))
-    _store_bytes(block_bytes, block:byte(1, n))
+    -- Extract via table constructors (O(n)); the former select()-based helper
+    -- was O(n^2) per block and this runs on every session frame.
+    local data_bytes = { data:byte(pos, pos + n - 1) }
+    local block_bytes = { block:byte(1, n) }
     for i = 1, n do
       chunk[i] = string.char(Bit32.bxor(data_bytes[i], block_bytes[i]))
     end
@@ -1445,6 +1442,10 @@ function X25519Pure.mul(k_bytes, u_bytes)
     z2 = fmul(e, fadd(aa, fmul(_A24, e)))
   end
   if swap == 1 then x2, x3 = x3, x2; z2, z3 = z3, z2 end
+  -- A low-order / degenerate peer point yields z2 == 0, where finv() has no
+  -- inverse and would throw. RFC 7748 defines the shared output as all-zeros
+  -- here, so return that instead of crashing the pairing thread.
+  if _bn.iszero(z2) then return string.rep("\0", 32) end
   return bn_to_le(fmul(x2, finv(z2)), 32)
 end
 
@@ -1921,41 +1922,14 @@ local function openssl_assert(value, err, label)
   return value
 end
 
-OpenSSLCrypto._pregenerated_x25519_keypair = nil
-
-function OpenSSLCrypto._pregen_x25519()
-  local scalar = OpenSSLCrypto.random_bytes(32)
-  OpenSSLCrypto._pregenerated_x25519_keypair = {
-    private_key = scalar,
-    public_key  = X25519Pure.mul(scalar, X25519Pure.BASE_POINT),
-  }
-end
-
-function OpenSSLCrypto.ensure_x25519_keypair()
-  if OpenSSLCrypto._pregenerated_x25519_keypair then
-    return "ready"
-  end
-  OpenSSLCrypto._pregen_x25519()
-  return "built"
-end
-
 function OpenSSLCrypto.generate_x25519_keypair()
-  local cached = OpenSSLCrypto._pregenerated_x25519_keypair
-  if cached then
-    OpenSSLCrypto._pregenerated_x25519_keypair = nil
-    -- Kick off background generation of the next keypair (best-effort, no-op if no C4)
-    if has_c4() and type(SetTimer) == "function" then
-      SetTimer("AppleTV_crypto_prewarm_x25519", 100, OpenSSLCrypto._pregen_x25519)
-    end
-    return cached
-  end
-  -- Fallback: generate synchronously
+  -- Native bn X25519 is fast enough to generate synchronously on demand; the
+  -- former prewarm cache existed only for the slow pure-Lua path and is gone.
   local scalar = OpenSSLCrypto.random_bytes(32)
-  local keypair = {
+  return {
     private_key = scalar,
     public_key  = X25519Pure.mul(scalar, X25519Pure.BASE_POINT),
   }
-  return keypair
 end
 
 function OpenSSLCrypto._derive_x25519(private_key, server_public_key)
@@ -1966,9 +1940,12 @@ end
 
 function OpenSSLCrypto._sign_ed25519(private_key_bytes, data, public_key)
   local expanded = OpenSSLCrypto._expanded_ed25519_private_key(private_key_bytes)
-  if public_key and public_key ~= expanded.public_key then
-    return Ed25519Pure.sign(private_key_bytes, public_key, data)
-  end
+  -- Ed25519 binds the public key A into the challenge k = H(R || A || M), so
+  -- signing against a public key that disagrees with the private scalar yields
+  -- a signature that never verifies. A mismatch here means corrupt credentials,
+  -- not a valid alternate key: fail loudly instead of emitting a bad signature.
+  assert(not public_key or public_key == expanded.public_key,
+    "Ed25519 public key does not match private key")
   return Ed25519Pure.sign_expanded(expanded, data)
 end
 
@@ -1983,14 +1960,6 @@ function OpenSSLCrypto._expanded_ed25519_private_key(private_key_bytes)
     OpenSSLCrypto.ed25519_private_key_cache[key] = expanded
   end
   return expanded
-end
-
-function OpenSSLCrypto.ensure_ed25519_private_key(private_key_bytes)
-  return "ready", OpenSSLCrypto._expanded_ed25519_private_key(private_key_bytes)
-end
-
-function OpenSSLCrypto._decoded_ed25519_public_key(public_key_bytes)
-  return assert(Ed25519Pure.decode_public_key(public_key_bytes), "invalid Ed25519 public key")
 end
 
 function OpenSSLCrypto._default_verify_ed25519(public_key_bytes, signature, data)
@@ -2048,34 +2017,6 @@ end
 function OpenSSLCrypto.hkdf_sha512(salt, info, ikm)
   local prk = OpenSSLCrypto.hmac_sha512(salt or "", ikm)
   return OpenSSLCrypto.hmac_sha512(prk, info .. string.char(0x01)):sub(1, 32)
-end
-
-local function left_pad_bytes(value, len)
-  if #value > len then
-    local i = 1
-    while i <= #value - len and value:byte(i) == 0 do
-      i = i + 1
-    end
-    value = value:sub(i)
-  end
-  assert(#value <= len, "native SRP modpow returned too many bytes")
-  if #value < len then
-    return string.rep("\0", len - #value) .. value
-  end
-  return value
-end
-
-function OpenSSLCrypto.srp_modpow(base_bytes, exponent_bytes, len)
-  local openssl = OpenSSLCrypto.load_openssl()
-  local bn = openssl.bn
-  assert(bn and bn.text and bn.powmod and bn.totext, "lua-openssl bn.text/powmod/totext are required for native SRP modpow")
-
-  local base = bn.text(base_bytes)
-  local exponent = bn.text(exponent_bytes)
-  local modulus = bn.text(SRP.N_BYTES)
-  local result, err = bn.powmod(base, exponent, modulus)
-  result = openssl_assert(result, err, "native SRP BN_mod_exp")
-  return left_pad_bytes(bn.totext(result), len or 384)
 end
 
 function OpenSSLCrypto.random_bytes(n)
@@ -2213,10 +2154,13 @@ function OpenSSLCrypto.self_test(progress)
   assert(hkdf == expected_hkdf, "HKDF-SHA512 vector failed")
   progress("crypto self-test: HKDF-SHA512 passed")
 
-  progress("crypto self-test: native SRP BN modpow started")
-  local srp_native = OpenSSLCrypto.srp_modpow(string.char(5), string.char(3), 384)
-  assert(srp_native == string.rep("\0", 383) .. string.char(125), "native SRP BN modpow failed")
-  progress("crypto self-test: native SRP BN modpow passed")
+  -- Exercise the actual SRP production path (SRP.compute_A -> bn.powmod on the
+  -- 3072-bit modulus), not a self-test-only helper. With generator g=5 and
+  -- exponent a=3, A = g^a mod N = 125 (the modulus is far larger than 125).
+  progress("crypto self-test: native SRP compute_A started")
+  local srp_A = SRP.compute_A(string.rep("\0", 31) .. string.char(3))
+  assert(srp_A == string.rep("\0", 383) .. string.char(125), "native SRP compute_A failed")
+  progress("crypto self-test: native SRP compute_A passed")
 
   progress("crypto self-test: ChaCha20-Poly1305 started")
   local key = Bytes.from_hex(
@@ -7023,9 +6967,7 @@ function C4Driver.load_persisted_credentials()
 end
 
 function C4Driver.reset_pairing()
-  C4Driver.cancel_timer("AppleTV_crypto_prewarm_x25519")
   C4Driver.cancel_timer("AppleTV_companion_watchdog")
-  OpenSSLCrypto._pregenerated_x25519_keypair = nil
   C4Driver.dispose_companion_client(Companion.client)
   C4Driver.pairing_target = nil
   Driver.state = Driver.state or {}
@@ -7063,10 +7005,8 @@ function C4Driver.close_airplay_control_client(reason)
 end
 
 function C4Driver.disconnect_companion()
-  C4Driver.cancel_timer("AppleTV_crypto_prewarm_x25519")
   C4Driver.cancel_timer("AppleTV_companion_watchdog")
   MDNS.close()
-  OpenSSLCrypto._pregenerated_x25519_keypair = nil
   C4Driver.dispose_companion_client(Companion.client)
   C4Driver.stop_airplay_monitor("disconnect")
   Companion.client = nil
@@ -7257,229 +7197,6 @@ function C4Driver.pair_companion()
   return client
 end
 
-function C4Driver.check_crypto_provider()
-  Log.debug("crypto provider check started")
-  local ok, err = pcall(function()
-    Log.debug("crypto provider install started")
-    C4Driver.ensure_crypto_provider()
-    Log.debug("crypto provider install passed")
-    OpenSSLCrypto.self_test(Log.debug)
-  end)
-  if ok then
-    C4Driver.set_connection_state("Crypto Provider OK")
-    Log.debug("crypto provider check passed")
-    return true
-  end
-  Log.error("crypto provider check failed: " .. tostring(err))
-  C4Driver.set_connection_state("Crypto Provider Failed")
-  return false, err
-end
-
--- Phase 0 diagnostic: probe whether Control4's embedded lua-openssl exposes the
--- native primitives we would use to delete the pure-Lua Ed25519/X25519/ChaCha20
--- paths (and their multi-MB precompute tables). Read-only; each check is isolated
--- so a failure never aborts the rest. Prints to the Lua output window.
-function C4Driver.probe_native_crypto()
-  local function line(msg) Log.output(msg) end
-  local function check(label, fn)
-    local ok, res = pcall(fn)
-    if ok then
-      line(string.format("  [PASS] %-26s %s", label, res and tostring(res) or ""))
-    else
-      line(string.format("  [FAIL] %-26s %s", label, tostring(res)))
-    end
-    return ok, res
-  end
-
-  line("==== native crypto probe start ====")
-
-  local ok_req, openssl = pcall(require, "openssl")
-  if not ok_req then
-    line("  require('openssl') FAILED: " .. tostring(openssl))
-    line("  Native crypto unavailable in this runtime; pure-Lua path stays required.")
-    line("==== native crypto probe end ====")
-    return false
-  end
-  line("  require('openssl') OK")
-  if type(openssl.version) == "function" then
-    local vok, v = pcall(openssl.version, true)
-    line("  openssl.version: " .. (vok and tostring(v) or "unavailable"))
-  end
-
-  -- Module presence (definitive; no API-shape risk).
-  line("-- module presence --")
-  for _, mod in ipairs({ "pkey", "cipher", "digest", "hmac", "kdf", "bn", "rand" }) do
-    line(string.format("  %-8s %s", mod .. ":", tostring(openssl[mod] ~= nil)))
-  end
-
-  -- Algorithm availability -- the real Phase 1 (AEAD) / Phase 2 (curves) gates.
-  line("-- algorithm availability --")
-  check("cipher chacha20-poly1305", function()
-    assert(openssl.cipher and openssl.cipher.get, "openssl.cipher.get missing")
-    assert(openssl.cipher.get("chacha20-poly1305"), "cipher not found")
-    return "available"
-  end)
-  check("pkey ed25519", function()
-    assert(openssl.pkey and openssl.pkey.new, "openssl.pkey.new missing")
-    assert(openssl.pkey.new("ed25519"), "pkey.new returned nil")
-    return "available"
-  end)
-  check("pkey x25519", function()
-    assert(openssl.pkey and openssl.pkey.new, "openssl.pkey.new missing")
-    assert(openssl.pkey.new("x25519"), "pkey.new returned nil")
-    return "available"
-  end)
-
-  -- Functional cross-checks for the primitives we CAN use natively (Phase 1).
-  line("-- functional cross-checks vs pure-Lua --")
-
-  check("sha512 == reference", function()
-    local msg = "control4-apple-tv-probe"
-    local ctx = openssl.digest.new("sha512")
-    ctx:update(msg)
-    local native = ctx:final()
-    if type(native) == "string" and #native == 128 then native = Bytes.from_hex(native) end
-    assert(native == _sha512_bytes(msg), "digest mismatch (len " .. tostring(#native) .. ")")
-    return "match"
-  end)
-
-  check("hmac-sha512 == reference", function()
-    assert(openssl.hmac and openssl.hmac.hmac, "openssl.hmac.hmac missing")
-    local key, data = string.rep(string.char(0x2b), 32), "hmac-probe-data"
-    local native = openssl.hmac.hmac("sha512", data, key, true)
-    if type(native) == "string" and #native == 128 then native = Bytes.from_hex(native) end
-    assert(native == OpenSSLCrypto.hmac_sha512(key, data), "hmac mismatch (len " .. tostring(#native) .. ")")
-    return "match"
-  end)
-
-  -- Phase 2' gate: native EVP curves are blocked, so the fallback is to move
-  -- 25519 field arithmetic onto native bignums. If modular multiply + inverse
-  -- work here, plain double-and-add scalar-mult needs NO precompute table, which
-  -- lets us delete the multi-MB Ed25519 fixed-base tables. Enumerate the surface
-  -- (method names differ across builds) and test against known values.
-  line("-- openssl.bn capability (Phase 2' gate) --")
-
-  check("bn module functions", function()
-    local names = {}
-    for k, v in pairs(openssl.bn) do names[#names + 1] = k .. ":" .. type(v) end
-    table.sort(names)
-    return table.concat(names, " ")
-  end)
-
-  check("bn instance methods", function()
-    local mt = getmetatable(openssl.bn.text(string.char(7)))
-    local idx = mt and mt.__index
-    if type(idx) ~= "table" then return "(__index is " .. type(idx) .. ")" end
-    local names = {}
-    for k in pairs(idx) do names[#names + 1] = k end
-    table.sort(names)
-    return table.concat(names, " ")
-  end)
-
-  local function bnum(n) return openssl.bn.text(string.char(n)) end
-  local function bn_bytes(v) return openssl.bn.totext(v) end
-
-  check("bn multiply+mod (7*13 mod 100 = 91)", function()
-    local a, b, m = bnum(7), bnum(13), bnum(100)
-    local prod = (type(openssl.bn.mul) == "function") and openssl.bn.mul(a, b) or (a * b)
-    local r = (type(openssl.bn.mod) == "function") and openssl.bn.mod(prod, m) or (prod % m)
-    assert(bn_bytes(r) == string.char(91), "got 0x" .. Bytes.hex(bn_bytes(r)))
-    return "91 ok"
-  end)
-
-  check("bn modular inverse (3^-1 mod 11 = 4)", function()
-    local a, m = bnum(3), bnum(11)
-    local inv
-    for _, name in ipairs({ "invmod", "mod_inverse", "modinv", "inverse" }) do
-      if type(openssl.bn[name]) == "function" then inv = openssl.bn[name](a, m); break end
-    end
-    assert(inv, "no modular-inverse function found on openssl.bn")
-    assert(bn_bytes(inv) == string.char(4), "got 0x" .. Bytes.hex(bn_bytes(inv)))
-    return "4 ok"
-  end)
-
-  check("bn add/sub (200+99-255 = 44)", function()
-    local a, b, c = bnum(200), bnum(99), bnum(255)
-    local sum = (type(openssl.bn.add) == "function") and openssl.bn.add(a, b) or (a + b)
-    local r = (type(openssl.bn.sub) == "function") and openssl.bn.sub(sum, c) or (sum - c)
-    assert(bn_bytes(r) == string.char(44), "got 0x" .. Bytes.hex(bn_bytes(r)))
-    return "44 ok"
-  end)
-
-  -- Phase 1: pin down the native ChaCha20-Poly1305 AEAD API so we can wire it and
-  -- delete ChaCha20Poly1305Pure/Poly1305/Bit32. Enumerate the cipher + cipher_ctx
-  -- surface (method names vary by build) and attempt a roundtrip cross-checked
-  -- against the pure-Lua AEAD (which produces ciphertext .. 16-byte tag).
-  line("-- openssl.cipher AEAD capability (Phase 1) --")
-
-  local function keys_of(tbl, with_type)
-    local names = {}
-    for k, v in pairs(tbl) do names[#names + 1] = with_type and (k .. ":" .. type(v)) or k end
-    table.sort(names)
-    return table.concat(names, " ")
-  end
-  local function index_keys(obj)
-    local mt = getmetatable(obj)
-    local idx = mt and mt.__index
-    if type(idx) ~= "table" then return "(__index is " .. type(idx) .. ")" end
-    return keys_of(idx, false)
-  end
-
-  check("openssl.cipher functions", function() return keys_of(openssl.cipher, true) end)
-  check("evp_cipher methods", function()
-    return index_keys(openssl.cipher.get("chacha20-poly1305"))
-  end)
-  check("evp_cipher_ctx methods", function()
-    local c = openssl.cipher.get("chacha20-poly1305")
-    local ctx = c:new(true, string.rep(string.char(0), 32), string.rep(string.char(0), 12))
-    return index_keys(ctx)
-  end)
-
-  check("chacha20-poly1305 AAD-feed diagnostics", function()
-    local key = string.rep(string.char(0x2b), 32)
-    local nonce = string.rep(string.char(0), 12)
-    local pt = "chacha-probe-plaintext"
-    local GET_TAG = openssl.cipher.EVP_CTRL_GCM_GET_TAG or 0x10
-
-    -- Encrypt via a given constructor + AAD-feed convention; return ct .. tag.
-    local function native_enc(ctor, aad, feed)
-      local c = openssl.cipher.get("chacha20-poly1305")
-      local ctx = (ctor == "encrypt_new") and c:encrypt_new(key, nonce) or c:new(true, key, nonce)
-      ctx:padding(false)
-      if #aad > 0 then
-        if feed == "flag" then ctx:update(aad, true)
-        elseif feed == "plain" then ctx:update(aad) end
-      end
-      local ct = (ctx:update(pt) or "") .. (ctx:final() or "")
-      return ct .. (ctx:ctrl(GET_TAG, 16) or "")
-    end
-    local function try(label, ctor, aad, feed, oracle)
-      local ok, out = pcall(native_enc, ctor, aad, feed)
-      if not ok then return label .. "=ERR(" .. tostring(out):sub(1, 40) .. ")" end
-      if out == oracle then return label .. "=MATCH" end
-      return label .. "=diff"
-    end
-
-    local pure0 = ChaCha20Poly1305Pure.encrypt(key, nonce, pt, "")
-    local pureA = ChaCha20Poly1305Pure.encrypt(key, nonce, pt, "hap-aad")
-    local r = {
-      try("empty/new", "new", "", "none", pure0),
-      try("empty/encrypt_new", "encrypt_new", "", "none", pure0),
-      try("aad/new/flag", "new", "hap-aad", "flag", pureA),
-      try("aad/new/plain", "new", "hap-aad", "plain", pureA),
-    }
-    -- Show one concrete diff to diagnose if the core (empty-aad) doesn't match.
-    local nat0 = select(2, pcall(native_enc, "new", "", "none"))
-    if type(nat0) == "string" and nat0 ~= pure0 then
-      r[#r + 1] = "\n      nat0=" .. Bytes.hex(nat0) .. "\n      pur0=" .. Bytes.hex(pure0)
-    end
-    return table.concat(r, "  ")
-  end)
-
-  line("==== native crypto probe end ====")
-  return true
-end
-
 function C4Driver.cancel_timer(name)
   if type(CancelTimer) == "function" then
     pcall(CancelTimer, name)
@@ -7489,7 +7206,6 @@ function C4Driver.cancel_timer(name)
 end
 
 function C4Driver.cancel_driver_timers()
-  C4Driver.cancel_timer("AppleTV_crypto_prewarm_x25519")
   C4Driver.cancel_timer("AppleTV_reselect_passthrough")
   C4Driver.cancel_timer(C4MiniApps.native_handoff_timer)
   for timer_name in pairs(C4MiniApps.active_handoff_timers or {}) do
@@ -7530,12 +7246,6 @@ EC.CONNECT_COMPANION = function()
 end
 EC.DISCONNECT_COMPANION = function()
   return C4Driver.disconnect_companion()
-end
-EC.CHECK_CRYPTO_PROVIDER = function()
-  return C4Driver.check_crypto_provider()
-end
-EC.PROBE_NATIVE_CRYPTO = function()
-  return C4Driver.probe_native_crypto()
 end
 EC.START_AIRPLAY_MONITOR = function()
   return C4Driver.start_airplay_monitor("manual")
@@ -7581,7 +7291,6 @@ end
 
 function C4Driver.destroy()
   C4Driver.cancel_driver_timers()
-  OpenSSLCrypto._pregenerated_x25519_keypair = nil
   C4Driver.dispose_companion_client(Companion.client)
   Companion.client = nil
   C4Driver.close_airplay_control_client("driver destroy")
