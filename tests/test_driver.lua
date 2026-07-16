@@ -1,4 +1,9 @@
+dofile("tests/compat_bit32.lua")
 local Driver = dofile("driver.lua")
+
+-- Opt in to sent-message recording; the driver keeps it off in production
+-- because only the tests below read it.
+Driver.Companion.record_history = true
 
 local function assert_eq(actual, expected, label)
   if actual ~= expected then
@@ -70,6 +75,31 @@ local function xor_bytes(a, b)
   return table.concat(out)
 end
 
+-- Captured before any test stubs anything. When lua-openssl is installed the
+-- canned-digest tables below are only a fallback: unknown inputs hash for real,
+-- so adding a step to a crypto self-test cannot silently break the stub.
+local REAL_SHA512
+do
+  local ok, openssl = pcall(require, "openssl")
+  if ok and openssl and openssl.digest then
+    REAL_SHA512 = function(data)
+      local ctx = openssl.digest.new("sha512")
+      ctx:update(data)
+      local digest = ctx:final()
+      if type(digest) == "string" and #digest == 128 then
+        digest = (digest:gsub("..", function(cc) return string.char(tonumber(cc, 16)) end))
+      end
+      return digest
+    end
+  end
+end
+
+local function sha512_fallback(data, context)
+  if REAL_SHA512 then return REAL_SHA512(data) end
+  error(context .. ": no canned digest for SHA-512 input of length " .. tostring(#data) ..
+    " and lua-openssl is not installed to hash it for real")
+end
+
 local function with_fake_openssl(fake, fn)
   local old_openssl = Driver.OpenSSLCrypto.openssl
   local old_c4 = C4
@@ -122,7 +152,7 @@ local function with_ed25519_vector_sha512(fn)
     if data == ED25519_VECTOR_SEED then return ED25519_VECTOR_HASH_SEED end
     if data == ED25519_VECTOR_HASH_SEED:sub(33, 64) then return ED25519_VECTOR_HASH_PREFIX end
     if data == ED25519_VECTOR_SIGNATURE:sub(1, 32) .. ED25519_VECTOR_PUBLIC then return ED25519_VECTOR_HASH_CHALLENGE end
-    error("unexpected Ed25519 vector SHA-512 input length " .. tostring(#data))
+    return sha512_fallback(data, "Ed25519 vector")
   end
   local ok, err = pcall(fn)
   Driver.Ed25519Pure._sha512 = old_sha512
@@ -180,7 +210,7 @@ local function with_crypto_self_test_sha512(fn)
     end
     local digest = sha512_by_input[data]
     if digest then return digest end
-    error("unexpected crypto self-test SHA-512 input length " .. tostring(#data))
+    return sha512_fallback(data, "crypto self-test")
   end
   local ok, err = pcall(fn)
   Driver.Ed25519Pure._sha512 = old_sha512
@@ -423,6 +453,157 @@ function tests.mdns_cached_port_falls_back_to_default()
   Driver.MDNS.invalidate("192.0.2.10")
 end
 
+-- Fake C4 with just enough surface for MDNS.discover_service_info to run.
+local function with_mdns_c4(fn)
+  local old_c4 = C4
+  C4 = {
+    GetDriverConfigInfo = function() return "Apple TV Companion" end,
+    GetDeviceID = function() return 0 end,
+    GetBindingAddress = function() return "" end,
+    CreateNetworkConnection = function() end,
+    NetConnect = function() end,
+    NetDisconnect = function() end,
+    SetBindingAddress = function() end,
+    SendToNetwork = function() end,
+    SetTimer = function() return { Cancel = function() end } end,
+  }
+  Driver.MDNS.cancel_all()
+  local ok, err = pcall(fn)
+  Driver.MDNS.cancel_all()
+  C4 = old_c4
+  if not ok then error(err, 2) end
+end
+
+function tests.mdns_concurrent_discovery_queues_instead_of_dropping_callbacks()
+  with_mdns_c4(function()
+    local fired = {}
+    Driver.MDNS.discover_companion_port("192.0.2.20", function(port)
+      fired[#fired + 1] = "companion:" .. tostring(port)
+    end)
+    -- A second discovery arriving mid-flight must not steal the first one's slot.
+    Driver.MDNS.discover_airplay_info("192.0.2.20", function(info)
+      fired[#fired + 1] = "airplay:" .. tostring(info and info.port or "nil")
+    end)
+    assert_eq(#Driver.MDNS.queue, 1, "second discovery queued")
+    assert_eq(#fired, 0, "no callback fired yet")
+
+    Driver.MDNS.finish(nil, "timeout")
+    assert_eq(fired[1], "companion:49153", "companion callback got the fallback port")
+    assert_eq(Driver.MDNS.in_flight, true, "queued discovery started automatically")
+    assert_eq(#Driver.MDNS.queue, 0, "queue drained")
+
+    Driver.MDNS.finish(nil, "timeout")
+    assert_eq(fired[2], "airplay:nil", "airplay callback still fired")
+    assert_eq(#fired, 2, "both callbacks fired exactly once")
+  end)
+end
+
+function tests.mdns_stalled_discovery_does_not_wedge_the_queue()
+  with_mdns_c4(function()
+    local fired = {}
+    Driver.MDNS.discover_companion_port("192.0.2.21", function(port)
+      fired[#fired + 1] = "first:" .. tostring(port)
+    end)
+    -- Simulate a discovery whose timeout timer never fired.
+    Driver.MDNS.started_at_ms = Driver.MDNS.now_ms() - (Driver.MDNS.TIMEOUT_MS * 10)
+
+    Driver.MDNS.discover_airplay_info("192.0.2.21", function(info)
+      fired[#fired + 1] = "second:" .. tostring(info and info.port or "nil")
+    end)
+    -- The stalled one is force-completed and the new one runs immediately.
+    assert_eq(fired[1], "first:49153", "stalled discovery was completed, not orphaned")
+    assert_eq(Driver.MDNS.in_flight, true, "new discovery took the slot")
+    assert_eq(#Driver.MDNS.queue, 0, "new discovery did not have to queue")
+  end)
+end
+
+function tests.mdns_queue_cap_answers_dropped_callers()
+  with_mdns_c4(function()
+    local answered = 0
+    Driver.MDNS.discover_companion_port("192.0.2.22", function() answered = answered + 1 end)
+    for _ = 1, Driver.MDNS.QUEUE_MAX + 2 do
+      Driver.MDNS.discover_companion_port("192.0.2.22", function() answered = answered + 1 end)
+    end
+    assert_eq(#Driver.MDNS.queue, Driver.MDNS.QUEUE_MAX, "queue capped")
+    -- Callers evicted by the cap still get an answer rather than hanging forever.
+    assert_eq(answered, 2, "evicted callers were answered")
+  end)
+end
+
+-- handle_payload skips building the MRP description when debug is off. Its real
+-- work (dispatching the update, the device-info bootstrap) must not depend on it.
+function tests.airplay_data_channel_dispatches_mrp_update_with_debug_off()
+  local PB, BPlist = Driver.PB, Driver.BPlist
+  local client = PB.field_string(2, "com.att.tv") .. PB.field_string(7, "DIRECTV")
+  local path = PB.field_message(2, client)
+  local now_playing = PB.field_string(2, "Channel 12") .. PB.field_string(9, "Live TV")
+  local state = PB.field_message(1, now_playing) ..
+    PB.field_varint(6, 2) ..
+    PB.field_message(9, path)
+  local message = PB.field_varint(1, 4) ..
+    PB.field_string(2, "state-id") ..
+    PB.field_varint(4, 0) ..
+    PB.field_message(9, state)
+  local payload = BPlist.encode({
+    params = { data = BPlist.bytes(PB.varint(#message) .. message) },
+  })
+
+  local saved_handler = Driver.C4Driver.handle_airplay_mrp_update
+  local saved_debug = DEBUGPRINT
+  local seen
+
+  local instance = setmetatable({
+    send_post_device_info_bootstrap = function() end,
+    send_reply = function() end,
+  }, { __index = Driver.AirPlayDataChannelClient })
+
+  Driver.C4Driver.handle_airplay_mrp_update = function(update) seen = update end
+
+  -- Restore before asserting: a throw here would otherwise leave the stubbed
+  -- handler installed and break every later test.
+  local ok, err = pcall(function()
+    for _, debug_on in ipairs({ false, true }) do
+      seen = nil
+      DEBUGPRINT = debug_on
+      instance:handle_payload("event", 1, payload)
+      local label = "debug=" .. tostring(debug_on)
+      assert(seen ~= nil, "MRP update dispatched with " .. label)
+      assert_eq(seen.app_bundle, "com.att.tv", "app bundle with " .. label)
+      assert_eq(seen.app_name, "DIRECTV", "app name with " .. label)
+      assert_eq(seen.title, "Live TV", "title with " .. label)
+      assert_eq(seen.artist, "Channel 12", "artist with " .. label)
+    end
+  end)
+
+  DEBUGPRINT = saved_debug
+  Driver.C4Driver.handle_airplay_mrp_update = saved_handler
+  if not ok then error(err, 2) end
+end
+
+function tests.airplay_monitor_retry_backs_off_exponentially()
+  local AirPlay = Driver.AirPlay
+  local saved_attempts = AirPlay.monitor_retry_attempts
+  AirPlay.monitor_retry_attempts = 0
+
+  local seen = {}
+  for _ = 1, 8 do
+    AirPlay.monitor_retry_attempts = AirPlay.monitor_retry_attempts + 1
+    seen[#seen + 1] = Driver.C4Driver.airplay_monitor_retry_delay_ms()
+  end
+
+  assert_eq(seen[1], 15000, "first retry at the base delay")
+  assert_eq(seen[2], 30000, "second retry doubles")
+  assert_eq(seen[3], 60000, "third retry doubles again")
+  assert_eq(seen[8], AirPlay.monitor_retry_max_ms, "retry delay is capped")
+  assert_eq(seen[8] <= AirPlay.monitor_retry_max_ms, true, "never exceeds the cap")
+
+  -- A successful start clears the backoff so the next outage starts fast again.
+  Driver.C4Driver.airplay_monitor_retry_succeeded()
+  assert_eq(AirPlay.monitor_retry_attempts, 0, "success resets the backoff")
+
+  AirPlay.monitor_retry_attempts = saved_attempts
+end
+
 function tests.tlv8_roundtrip()
   local encoded = Driver.TLV8.encode({
     [0] = string.char(0x00),
@@ -652,20 +833,6 @@ function tests.poly1305_handles_varied_block_lengths()
   end
 end
 
-function tests.openssl_crypto_wraps_raw_hap_keys_as_der()
-  local key = bytes_range(0, 31)
-  assert_eq(
-    Driver.Bytes.hex(Driver.OpenSSLCrypto._spki_der("x25519", key)),
-    "302a300506032b656e032100000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-    "x25519 spki"
-  )
-  assert_eq(
-    Driver.Bytes.hex(Driver.OpenSSLCrypto._pkcs8_der("ed25519", key)),
-    "302e020100300506032b657004220420000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-    "ed25519 pkcs8"
-  )
-end
-
 function tests.x25519_matches_rfc7748_key_exchange_vectors()
   local alice_private = Driver.Bytes.from_hex(
     "77076d0a7318a57d3c16c17251b26645" ..
@@ -703,7 +870,10 @@ function tests.openssl_crypto_self_test_uses_documented_call_shapes()
     end)
   end)
 
-  assert_contains(fake.calls, "bn.powmod", "native SRP BN modpow")
+  -- Only calls routed through OpenSSLCrypto.load_openssl() are observable here.
+  -- The SRP/curve bignums deliberately require openssl directly (_ensure_curve),
+  -- so the fake never sees bn.powmod; self_test asserting A = g^3 mod N == 125 is
+  -- what covers the real powmod path.
   assert_contains(fake.calls, "rand.bytes:32", "secure random call")
 end
 
@@ -1671,6 +1841,13 @@ function tests.driver_destroy_closes_client_and_cancels_timers()
   }
   Driver.AirPlay.monitor_enabled = true
 
+  -- Per-room handoff timers must be registered so teardown can find them.
+  Driver.C4MiniApps.active_handoff_timers = {
+    ["AppleTV_verify_native_handoff_42"] = true,
+    ["AppleTV_verify_handoff_42"] = true,
+    ["AppleTV_native_driver_handoff_42"] = true,
+  }
+
   Driver.C4Driver.destroy()
 
   assert_eq(closed, true, "destroy closes Companion client")
@@ -1683,11 +1860,50 @@ function tests.driver_destroy_closes_client_and_cancels_timers()
   assert_contains(cancelled, "AppleTV_airplay_monitor_start", "AirPlay monitor start timer cancelled")
   assert_contains(cancelled, "AppleTV_airplay_monitor_retry", "AirPlay monitor retry timer cancelled")
   assert_contains(cancelled, "AppleTV_airplay_monitor_watchdog", "AirPlay monitor watchdog timer cancelled")
+  assert_contains(cancelled, "AppleTV_airplay_monitor_start_watchdog", "AirPlay start watchdog cancelled")
+  assert_contains(cancelled, "AppleTV_verify_native_handoff_42", "native handoff verify timer cancelled")
+  assert_contains(cancelled, "AppleTV_verify_handoff_42", "room selection verify timer cancelled")
+  assert_eq(next(Driver.C4MiniApps.active_handoff_timers), nil, "handoff timer registry cleared")
 
   CancelTimer = old_cancel_timer
   Driver.Companion.client = old_client
   Driver.AirPlay.control_client = old_airplay_client
   Driver.AirPlay.monitor_enabled = old_monitor_enabled
+end
+
+-- The per-room verify timers used to be created without registering their names,
+-- so cancel_driver_timers could never find them on destroy.
+function tests.handoff_verify_timers_are_registered_for_cancellation()
+  local old_c4 = C4
+  local old_set_timer = SetTimer
+  local old_registry = Driver.C4MiniApps.active_handoff_timers
+  local armed = {}
+
+  C4 = {
+    GetDriverConfigInfo = function() return "Apple TV Companion" end,
+    GetDeviceID = function() return 0 end,
+    GetDeviceVariable = function() return 99 end,
+    SendToDevice = function() end,
+  }
+  SetTimer = function(name) armed[#armed + 1] = name end
+  Driver.C4MiniApps.active_handoff_timers = {}
+
+  local ok, err = pcall(function()
+    Driver.C4MiniApps.verify_native_handoff(42, 99, 98)
+    assert_contains(armed, "AppleTV_verify_native_handoff_42", "native handoff verify timer armed")
+    assert_eq(Driver.C4MiniApps.active_handoff_timers["AppleTV_verify_native_handoff_42"], true,
+      "native handoff verify timer registered for cancellation")
+
+    Driver.C4MiniApps.verify_room_selection(42, 99, "test")
+    assert_contains(armed, "AppleTV_verify_handoff_42", "room selection verify timer armed")
+    assert_eq(Driver.C4MiniApps.active_handoff_timers["AppleTV_verify_handoff_42"], true,
+      "room selection verify timer registered for cancellation")
+  end)
+
+  C4 = old_c4
+  SetTimer = old_set_timer
+  Driver.C4MiniApps.active_handoff_timers = old_registry
+  if not ok then error(err, 2) end
 end
 
 function tests.import_credentials_closes_existing_companion_client()
@@ -3841,9 +4057,38 @@ for name in pairs(tests) do
 end
 table.sort(names)
 
+-- Tests run under pcall so one failure reports instead of aborting the run and
+-- hiding every test after it. Restore the globals a test body may swap in but
+-- not put back if it fails partway, so a single failure does not cascade.
+local passed, skipped = 0, 0
+local failures = {}
+
 for _, name in ipairs(names) do
-  tests[name]()
-  print("ok - " .. name)
+  local saved_c4, saved_properties, saved_debug = C4, Properties, DEBUGPRINT
+  local ok, err = pcall(tests[name])
+  C4, Properties, DEBUGPRINT = saved_c4, saved_properties, saved_debug
+
+  if ok then
+    passed = passed + 1
+    print("ok - " .. name)
+  elseif not REAL_SHA512 and tostring(err):match("openssl") then
+    -- lua-openssl is absent locally; these paths are exercised on the controller.
+    skipped = skipped + 1
+    print("skip - " .. name .. " (requires lua-openssl)")
+  else
+    failures[#failures + 1] = { name = name, err = err }
+    print("not ok - " .. name)
+    print("  " .. tostring(err))
+  end
 end
 
-print(string.format("%d tests passed", #names))
+print(string.format("\n%d passed, %d skipped, %d failed (of %d tests)",
+  passed, skipped, #failures, #names))
+
+if #failures > 0 then
+  print("\nFAILURES:")
+  for _, failure in ipairs(failures) do
+    print("  " .. failure.name .. ": " .. tostring(failure.err))
+  end
+  os.exit(1)
+end

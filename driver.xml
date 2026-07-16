@@ -6,7 +6,7 @@
     <model>Apple TV</model>
     <created>05/02/2026 12:00 AM</created>
     <modified>07/16/2026 12:00 AM</modified>
-    <version>63</version>
+    <version>64</version>
     <small image_source="c4z">icons/device_sm.png</small>
     <large image_source="c4z">icons/device_lg.png</large>
     <control>lua_gen</control>
@@ -725,6 +725,14 @@
             <action>
                 <name>Reset Pairing</name>
                 <command>RESET_PAIRING</command>
+            </action>
+            <action>
+                <name>Start AirPlay Monitor</name>
+                <command>START_AIRPLAY_MONITOR</command>
+            </action>
+            <action>
+                <name>Stop AirPlay Monitor</name>
+                <command>STOP_AIRPLAY_MONITOR</command>
             </action>
         </actions>
     </config>

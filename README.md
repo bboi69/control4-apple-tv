@@ -98,6 +98,8 @@ and Prime Video are also aliased.
 - `Launch App`: launches the row selected in the `Launch App` property.
 - `Refresh Native Apple TV Drivers`: populates the `Native Apple TV Driver` dropdown with native `appleTV.c4z` drivers.
 - `Reset Pairing`: clears stored credentials so the Apple TV can be paired again.
+- `Start AirPlay Monitor` / `Stop AirPlay Monitor`: manually control the AirPlay metadata
+  monitor, which otherwise starts on its own once AirPlay credentials are available.
 
 ## Key Properties
 

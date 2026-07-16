@@ -1,4 +1,5 @@
 local socket = require("socket")
+dofile("tests/compat_bit32.lua")
 local Driver = dofile("driver.lua")
 
 local function assert_eq(actual, expected, label)

@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.44-dev",
+  VERSION = "0.1.45-dev",
 }
 
 local function has_c4()
@@ -29,8 +29,18 @@ end
 
 local Log = {}
 
+-- Lua evaluates a call's arguments before the call, so Log.debug's early-out
+-- cannot save the cost of building its message. Use this to guard call sites
+-- that run per frame/message or that format payloads (Bytes.hex, PB.describe).
+function Log.is_debug()
+  if not has_c4() then
+    return true
+  end
+  return DEBUGPRINT and true or false
+end
+
 function Log.debug(message)
-  if has_c4() and not DEBUGPRINT then
+  if not Log.is_debug() then
     return
   end
   local line = "[AppleTV] [DEBUG] " .. tostring(message)
@@ -98,7 +108,6 @@ end
 
 local MDNS = {}
 MDNS.SERVICE = "_companion-link._tcp.local"
-MDNS.MRP_SERVICE = "_mediaremotetv._tcp.local"
 MDNS.AIRPLAY_SERVICE = "_airplay._tcp.local"
 MDNS.PORT = 5353
 MDNS.DEFAULT_COMPANION_PORT = 49153
@@ -111,6 +120,18 @@ MDNS.pending_cache_companion_port = false
 MDNS.pending_info_callback = false
 MDNS.timeout_timer = nil
 MDNS.last_port_by_host = {}
+MDNS.TIMEOUT_MS = 1500
+MDNS.QUEUE_MAX = 8
+MDNS.queue = {}
+MDNS.in_flight = false
+MDNS.started_at_ms = nil
+
+function MDNS.now_ms()
+  if C4Driver and C4Driver.now_ms then
+    return C4Driver.now_ms()
+  end
+  return (os.time() or 0) * 1000
+end
 
 local function dns_encode_name(name)
   local out = {}
@@ -321,6 +342,27 @@ function MDNS.close()
   MDNS.pending_cache_companion_port = false
   MDNS.pending_info_callback = false
   MDNS.host = nil
+  MDNS.in_flight = false
+  MDNS.started_at_ms = nil
+end
+
+-- Abort the in-flight discovery and discard anything queued behind it without
+-- answering their callers. Teardown only (driver destroy / explicit disconnect),
+-- where nobody is left to care about the answer.
+function MDNS.cancel_all()
+  MDNS.queue = {}
+  MDNS.close()
+end
+
+function MDNS._start_next()
+  if MDNS.in_flight then
+    return
+  end
+  local request = table.remove(MDNS.queue, 1)
+  if request then
+    Log.debug(tostring(request.label or "mDNS") .. " discovery dequeued")
+    MDNS._begin(request)
+  end
 end
 
 function MDNS.finish(info_or_port, source)
@@ -351,26 +393,21 @@ function MDNS.finish(info_or_port, source)
       callback(port or fallback_port)
     end
   end
+  -- The callback may have started its own discovery; _start_next respects that.
+  MDNS._start_next()
 end
 
-function MDNS.discover_service_info(host, service_name, fallback_port, label, callback)
-  if not host or host == "" then
-    callback(fallback_port and { port = fallback_port } or nil)
-    return
-  end
-
-  if not (has_c4() and C4.CreateNetworkConnection and C4.NetConnect and C4.SendToNetwork) then
-    callback(fallback_port and { port = fallback_port } or nil)
-    return
-  end
-
+function MDNS._begin(request)
   MDNS.close()
   RFN = RFN or {}
   OCS = OCS or {}
   local binding = MDNS.allocate_binding()
+  local host, service_name, label = request.host, request.service_name, request.label
+  MDNS.in_flight = true
+  MDNS.started_at_ms = MDNS.now_ms()
   MDNS.host = host
-  MDNS.pending_callback = callback
-  MDNS.pending_fallback_port = fallback_port
+  MDNS.pending_callback = request.callback
+  MDNS.pending_fallback_port = request.fallback_port
   MDNS.pending_label = label
   MDNS.pending_cache_companion_port = service_name == MDNS.SERVICE
   MDNS.pending_info_callback = true
@@ -396,11 +433,63 @@ function MDNS.discover_service_info(host, service_name, fallback_port, label, ca
 
   if type(SetTimer) == "function" then
     MDNS.timeout_timer = "AppleTV_mdns_timeout"
-    SetTimer(MDNS.timeout_timer, 1500, function()
+    SetTimer(MDNS.timeout_timer, MDNS.TIMEOUT_MS, function()
       Log.debug(tostring(label or "mDNS") .. " discovery timed out")
       MDNS.finish(nil, "timeout")
     end)
   end
+end
+
+-- Discovery is single-flight: one binding, one pending callback. Companion and
+-- AirPlay discovery are both triggered by ordinary user activity and used to
+-- clobber each other -- whichever started second called MDNS.close(), which
+-- dropped the first one's callback and cancelled its timeout, so that caller
+-- waited forever. Queue behind the in-flight request instead of stealing it.
+function MDNS.discover_service_info(host, service_name, fallback_port, label, callback)
+  if not host or host == "" then
+    callback(fallback_port and { port = fallback_port } or nil)
+    return
+  end
+
+  if not (has_c4() and C4.CreateNetworkConnection and C4.NetConnect and C4.SendToNetwork) then
+    callback(fallback_port and { port = fallback_port } or nil)
+    return
+  end
+
+  local request = {
+    host = host,
+    service_name = service_name,
+    fallback_port = fallback_port,
+    label = label,
+    callback = callback,
+  }
+
+  -- Clobbering used to double as self-healing: a discovery whose timer never
+  -- fired got cleared by the next one. Keep that safety net explicitly.
+  if MDNS.in_flight then
+    local age = MDNS.now_ms() - (MDNS.started_at_ms or 0)
+    if age > MDNS.TIMEOUT_MS * 4 then
+      Log.error("mDNS discovery stalled for " .. tostring(age) .. "ms; forcing completion")
+      MDNS.finish(nil, "stalled")
+    end
+  end
+
+  if MDNS.in_flight then
+    if #MDNS.queue >= MDNS.QUEUE_MAX then
+      local dropped = table.remove(MDNS.queue, 1)
+      Log.error("mDNS queue full; dropping oldest queued discovery: " ..
+        tostring(dropped and dropped.label))
+      if dropped and dropped.callback then
+        dropped.callback(nil)
+      end
+    end
+    MDNS.queue[#MDNS.queue + 1] = request
+    Log.debug(tostring(label or "mDNS") .. " discovery queued behind " ..
+      tostring(MDNS.pending_label or "in-flight discovery"))
+    return
+  end
+
+  MDNS._begin(request)
 end
 
 function MDNS.discover_service_port(host, service_name, fallback_port, label, callback)
@@ -411,10 +500,6 @@ end
 
 function MDNS.discover_companion_port(host, callback)
   return MDNS.discover_service_port(host, MDNS.SERVICE, MDNS.cached_port(host), "Companion mDNS", callback)
-end
-
-function MDNS.discover_mrp_port(host, callback)
-  return MDNS.discover_service_port(host, MDNS.MRP_SERVICE, nil, "MRP mDNS", callback)
 end
 
 function MDNS.discover_airplay_info(host, callback)
@@ -1011,40 +1096,20 @@ end
 local Bit32 = {}
 do
   -- Lua 5.1 (the controller) has no bit32 (5.2+) and no native bitwise operators
-  -- (5.3+), so ChaCha20 relies on whichever bit module Director exposes; the
-  -- pure-Lua bitop loop below is the fallback when neither is present.
-  if bit32 then
-    Bit32.band = bit32.band
-    Bit32.bor = bit32.bor
-    Bit32.bxor = bit32.bxor
-    Bit32.lshift = bit32.lshift
-    Bit32.rshift = bit32.rshift
-  elseif bit then
-    Bit32.band = bit.band
-    Bit32.bor = bit.bor
-    Bit32.bxor = bit.bxor
-    Bit32.lshift = bit.lshift
-    Bit32.rshift = bit.rshift
-  else
-    local function bitop(a, b, op)
-      local result, bit = 0, 1
-      a = a % 0x100000000
-      b = b % 0x100000000
-      for _ = 0, 31 do
-        local aa, bb = a % 2, b % 2
-        if op(aa, bb) then result = result + bit end
-        a = math.floor(a / 2)
-        b = math.floor(b / 2)
-        bit = bit * 2
-      end
-      return result
-    end
-    Bit32.band = function(a, b) return bitop(a, b, function(x, y) return x == 1 and y == 1 end) end
-    Bit32.bor = function(a, b) return bitop(a, b, function(x, y) return x == 1 or y == 1 end) end
-    Bit32.bxor = function(a, b) return bitop(a, b, function(x, y) return x ~= y end) end
-    Bit32.lshift = function(a, n) return (a * (2 ^ n)) % 0x100000000 end
-    Bit32.rshift = function(a, n) return math.floor((a % 0x100000000) / (2 ^ n)) end
-  end
+  -- (5.3+), so ChaCha20 relies on whichever bit module Director exposes. Director
+  -- always provides one; there is deliberately no pure-Lua substitute. The one we
+  -- used to fall back on ran ChaCha20 ~30-47x slower -- a single button press cost
+  -- milliseconds instead of microseconds -- while logging nothing to say so. A
+  -- driver that refuses to load is far easier to diagnose than one that silently
+  -- crawls, so fail here instead.
+  local ops = bit32 or bit
+  assert(ops, "Apple TV driver requires a native bit library (bit32 or bit); " ..
+    "Director normally provides one. ChaCha20 cannot run without it.")
+  Bit32.band = ops.band
+  Bit32.bor = ops.bor
+  Bit32.bxor = ops.bxor
+  Bit32.lshift = ops.lshift
+  Bit32.rshift = ops.rshift
 end
 
 function Bit32.add(a, b)
@@ -1629,10 +1694,6 @@ function Ed25519Pure.verify(public_key, signature, message)
   return _point_equal(lhs, rhs)
 end
 
-function Ed25519Pure.decode_public_key(public_key)
-  _ensure_curve()
-  return _decode_point(public_key)
-end
 function SRP.sha512(data)
   return _sha512_bytes(data)
 end
@@ -1886,24 +1947,6 @@ function OpenSSLCrypto.load_openssl()
   assert(ok, "Control4 lua-openssl is required for live Companion crypto: " .. tostring(openssl_or_err))
   OpenSSLCrypto.openssl = openssl_or_err
   return OpenSSLCrypto.openssl
-end
-
-function OpenSSLCrypto._spki_der(algorithm, public_key)
-  assert(type(public_key) == "string" and #public_key == 32, algorithm .. " public key must be 32 bytes")
-  local prefixes = {
-    x25519 = "302a300506032b656e032100",
-    ed25519 = "302a300506032b6570032100",
-  }
-  return Bytes.from_hex(assert(prefixes[string.lower(algorithm)], "unsupported public key algorithm")) .. public_key
-end
-
-function OpenSSLCrypto._pkcs8_der(algorithm, private_key)
-  assert(type(private_key) == "string" and #private_key == 32, algorithm .. " private key must be 32 bytes")
-  local prefixes = {
-    x25519 = "302e020100300506032b656e04220420",
-    ed25519 = "302e020100300506032b657004220420",
-  }
-  return Bytes.from_hex(assert(prefixes[string.lower(algorithm)], "unsupported private key algorithm")) .. private_key
 end
 
 function OpenSSLCrypto._nonce12(value)
@@ -2704,6 +2747,10 @@ local Companion = {
   state = "DISCONNECTED",
   port = 49153,
   tx = 0,
+  -- Sent-message history is a test observability seam: nothing in the driver
+  -- reads it. Recording is off by default so the controller does not hold 100
+  -- request objects resident for no production purpose; the test harness opts in.
+  record_history = false,
   sent_messages = {},
   sent_messages_max = 100,
   pending_commands_max = 50,
@@ -2718,6 +2765,9 @@ local Companion = {
 }
 
 function Companion.record_sent_message(request)
+  if not Companion.record_history then
+    return
+  end
   local messages = Companion.sent_messages
   if type(messages) ~= "table" then
     return
@@ -2741,6 +2791,15 @@ local AirPlay = {
   monitor_enabled = false,
   monitor_state = "Stopped",
   monitor_retry_ms = 15000,
+  -- Retries back off exponentially up to this ceiling. A powered-off Apple TV is
+  -- the normal overnight state; retrying a discovery + TCP connect + HAP
+  -- pair-verify every 15s forever is a lot of controller work for nothing.
+  monitor_retry_max_ms = 300000,
+  monitor_retry_attempts = 0,
+  -- Covers the whole "starting -> tunnel up" window (discovery + TCP + HAP
+  -- pair-verify). Nothing else guards that stretch, so a start that never calls
+  -- back used to strand the monitor in DISCOVERING forever.
+  monitor_start_timeout_ms = 30000,
   monitor_heartbeat_ms = 30000,
   monitor_stale_ms = 90000,
   receive_buffer_max = 65536,
@@ -3281,14 +3340,6 @@ function Companion.parse_app_list(content)
   return apps, rows
 end
 
-function Companion.render_app_list(rows)
-  local lines = {}
-  for _, app in ipairs(rows or {}) do
-    lines[#lines + 1] = app.name .. " | " .. app.identifier
-  end
-  return table.concat(lines, "\n")
-end
-
 function Companion.app_display_name(app)
   if type(app) ~= "table" then return "" end
   return tostring(app.name or app.identifier or "") .. " | " .. tostring(app.identifier or "")
@@ -3548,7 +3599,6 @@ function CompanionClient.new(options)
     connecting = false,
     connected = false,
     state = "DISCONNECTED",
-    received_messages = {},
     on_state = options.on_state,
     on_message = options.on_message,
     on_paired = options.on_paired,
@@ -3615,13 +3665,15 @@ end
 function CompanionClient:send_raw(frame)
   assert(type(frame) == "string", "frame must be a string")
   assert(self.transport, "Companion transport is not connected")
-  if #frame >= 4 then
-    local frame_type = frame:byte(1)
-    local length = Bytes.read_u24be(frame, 2)
-    Log.debug("Companion send frame: type=" .. CompanionFrame.name(frame_type) ..
-      " payload_len=" .. tostring(length))
-  else
-    Log.debug("Companion send raw bytes: len=" .. tostring(#frame))
+  if Log.is_debug() then
+    if #frame >= 4 then
+      local frame_type = frame:byte(1)
+      local length = Bytes.read_u24be(frame, 2)
+      Log.debug("Companion send frame: type=" .. CompanionFrame.name(frame_type) ..
+        " payload_len=" .. tostring(length))
+    else
+      Log.debug("Companion send raw bytes: len=" .. tostring(#frame))
+    end
   end
   self:mark_tx()
   if self.transport.Write then
@@ -3732,7 +3784,9 @@ function CompanionClient:connect(host, port)
       tcp_client:ReadUpTo(4096)
     end)
     :OnRead(function(tcp_client, data)
-      Log.debug("Companion TCP read: bytes=" .. tostring(#(data or "")))
+      if Log.is_debug() then
+        Log.debug("Companion TCP read: bytes=" .. tostring(#(data or "")))
+      end
       self:mark_rx()
       local ok, err = pcall(function() self:receive(data) end)
       if not ok then
@@ -3960,8 +4014,10 @@ function CompanionClient:receive(data)
   self:mark_rx()
   self.buffer = self.buffer .. (data or "")
   enforce_buffer_limit(self, "buffer", Companion.receive_buffer_max, "Companion receive buffer")
-  Log.debug("Companion receive buffered: buffer_len=" .. tostring(#self.buffer) ..
-    " encrypted_session=" .. tostring(self.session ~= nil))
+  if Log.is_debug() then
+    Log.debug("Companion receive buffered: buffer_len=" .. tostring(#self.buffer) ..
+      " encrypted_session=" .. tostring(self.session ~= nil))
+  end
   while true do
     local frame
     if self.session then
@@ -3970,12 +4026,16 @@ function CompanionClient:receive(data)
       frame, self.buffer = CompanionFrame.try_decode(self.buffer)
     end
     if not frame then
-      Log.debug("Companion receive waiting for complete frame: buffer_len=" .. tostring(#self.buffer))
+      if Log.is_debug() then
+        Log.debug("Companion receive waiting for complete frame: buffer_len=" .. tostring(#self.buffer))
+      end
       return
     end
-    Log.debug("Companion receive frame: type=" .. CompanionFrame.name(frame.frame_type) ..
-      " payload_len=" .. tostring(#(frame.payload or "")) ..
-      " remaining_buffer=" .. tostring(#self.buffer))
+    if Log.is_debug() then
+      Log.debug("Companion receive frame: type=" .. CompanionFrame.name(frame.frame_type) ..
+        " payload_len=" .. tostring(#(frame.payload or "")) ..
+        " remaining_buffer=" .. tostring(#self.buffer))
+    end
     self:handle_frame(frame)
   end
 end
@@ -4049,9 +4109,11 @@ function CompanionClient:handle_frame(frame)
 
   if frame.frame_type == CompanionFrame.U_OPACK or frame.frame_type == CompanionFrame.E_OPACK then
     local message = OPACK.decode(frame.payload)
-    Log.debug("Companion OPACK message: id=" .. tostring(message._i) ..
-      " type=" .. tostring(message._t) ..
-      " xid=" .. tostring(message._x))
+    if Log.is_debug() then
+      Log.debug("Companion OPACK message: id=" .. tostring(message._i) ..
+        " type=" .. tostring(message._t) ..
+        " xid=" .. tostring(message._x))
+    end
 
     if message._t == 3 and message._x ~= nil then
       local pending = self.pending_responses[message._x]
@@ -4725,6 +4787,7 @@ function C4MiniApps.verify_native_handoff(room_id, native_device_id, proxy_devic
   end
 
   local function verify()
+    C4MiniApps.active_handoff_timers["AppleTV_verify_native_handoff_" .. tostring(room_id)] = nil
     local ok, value = pcall(function()
       return C4:GetDeviceVariable(room_id, 1000)
     end)
@@ -4762,8 +4825,9 @@ function C4MiniApps.verify_native_handoff(room_id, native_device_id, proxy_devic
   end
 
   if has_c4() and type(SetTimer) == "function" then
-    SetTimer("AppleTV_verify_native_handoff_" .. tostring(room_id),
-      C4MiniApps.handoff_verify_delay_ms, verify)
+    local timer_name = "AppleTV_verify_native_handoff_" .. tostring(room_id)
+    C4MiniApps.active_handoff_timers[timer_name] = true
+    SetTimer(timer_name, C4MiniApps.handoff_verify_delay_ms, verify)
   else
     verify()
   end
@@ -4775,6 +4839,7 @@ function C4MiniApps.verify_room_selection(room_id, expected_device_id, reason)
   end
 
   local function verify()
+    C4MiniApps.active_handoff_timers["AppleTV_verify_handoff_" .. tostring(room_id)] = nil
     local ok, value = pcall(function()
       return C4:GetDeviceVariable(room_id, 1000)
     end)
@@ -4792,8 +4857,9 @@ function C4MiniApps.verify_room_selection(room_id, expected_device_id, reason)
   end
 
   if has_c4() and type(SetTimer) == "function" then
-    SetTimer("AppleTV_verify_handoff_" .. tostring(room_id),
-      C4MiniApps.handoff_verify_delay_ms, verify)
+    local timer_name = "AppleTV_verify_handoff_" .. tostring(room_id)
+    C4MiniApps.active_handoff_timers[timer_name] = true
+    SetTimer(timer_name, C4MiniApps.handoff_verify_delay_ms, verify)
   else
     verify()
   end
@@ -5405,18 +5471,6 @@ function PB.summarize_content_metadata(data)
   return #parts > 0 and table.concat(parts, " ") or nil
 end
 
-function PB.summarize_now_playing_info(data)
-  if not data then return nil end
-  local parts = {}
-  local album = PB.string_field(data, 1)
-  local artist = PB.string_field(data, 2)
-  local title = PB.string_field(data, 9)
-  if title then parts[#parts + 1] = "title=" .. title end
-  if artist then parts[#parts + 1] = "artist=" .. artist end
-  if album then parts[#parts + 1] = "album=" .. album end
-  return #parts > 0 and table.concat(parts, " ") or nil
-end
-
 function PB.copy_content_metadata(data, target)
   if not data or type(target) ~= "table" then return end
   local title = PB.string_field(data, 1)
@@ -5826,12 +5880,9 @@ function AirPlayDataChannelClient:handle_payload(message_type, seqno, payload)
     if ok and type(decoded) == "table" then
       local data = decoded.params and decoded.params.data
       if type(data) == "table" and data.__bplist_type == "bytes" then
-        local description = ""
         local ok_desc, value_or_err, next_index = pcall(PB.read_varint, data.data, 1)
         if ok_desc and value_or_err and next_index then
           local raw_message = data.data:sub(next_index, next_index + value_or_err - 1)
-          local ok_protocol, protocol_description = pcall(PB.describe_protocol_message, raw_message)
-          description = ok_protocol and protocol_description or PB.describe(raw_message)
           local ok_update, update = pcall(PB.extract_protocol_update, raw_message)
           if ok_update and update and C4Driver and C4Driver.handle_airplay_mrp_update then
             C4Driver.handle_airplay_mrp_update(update)
@@ -5839,9 +5890,15 @@ function AirPlayDataChannelClient:handle_payload(message_type, seqno, payload)
           if PB.varint_field(raw_message, 1) == 15 then
             self:send_post_device_info_bootstrap()
           end
-        end
-        if description ~= "" and not description:match("^UPDATE_OUTPUT_DEVICE_MESSAGE") then
-          Log.debug("AirPlay MRP: " .. description)
+          -- Rendering the description walks the whole protobuf and costs ~1.7x the
+          -- real work above, for a log line that is discarded when debug is off.
+          if Log.is_debug() then
+            local ok_protocol, protocol_description = pcall(PB.describe_protocol_message, raw_message)
+            local description = ok_protocol and protocol_description or PB.describe(raw_message)
+            if description ~= "" and not description:match("^UPDATE_OUTPUT_DEVICE_MESSAGE") then
+              Log.debug("AirPlay MRP: " .. description)
+            end
+          end
         end
       end
     end
@@ -6628,14 +6685,56 @@ function C4Driver.refresh_app_list()
 end
 
 
+-- Delay for the next retry: monitor_retry_ms doubled per consecutive failure,
+-- capped at monitor_retry_max_ms. Reset by monitor_retry_succeeded().
+function C4Driver.airplay_monitor_retry_delay_ms()
+  local attempts = AirPlay.monitor_retry_attempts or 0
+  local delay = AirPlay.monitor_retry_ms
+  for _ = 2, attempts do
+    delay = delay * 2
+    if delay >= AirPlay.monitor_retry_max_ms then
+      return AirPlay.monitor_retry_max_ms
+    end
+  end
+  return math.min(delay, AirPlay.monitor_retry_max_ms)
+end
+
+function C4Driver.airplay_monitor_retry_succeeded()
+  AirPlay.monitor_retry_attempts = 0
+  C4Driver.cancel_timer("AppleTV_airplay_monitor_retry")
+  C4Driver.cancel_timer("AppleTV_airplay_monitor_start_watchdog")
+end
+
+-- Guards the window between "start requested" and "tunnel up". Every other path
+-- out of a start attempt is driven by a callback; if one never arrives, this is
+-- the only thing that gets the monitor moving again.
+function C4Driver.schedule_airplay_monitor_start_watchdog()
+  if not (has_c4() and type(SetTimer) == "function") then return end
+  C4Driver.cancel_timer("AppleTV_airplay_monitor_start_watchdog")
+  local ok, err = pcall(SetTimer, "AppleTV_airplay_monitor_start_watchdog",
+    AirPlay.monitor_start_timeout_ms, function()
+      if not AirPlay.monitor_enabled then return end
+      if AirPlay.monitor_state == "ACTIVE" then return end
+      Log.error("AirPlay monitor start stalled in state " ..
+        tostring(AirPlay.monitor_state) .. "; retrying")
+      C4Driver.schedule_airplay_monitor_retry("start stalled")
+    end)
+  if not ok then
+    Log.debug("AirPlay monitor start watchdog unavailable: " .. tostring(err))
+  end
+end
+
 function C4Driver.schedule_airplay_monitor_retry(reason)
   if not AirPlay.monitor_enabled then return end
   C4Driver.cancel_timer("AppleTV_airplay_monitor_watchdog")
+  C4Driver.cancel_timer("AppleTV_airplay_monitor_start_watchdog")
   if not (has_c4() and type(SetTimer) == "function") then return end
   C4Driver.cancel_timer("AppleTV_airplay_monitor_retry")
+  AirPlay.monitor_retry_attempts = (AirPlay.monitor_retry_attempts or 0) + 1
+  local delay = C4Driver.airplay_monitor_retry_delay_ms()
   Log.debug("AirPlay monitor retry scheduled: " .. tostring(reason or "unknown") ..
-    " in " .. tostring(AirPlay.monitor_retry_ms) .. "ms")
-  local ok, err = pcall(SetTimer, "AppleTV_airplay_monitor_retry", AirPlay.monitor_retry_ms, function()
+    " in " .. tostring(delay) .. "ms (attempt " .. tostring(AirPlay.monitor_retry_attempts) .. ")")
+  local ok, err = pcall(SetTimer, "AppleTV_airplay_monitor_retry", delay, function()
     if AirPlay.monitor_enabled then
       C4Driver.start_airplay_monitor("retry")
     end
@@ -6724,6 +6823,7 @@ function C4Driver.start_airplay_monitor(reason)
   AirPlay.monitor_enabled = true
   C4Driver.cancel_timer("AppleTV_airplay_monitor_retry")
   C4Driver.cancel_timer("AppleTV_airplay_monitor_watchdog")
+  C4Driver.schedule_airplay_monitor_start_watchdog()
 
   local function start_monitor(port)
     C4Driver.close_airplay_control_client("starting AirPlay monitor")
@@ -6739,6 +6839,7 @@ function C4Driver.start_airplay_monitor(reason)
       on_tunnel_setup = function(result)
         if result and result.data_port then
           Log.debug("AirPlay monitor active: dataPort=" .. tostring(result.data_port))
+          C4Driver.airplay_monitor_retry_succeeded()
           C4Driver.mark_airplay_monitor_activity("tunnel ready")
           C4Driver.schedule_airplay_monitor_watchdog()
         else
@@ -6784,9 +6885,11 @@ end
 
 function C4Driver.stop_airplay_monitor(reason)
   AirPlay.monitor_enabled = false
+  AirPlay.monitor_retry_attempts = 0
   C4Driver.cancel_timer("AppleTV_airplay_monitor_start")
   C4Driver.cancel_timer("AppleTV_airplay_monitor_retry")
   C4Driver.cancel_timer("AppleTV_airplay_monitor_watchdog")
+  C4Driver.cancel_timer("AppleTV_airplay_monitor_start_watchdog")
   C4Driver.close_airplay_control_client(reason or "stopping AirPlay monitor")
   C4Driver.set_airplay_monitor_state("STOPPED")
 end
@@ -7006,7 +7109,7 @@ end
 
 function C4Driver.disconnect_companion()
   C4Driver.cancel_timer("AppleTV_companion_watchdog")
-  MDNS.close()
+  MDNS.cancel_all()
   C4Driver.dispose_companion_client(Companion.client)
   C4Driver.stop_airplay_monitor("disconnect")
   Companion.client = nil
@@ -7218,8 +7321,9 @@ function C4Driver.cancel_driver_timers()
   C4Driver.cancel_timer("AppleTV_airplay_monitor_start")
   C4Driver.cancel_timer("AppleTV_airplay_monitor_retry")
   C4Driver.cancel_timer("AppleTV_airplay_monitor_watchdog")
+  C4Driver.cancel_timer("AppleTV_airplay_monitor_start_watchdog")
   C4Driver.cancel_timer(C4MiniApps.launch_retry_timer)
-  MDNS.close()
+  MDNS.cancel_all()
 end
 
 -- EC: Composer action and command dispatch (DCP normalises spaces→underscores and handles LUA_ACTION)
@@ -7380,6 +7484,7 @@ Driver.Companion = Companion
 Driver.AirPlay = AirPlay
 Driver.AirPlayHTTP = AirPlayHTTP
 Driver.AirPlayControlClient = AirPlayControlClient
+Driver.AirPlayDataChannelClient = AirPlayDataChannelClient
 Driver.BPlist = BPlist
 Driver.PB = PB
 Driver.PairVerify = PairVerify

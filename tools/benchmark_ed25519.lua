@@ -1,3 +1,4 @@
+dofile("tests/compat_bit32.lua")
 local Driver = dofile("driver.lua")
 
 local seed = Driver.Bytes.from_hex(
