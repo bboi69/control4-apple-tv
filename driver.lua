@@ -7023,15 +7023,23 @@ function C4Driver.load_persisted_airplay_credentials()
   return credentials_or_err
 end
 
-function C4Driver.launch_selected_app()
-  local selection = Properties and (Properties["Launch App"] or Properties["Selected App"]) or ""
+function C4Driver.launch_app_selection(selection)
+  selection = tostring(selection or "")
   local app_id, err = Companion.resolve_app_selection(selection)
+  if not app_id and Companion.looks_like_launch_identifier(selection) then
+    app_id = selection
+  end
   if not app_id then
-    err = err or "select an app after refreshing the app list"
+    err = err or "enter a bundle id, URL, or app name from the Launch App list"
     Log.error("Launch App failed: " .. tostring(err))
     error(err)
   end
   return C4Driver.launch_app(app_id)
+end
+
+function C4Driver.launch_selected_app()
+  local selection = Properties and (Properties["Launch App"] or Properties["Selected App"]) or ""
+  return C4Driver.launch_app_selection(selection)
 end
 
 function C4Driver.import_credentials(detail_string)
@@ -7328,8 +7336,17 @@ end
 
 -- EC: Composer action and command dispatch (DCP normalises spaces→underscores and handles LUA_ACTION)
 EC.LAUNCH_APP = function(params)
-  return C4Driver.launch_app(params.BUNDLE_ID_OR_URL or params.bundle_id_or_url)
+  params = params or {}
+  local selection = params["Bundle ID or URL"]
+    or params.BUNDLE_ID_OR_URL
+    or params.bundle_id_or_url
+    or ""
+  return C4Driver.launch_app_selection(selection)
 end
+-- Programming sends command <name> with spaces; handlers.lua turns them into underscores.
+EC.Launch_App = EC.LAUNCH_APP
+EC.LAUNCH_APP_BY_ID = EC.LAUNCH_APP
+EC.Launch_App_By_ID = EC.LAUNCH_APP
 EC.REFRESH_APP_LIST = function()
   return C4Driver.refresh_app_list()
 end
@@ -7463,6 +7480,16 @@ end
 
 function OnDriverDestroyed(dit)
   C4Driver.destroy(dit)
+end
+
+-- Composer Programming DYNAMIC_LIST params (OS 3.3+). Same entries as the
+-- Actions-tab "Launch App" property, populated by Refresh App List.
+function GetCommandParamList(commandName, paramName)
+  if (commandName == "Launch App" or commandName == "Launch_App" or commandName == "LAUNCH_APP")
+      and (paramName == "Bundle ID or URL" or paramName == "BUNDLE_ID_OR_URL")
+  then
+    return Companion.app_selector_items(Companion.app_list_rows)
+  end
 end
 
 -- ExecuteCommand, OnPropertyChanged, OnSystemEvent, OnWatchedVariableChanged,

@@ -1515,10 +1515,62 @@ function tests.execute_command_routes_driver_commands()
   assert_table_has(launch._c, "_bundleID", "com.netflix.Netflix")
   assert_eq(Properties["Current App"], "com.netflix.Netflix", "current app property")
 
+  ExecuteCommand("Launch App", { ["Bundle ID or URL"] = "https://www.netflix.com/title/80234304" })
+  launch = Driver.Companion.sent_messages[#Driver.Companion.sent_messages]
+  assert_table_has(launch, "_i", "_launchApp")
+  assert_table_has(launch._c, "_urlS", "https://www.netflix.com/title/80234304")
+
   ExecuteCommand("REFRESH_APP_LIST", {})
   local refresh = Driver.Companion.sent_messages[#Driver.Companion.sent_messages]
   assert_table_has(refresh, "_i", "FetchLaunchableApplicationsEvent")
   Properties = old_properties
+end
+
+function tests.programming_launch_app_resolves_property_style_selection()
+  local old_properties = Properties
+  Properties = { ["Launch App"] = "", ["Current App"] = "" }
+  Driver.Companion.app_list = {
+    ["com.netflix.Netflix"] = "Netflix",
+    ["com.google.ios.youtube"] = "YouTube",
+  }
+  local _, rows = Driver.Companion.parse_app_list(Driver.Companion.app_list)
+  Driver.Companion.app_list_rows = rows
+  Driver.Companion.sent_messages = {}
+
+  ExecuteCommand("Launch_App", { ["Bundle ID or URL"] = "Netflix | com.netflix.Netflix" })
+  local launch = Driver.Companion.sent_messages[#Driver.Companion.sent_messages]
+  assert_eq(launch._i, "_launchApp", "programming launch uses resolved selection")
+  assert_eq(launch._c._bundleID, "com.netflix.Netflix", "programming launch bundle")
+
+  Driver.Companion.sent_messages = {}
+  ExecuteCommand("LAUNCH_APP", { ["Bundle ID or URL"] = "YouTube" })
+  launch = Driver.Companion.sent_messages[#Driver.Companion.sent_messages]
+  assert_eq(launch._c._bundleID, "com.google.ios.youtube", "programming launch resolves app name")
+
+  Driver.Companion.sent_messages = {}
+  ExecuteCommand("Launch App By ID", { ["Bundle ID or URL"] = "com.netflix.Netflix" })
+  launch = Driver.Companion.sent_messages[#Driver.Companion.sent_messages]
+  assert_eq(launch._c._bundleID, "com.netflix.Netflix", "free-type launch by id")
+
+  Properties = old_properties
+end
+
+function tests.get_command_param_list_returns_launch_app_selector_items()
+  Driver.Companion.app_list = {
+    ["com.netflix.Netflix"] = "Netflix",
+    ["com.google.ios.youtube"] = "YouTube",
+  }
+  local _, rows = Driver.Companion.parse_app_list(Driver.Companion.app_list)
+  Driver.Companion.app_list_rows = rows
+
+  local items = GetCommandParamList("Launch App", "Bundle ID or URL")
+  assert(type(items) == "table", "returns a table")
+  assert_eq(items[1], "", "leading blank entry")
+  local joined = table.concat(items, "\n")
+  assert(joined:match("Netflix | com%.netflix%.Netflix"), "includes Netflix row")
+  assert(joined:match("YouTube | com%.google%.ios%.youtube"), "includes YouTube row")
+
+  assert_eq(GetCommandParamList("Launch App", "Other"), nil, "unknown param ignored")
 end
 
 function tests.refresh_app_list_uses_existing_client()

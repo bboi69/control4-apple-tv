@@ -5,8 +5,8 @@
     <name>Apple TV</name>
     <model>Apple TV</model>
     <created>05/02/2026 12:00 AM</created>
-    <modified>07/16/2026 12:00 AM</modified>
-    <version>64</version>
+    <modified>07/17/2026 12:00 AM</modified>
+    <version>66</version>
     <small image_source="c4z">icons/device_sm.png</small>
     <large image_source="c4z">icons/device_lg.png</large>
     <control>lua_gen</control>
@@ -735,6 +735,28 @@
                 <command>STOP_AIRPLAY_MONITOR</command>
             </action>
         </actions>
+        <commands>
+            <command>
+                <name>Launch App</name>
+                <description>Launch App PARAM1</description>
+                <params>
+                    <param>
+                        <name>Bundle ID or URL</name>
+                        <type>DYNAMIC_LIST</type>
+                    </param>
+                </params>
+            </command>
+            <command>
+                <name>Launch App By ID</name>
+                <description>Launch App By ID PARAM1</description>
+                <params>
+                    <param>
+                        <name>Bundle ID or URL</name>
+                        <type>STRING</type>
+                    </param>
+                </params>
+            </command>
+        </commands>
     </config>
     <composer_categories>
         <category>Audio/Video</category>
