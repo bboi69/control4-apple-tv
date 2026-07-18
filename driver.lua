@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.45-dev",
+  VERSION = "0.1.46-dev",
 }
 
 local function has_c4()
@@ -7488,7 +7488,14 @@ function GetCommandParamList(commandName, paramName)
   if (commandName == "Launch App" or commandName == "Launch_App" or commandName == "LAUNCH_APP")
       and (paramName == "Bundle ID or URL" or paramName == "BUNDLE_ID_OR_URL")
   then
-    return Companion.app_selector_items(Companion.app_list_rows)
+    local rows = Companion.app_list_rows
+    if not rows or #rows == 0 then
+      -- No apps fetched yet: hint toward Refresh App List rather than showing an
+      -- empty dropdown. The entry has no bundle id/URL, so firing it errors cleanly
+      -- (and "Launch App By ID" remains the free-type escape hatch either way).
+      return { "", "(no apps - run Refresh App List first)" }
+    end
+    return Companion.app_selector_items(rows)
   end
 end
 

@@ -6,7 +6,7 @@
     <model>Apple TV</model>
     <created>05/02/2026 12:00 AM</created>
     <modified>07/17/2026 12:00 AM</modified>
-    <version>66</version>
+    <version>65</version>
     <small image_source="c4z">icons/device_sm.png</small>
     <large image_source="c4z">icons/device_lg.png</large>
     <control>lua_gen</control>

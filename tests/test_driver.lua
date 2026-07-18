@@ -1573,6 +1573,22 @@ function tests.get_command_param_list_returns_launch_app_selector_items()
   assert_eq(GetCommandParamList("Launch App", "Other"), nil, "unknown param ignored")
 end
 
+function tests.get_command_param_list_hints_when_no_apps()
+  Driver.Companion.app_list = {}
+  Driver.Companion.app_list_rows = {}
+
+  local items = GetCommandParamList("Launch App", "Bundle ID or URL")
+  assert(type(items) == "table", "returns a table")
+  assert_eq(items[1], "", "leading blank entry")
+  local joined = table.concat(items, "\n")
+  assert(joined:match("Refresh App List"), "hints toward Refresh App List when empty")
+
+  -- nil rows (never fetched) must not crash and must still hint
+  Driver.Companion.app_list_rows = nil
+  local items_nil = GetCommandParamList("Launch App", "Bundle ID or URL")
+  assert(type(items_nil) == "table" and items_nil[2] ~= nil, "handles nil rows with hint")
+end
+
 function tests.refresh_app_list_uses_existing_client()
   local old_properties = Properties
   Properties = { ["Current App"] = "" }
